@@ -10,6 +10,15 @@ description = "GPU/CPU miner for BC3 (BitcoinIII, SHA3-256t) — the bc3.online 
 name = "bc3-miner"
 path = "src/main.rs"
 
+[features]
+# CUDA är på som standard: libcuda/libnvrtc laddas dynamiskt i runtime, så
+# binären fungerar även på maskiner utan NVIDIA-drivrutin (CPU-fallback).
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+# OpenCL kräver en OpenCL-loader vid länkning (OpenCL.dll/libOpenCL.so) och
+# byggs därför bara på begäran: cargo build --features opencl
+opencl = ["dep:opencl3"]
+
 [dependencies]
 sha3 = "0.10"
 sha2 = "0.10"
@@ -17,8 +26,13 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
+cudarc = { version = "0.19", default-features = false, features = [
+    "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040",
+], optional = true }
+opencl3 = { version = "0.9", optional = true }
 
+# Obs: inte panic = "abort" — cudarc:s dynamiska laddare panikar om libcuda
+# saknas, och CUDA-detekteringen fångar det med catch_unwind (CPU-fallback).
 [profile.release]
 lto = "thin"
 codegen-units = 1
-panic = "abort"
