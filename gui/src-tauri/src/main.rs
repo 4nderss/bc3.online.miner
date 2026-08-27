@@ -24,8 +24,23 @@ pub struct StartOptions {
     mode: String,
     /// Valfri pool-override (host:port); tomt ⇒ bc3.online med lägets port.
     pool: String,
-    /// CPU-trådar; None/0 ⇒ låt CLI:n välja (GPU-läge = inga CPU-trådar).
-    threads: Option<usize>,
+    /// "gpu", "cpu" eller "dual".
+    hardware: String,
+    /// Intensitet 1–100 %.
+    intensity: Option<u32>,
+}
+
+/// Översätt hårdvaruvalet till CLI-flaggor.
+///
+/// - gpu:  `--backend auto` (CLI:n startar inga CPU-trådar när en GPU finns)
+/// - cpu:  `--backend cpu` + alla kärnor
+/// - dual: `--backend auto --threads 0` (0 = alla kärnor, utöver GPU:n)
+fn hardware_args(hardware: &str) -> Vec<String> {
+    match hardware {
+        "cpu" => vec!["--backend".into(), "cpu".into(), "--threads".into(), "0".into()],
+        "dual" => vec!["--backend".into(), "auto".into(), "--threads".into(), "0".into()],
+        _ => vec!["--backend".into(), "auto".into()],
+    }
 }
 
 /// Den körande minerprocessen (None när stoppad).
@@ -88,10 +103,10 @@ fn start_mining(
         "--stats-interval".to_string(),
         "3".to_string(),
     ];
-    if let Some(t) = opts.threads.filter(|t| *t > 0) {
-        args.push("--threads".into());
-        args.push(t.to_string());
-    }
+    args.extend(hardware_args(&opts.hardware));
+    let intensity = opts.intensity.unwrap_or(100).clamp(1, 100);
+    args.push("--intensity".into());
+    args.push(intensity.to_string());
 
     let sidecar = app
         .shell()
@@ -162,11 +177,40 @@ fn is_mining(state: State<'_, MinerState>) -> bool {
     state.0.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
+/// Fråga CLI:n vilka GPU:er som finns (kort körning med `--probe`), så att
+/// hårdvaruknapparna kan visa kortets namn innan man startar.
+#[tauri::command]
+async fn probe_hardware(app: AppHandle) -> Result<serde_json::Value, String> {
+    let output = app
+        .shell()
+        .sidecar("bc3-miner")
+        .map_err(|e| format!("miner binary not found: {e}"))?
+        .args(["--probe", "--json"])
+        .output()
+        .await
+        .map_err(|e| format!("probe failed: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v["type"] == "probe" {
+                return Ok(v);
+            }
+        }
+    }
+    Err("probe produced no result".into())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(MinerState::default())
-        .invoke_handler(tauri::generate_handler![start_mining, stop_mining, is_mining])
+        .invoke_handler(tauri::generate_handler![
+            start_mining,
+            stop_mining,
+            is_mining,
+            probe_hardware
+        ])
         .run(tauri::generate_context!())
         .expect("kunde inte starta bc3.online miner");
 }
@@ -181,8 +225,24 @@ mod tests {
             rig: "rig".into(),
             mode: mode.into(),
             pool: pool.into(),
-            threads: None,
+            hardware: "gpu".into(),
+            intensity: None,
         }
+    }
+
+    #[test]
+    fn hardware_maps_to_cli_flags() {
+        assert_eq!(hardware_args("gpu"), vec!["--backend", "auto"]);
+        assert_eq!(
+            hardware_args("cpu"),
+            vec!["--backend", "cpu", "--threads", "0"]
+        );
+        assert_eq!(
+            hardware_args("dual"),
+            vec!["--backend", "auto", "--threads", "0"]
+        );
+        // Okänt värde faller tillbaka på GPU-beteendet.
+        assert_eq!(hardware_args("nonsense"), vec!["--backend", "auto"]);
     }
 
     #[test]

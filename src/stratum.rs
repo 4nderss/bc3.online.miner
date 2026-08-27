@@ -21,7 +21,7 @@ pub fn run_client(shared: Arc<Shared>, submit_rx: Receiver<FoundShare>, cfg: Str
         match session(&shared, &submit_rx, &cfg) {
             Ok(()) => backoff = 1,
             Err(e) => {
-                eprintln!("[pool] anslutningsfel: {e} — återansluter om {backoff}s");
+                eprintln!("[pool] connection error: {e} — reconnecting in {backoff}s");
                 crate::ipc::emit(&crate::ipc::Event::Status {
                     state: crate::ipc::StatusState::Connecting,
                     message: format!("connection lost, retrying in {backoff}s"),
@@ -39,7 +39,7 @@ fn session(
     submit_rx: &Receiver<FoundShare>,
     cfg: &StratumConfig,
 ) -> std::io::Result<()> {
-    crate::human!("[pool] ansluter till {} som {}", cfg.pool, cfg.user);
+    crate::human!("[pool] connecting to {} as {}", cfg.pool, cfg.user);
     crate::ipc::emit(&crate::ipc::Event::Status {
         state: crate::ipc::StatusState::Connecting,
         message: format!("connecting to {}", cfg.pool),
@@ -68,7 +68,7 @@ fn session(
         // 1) Skicka in väntande shares.
         while let Ok(share) = submit_rx.try_recv() {
             if share.is_block_candidate {
-                    crate::human!("[MINER] ★ BLOCKKANDIDAT {} ★", share.hash_display);
+                crate::human!("[miner] ★ BLOCK CANDIDATE {} ★", share.hash_display);
                 crate::ipc::emit(&crate::ipc::Event::Block {
                     hash: share.hash_display.clone(),
                 });
@@ -86,7 +86,7 @@ fn session(
             Ok(0) => {
                 return Err(std::io::Error::new(
                     ErrorKind::ConnectionAborted,
-                    "poolen stängde anslutningen",
+                    "pool closed the connection",
                 ))
             }
             Ok(_) => {}
@@ -102,7 +102,7 @@ fn session(
         if msg["id"] == json!(1) {
             let r = &msg["result"];
             if r.is_null() {
-                return Err(std::io::Error::new(ErrorKind::InvalidData, "subscribe avvisades"));
+                return Err(std::io::Error::new(ErrorKind::InvalidData, "subscribe rejected"));
             }
             extranonce1 = hex::decode(r[1].as_str().unwrap_or("")).unwrap_or_default();
             extranonce2_size = r[2].as_u64().unwrap_or(4) as usize;
@@ -110,14 +110,14 @@ fn session(
         }
         if msg["id"] == json!(2) {
             if msg["result"] != json!(true) {
-                eprintln!("[pool] AUKTORISERING AVVISAD: {}", msg["error"]);
+                eprintln!("[pool] AUTHORIZATION REJECTED: {}", msg["error"]);
                 crate::ipc::emit(&crate::ipc::Event::Status {
                     state: crate::ipc::StatusState::Error,
                     message: format!("pool rejected the address: {}", msg["error"]),
                 });
                 return Err(std::io::Error::new(ErrorKind::PermissionDenied, "authorize"));
             }
-            crate::human!("[pool] auktoriserad");
+            crate::human!("[pool] authorized");
             crate::ipc::emit(&crate::ipc::Event::Status {
                 state: crate::ipc::StatusState::Mining,
                 message: "authorized — mining".into(),
@@ -133,7 +133,7 @@ fn session(
                     shared.stats.accepted.fetch_add(1, Ordering::Relaxed);
                 } else {
                     shared.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[pool] share avvisad: {}", msg["error"]);
+                    eprintln!("[pool] share rejected: {}", msg["error"]);
                 }
                 crate::ipc::emit(&crate::ipc::Event::Share { accepted });
                 continue;
@@ -151,11 +151,11 @@ fn session(
                 }
                 match parse_notify(&p, &extranonce1, extranonce2_size, difficulty) {
                     Some(job) => shared.publish_job(job),
-                    None => eprintln!("[pool] ogiltigt notify-meddelande"),
+                    None => eprintln!("[pool] invalid notify message"),
                 }
             }
             Some("client.reconnect") => {
-                return Err(std::io::Error::new(ErrorKind::ConnectionReset, "reconnect begärd"));
+                return Err(std::io::Error::new(ErrorKind::ConnectionReset, "reconnect requested"));
             }
             _ => {}
         }

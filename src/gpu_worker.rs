@@ -29,11 +29,11 @@ pub fn run_gpu_worker(
     let mut backend = match open_backend(&device) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[gpu] kunde inte öppna {}: {e}", device.describe());
+            eprintln!("[gpu] could not open {}: {e}", device.describe());
             return;
         }
     };
-    crate::human!("[gpu] startad: {}", backend.name());
+    crate::human!("[gpu] started: {}", backend.name());
 
     let mut batch = START_BATCH;
     loop {
@@ -90,9 +90,9 @@ fn mine_job(
                 Ok(h) => h,
                 Err(e) => {
                     errors += 1;
-                    eprintln!("[gpu] {}: scan-fel: {e}", backend.name());
+                    eprintln!("[gpu] {}: scan error: {e}", backend.name());
                     if errors >= 5 {
-                        eprintln!("[gpu] {}: ger upp efter {errors} fel", backend.name());
+                        eprintln!("[gpu] {}: giving up after {errors} errors", backend.name());
                         std::thread::sleep(Duration::from_secs(30));
                     }
                     std::thread::sleep(Duration::from_secs(1));
@@ -127,6 +127,10 @@ fn mine_job(
             }
 
             shared.stats.hashes.fetch_add(count as u64, Ordering::Relaxed);
+
+            // Intensitet < 100 % ⇒ vila proportionellt (håller nere värme
+            // och gör datorn användbar under mining).
+            shared.throttle(elapsed);
 
             // Enkel autotune mot ~TARGET_LAUNCH per launch.
             if elapsed < TARGET_LAUNCH / 2 && *batch < MAX_BATCH {

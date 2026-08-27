@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
     let mut last_hashes = 0u64;
     let mut last_t = Instant::now();
+    let telemetry = crate::telemetry::Telemetry::open();
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs));
         let hashes = shared.stats.hashes.load(Ordering::Relaxed);
@@ -25,17 +26,26 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
         let eta_secs = (rate > 0.0 && bits != 0)
             .then(|| network_difficulty * 4_294_967_296.0 / rate);
 
+        let temps = telemetry.read(0);
         crate::ipc::emit(&crate::ipc::Event::Stats {
             hashrate: rate,
             accepted,
             rejected,
             eta_secs,
             network_difficulty,
+            telemetry: temps,
         });
+        let temp_text = match (temps.gpu_temp_c, temps.cpu_temp_c) {
+            (Some(g), Some(c)) => format!(" | GPU {g}°C CPU {c}°C"),
+            (Some(g), None) => format!(" | GPU {g}°C"),
+            (None, Some(c)) => format!(" | CPU {c}°C"),
+            (None, None) => String::new(),
+        };
         crate::human!(
-            "[miner] {} | shares {accepted}✓ {rejected}✗ | est. block: {}",
+            "[miner] {} | shares {accepted}✓ {rejected}✗ | est. block: {}{}",
             format_hashrate(rate),
-            eta_secs.map(format_duration).unwrap_or_else(|| "—".into())
+            eta_secs.map(format_duration).unwrap_or_else(|| "—".into()),
+            temp_text
         );
     }
 }

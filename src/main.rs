@@ -8,6 +8,7 @@ mod backend;
 mod consensus;
 mod gpu_worker;
 mod ipc;
+mod telemetry;
 mod shared;
 mod stats;
 mod stratum;
@@ -41,6 +42,11 @@ struct Args {
     #[arg(long)]
     threads: Option<usize>,
 
+    /// Intensitet 1–100 %. Under 100 vilar arbetarna mellan pass, vilket
+    /// sänker värme/strömförbrukning och gör datorn användbar under mining.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
+    intensity: u32,
+
     /// Sekunder mellan statistikrader.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
@@ -48,11 +54,30 @@ struct Args {
     /// Skriv maskinläsbara JSON-rader på stdout i stället för text (GUI:t).
     #[arg(long)]
     json: bool,
+
+    /// Lista tillgänglig hårdvara och avsluta (GUI:t frågar innan start).
+    #[arg(long)]
+    probe: bool,
 }
 
 fn main() {
     let args = Args::parse();
     ipc::set_json_mode(args.json);
+
+    let all_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+
+    if args.probe {
+        let gpus: Vec<String> = backend::detect_gpus(BackendKind::Auto, None)
+            .iter()
+            .map(|g| g.describe())
+            .collect();
+        ipc::emit(&ipc::Event::Probe {
+            gpus: gpus.clone(),
+            cpu_cores: all_cores,
+        });
+        human!("GPUs: {gpus:?}, CPU cores: {all_cores}");
+        return;
+    }
 
     let gpus = if matches!(args.backend, BackendKind::Cpu) {
         vec![]
@@ -62,19 +87,18 @@ fn main() {
     if gpus.is_empty() {
         match args.backend {
             BackendKind::Cuda => {
-                eprintln!("bc3-miner: ingen CUDA-enhet hittades");
+                eprintln!("bc3-miner: no CUDA device found");
                 std::process::exit(1);
             }
             BackendKind::Opencl => {
-                eprintln!("bc3-miner: ingen OpenCL-GPU hittades");
+                eprintln!("bc3-miner: no OpenCL GPU found");
                 std::process::exit(1);
             }
-            BackendKind::Auto => human!("[gpu] ingen GPU hittades — minar med CPU"),
+            BackendKind::Auto => human!("[gpu] no GPU found — mining on CPU"),
             BackendKind::Cpu => {}
         }
     }
 
-    let all_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let threads = match (args.threads, gpus.is_empty()) {
         (Some(0), _) => all_cores,
         (Some(n), _) => n,
@@ -83,13 +107,13 @@ fn main() {
     };
 
     human!(
-        "bc3-miner {} — {} GPU:er, {} CPU-trådar",
+        "bc3-miner {} — {} GPU(s), {} CPU thread(s)",
         env!("CARGO_PKG_VERSION"),
         gpus.len(),
         threads
     );
     for gpu in &gpus {
-        human!("[gpu] hittad: {}", gpu.describe());
+        human!("[gpu] found: {}", gpu.describe());
     }
     ipc::emit(&ipc::Event::Startup {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -100,6 +124,10 @@ fn main() {
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel();
     let shared = Arc::new(shared::Shared::new(submit_tx));
+    shared.set_intensity(args.intensity);
+    if args.intensity < 100 {
+        human!("[miner] intensity {}%", args.intensity);
+    }
 
     // CPU-trådar och GPU:er delar en gemensam disjunkt extranonce2-partition.
     let total_workers = threads + gpus.len();

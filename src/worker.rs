@@ -48,6 +48,7 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
 
         let mut nonce: u32 = 0;
         loop {
+            let batch_start = std::time::Instant::now();
             let batch_end = nonce.saturating_add(CHECK_INTERVAL);
             while nonce < batch_end {
                 header.nonce = nonce;
@@ -74,6 +75,7 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
                 .stats
                 .hashes
                 .fetch_add(CHECK_INTERVAL as u64, Ordering::Relaxed);
+            shared.throttle(batch_start.elapsed());
             if shared.generation.load(Ordering::Acquire) != generation {
                 return; // nytt jobb — släpp det gamla direkt
             }

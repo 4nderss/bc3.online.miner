@@ -41,11 +41,19 @@ pub enum Event {
         /// Förväntad tid till block i sekunder; `null` innan hashrate finns.
         eta_secs: Option<f64>,
         network_difficulty: f64,
+        /// Temperatur/effekt där plattformen exponerar det (annars null).
+        #[serde(flatten)]
+        telemetry: crate::telemetry::Reading,
     },
     /// En share skickades in och poolen svarade.
     Share { accepted: bool },
     /// Vi hittade ett block (hash i display-ordning).
     Block { hash: String },
+    /// Svar på `--probe`: tillgänglig hårdvara (GUI:t frågar innan start).
+    Probe {
+        gpus: Vec<String>,
+        cpu_cores: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -100,10 +108,17 @@ mod tests {
             rejected: 0,
             eta_secs: None,
             network_difficulty: 42.0,
+            telemetry: crate::telemetry::Reading {
+                gpu_temp_c: Some(64),
+                ..Default::default()
+            },
         })
         .unwrap();
         assert!(s.starts_with(r#"{"type":"stats","hashrate":1.5"#));
         assert!(s.contains(r#""eta_secs":null"#));
+        // Telemetrin plattas ut i samma objekt.
+        assert!(s.contains(r#""gpu_temp_c":64"#));
+        assert!(s.contains(r#""cpu_temp_c":null"#));
     }
 
     #[test]
