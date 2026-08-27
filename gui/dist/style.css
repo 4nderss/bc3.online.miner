@@ -1,0 +1,277 @@
+/* bc3.online miner — samma formspråk som webben (Ember på varm grafit).
+   GUI:t är mörkt-först: miners lever i mörka rum. */
+
+:root {
+  --bg: #14110F;
+  --surface: #201B18;
+  --surface2: #2C2521;
+  /* Ljusare kantlinje och sekundärtext än webben: GUI:t läses på nära håll
+     och ofta i ljusa rum, så kontrasterna behöver ligga högre. */
+  --line: #4A403A;
+  --text: #F5F1EB;
+  --muted: #C4B8AC;
+  --faint: #93867B;
+  --accent: #F08A48;
+  --accent-ink: #1A120C;
+  --data: #4FD8C6;
+  --ok: #6BD186;
+  --bad: #F0805C;
+  --warn: #EFC05C;
+  --radius: 10px;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Figtree', system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  /* Fönstret ska aldrig scrolla i sin helhet — bara loggen gör det.
+     Vid små fönster får main scrolla hellre än att krossa loggen. */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  width: 100vw;
+}
+input { user-select: text; }
+
+/* Topbar */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 20px; border-bottom: 1px solid var(--line);
+  background: var(--surface); flex: 0 0 auto;
+}
+.brand { display: flex; align-items: center; gap: 10px; color: var(--text); }
+.wordmark { font-family: 'Chakra Petch', sans-serif; font-weight: 700; font-size: 19px; }
+.wordmark span { font-weight: 500; opacity: .45; }
+/* Blocket vi malar på — accentfärgat medan ett jobb är aktivt, så man ser
+   direkt att klienten är i synk med poolen. */
+#job-height-card.live { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+#job-height-card.live #job-height { color: var(--accent); }
+.status {
+  display: flex; align-items: center; gap: 8px;
+  font-family: 'Chakra Petch', sans-serif; font-size: 12.5px; font-weight: 600;
+  letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+}
+.dot {
+  width: 9px; height: 9px; border-radius: 50%; background: var(--faint);
+  transition: background-color .2s ease;
+}
+.dot.connecting { background: var(--warn); }
+.dot.mining { background: var(--ok); }
+.dot.error { background: var(--bad); }
+@media (prefers-reduced-motion: no-preference) {
+  .dot.mining { animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+}
+
+main {
+  padding: 14px 18px; display: flex; flex-direction: column; gap: 12px;
+  flex: 1 1 auto; min-height: 0; min-width: 0;
+  overflow-y: auto; /* sista utvägen om fönstret görs riktigt litet */
+  /* OBS: sätts bara overflow-y till auto blir overflow-x automatiskt auto
+     (CSS-regel), vilket gav en horisontell scrollbar av minsta överskjutning. */
+  overflow-x: hidden;
+}
+main::-webkit-scrollbar { width: 10px; }
+main::-webkit-scrollbar-track { background: transparent; }
+main::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 5px; border: 2px solid var(--bg);
+}
+
+.card {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+
+/* Formulär */
+.field { display: flex; flex-direction: column; gap: 6px; }
+.label {
+  font-family: 'Chakra Petch', sans-serif; font-size: 11.5px; font-weight: 600;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+}
+.hint-inline {
+  text-transform: none; letter-spacing: 0; font-weight: 400;
+  color: var(--faint);
+}
+.hint { font-size: 12.5px; color: var(--muted); }
+.error { font-size: 12.5px; color: var(--bad); min-height: 0; }
+.error:empty { display: none; }
+input {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--text); padding: 10px 12px; font-size: 14px;
+  font-family: 'Spline Sans Mono', monospace;
+}
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
+input.invalid { border-color: var(--bad); }
+.row { display: flex; gap: 14px; flex-wrap: wrap; }
+.row .field { flex: 1 1 220px; }
+
+/* Intensitetsreglage */
+.slider-row { display: flex; align-items: center; gap: 12px; }
+.slider-value {
+  font-family: 'Spline Sans Mono', monospace; font-size: 14px;
+  font-variant-numeric: tabular-nums; color: var(--accent);
+  flex: 0 0 52px; text-align: right;
+}
+input[type="range"] {
+  flex: 1; appearance: none; -webkit-appearance: none;
+  background: transparent; padding: 0; border: none; height: 20px;
+  outline: none; /* egen fokusstil på tummen nedan */
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px; border-radius: 3px; background: var(--surface2);
+  border: 1px solid var(--line);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 16px; height: 16px; border-radius: 50%; margin-top: -6.5px;
+  background: var(--accent); cursor: pointer; border: none;
+}
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); cursor: default; }
+
+/* Lägesval (hårdvara + payout) */
+.modes { display: flex; gap: 10px; }
+.mode {
+  flex: 1 1 0; min-width: 0; text-align: left; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; color: var(--muted);
+  /* Tydligare skillnad mellan vald/ovald än en enbart färgad ram. */
+  display: flex; flex-direction: column; gap: 2px;
+  font-family: 'Figtree', system-ui, sans-serif;
+}
+.mode strong {
+  font-family: 'Chakra Petch', sans-serif; font-size: 13.5px; letter-spacing: .04em;
+  color: var(--text);
+}
+.mode span {
+  font-size: 12px; line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mode:disabled { cursor: default; opacity: .55; }
+.mode.active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.mode.active span { color: var(--text); }
+.mode.active strong { color: var(--accent); }
+.mode:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Knappar */
+.btn {
+  font-family: 'Chakra Petch', sans-serif; font-weight: 600; font-size: 15px;
+  letter-spacing: .04em; border: none; border-radius: 8px; cursor: pointer;
+  padding: 12px 20px;
+}
+.btn.primary { background: var(--accent); color: var(--accent-ink); }
+.btn.primary.running { background: var(--bad); color: #fff; }
+.btn:disabled {
+  background: var(--surface2); color: var(--faint); cursor: not-allowed;
+  transform: none; filter: none;
+}
+.btn.ghost {
+  background: none; border: 1px solid var(--line); color: var(--muted);
+  padding: 5px 12px; font-size: 12px;
+}
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: no-preference) {
+  .btn { transition: filter .15s ease, transform .15s ease, background-color .2s ease; }
+  .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+  .mode { transition: border-color .15s ease, background-color .15s ease; }
+}
+
+/* Statistik */
+/* Åtta paneler i ett jämnt 4+4-rutnät — auto-fit gav 5+3 på breda fönster
+   och lämnade ett tomt hål på andra raden. */
+.stats-grid {
+  display: grid; gap: 10px; flex: 0 0 auto;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+@media (max-width: 860px) {
+  .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.stat { gap: 3px; padding: 12px 14px; }
+.stat-title {
+  font-family: 'Chakra Petch', sans-serif; font-size: 11.5px; font-weight: 600;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+}
+.stat-value {
+  font-family: 'Spline Sans Mono', monospace; font-size: 23px;
+  font-variant-numeric: tabular-nums; line-height: 1.2;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stat-value.small { font-size: 16px; }
+.stat-sub {
+  font-size: 11.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ok { color: var(--ok); }
+.bad { color: var(--bad); }
+.warm { color: var(--warn); }
+.sep { color: var(--faint); }
+#spark { width: 100%; display: block; margin-top: 2px; }
+@media (prefers-reduced-motion: no-preference) {
+  .stat-value.bump { animation: bump .35s ease; }
+  @keyframes bump { from { opacity: .4; transform: translateY(3px); } to { opacity: 1; } }
+}
+
+/* Logg — enda ytan som scrollar; krymper med fönstret men aldrig till
+   en enda rad: minst ~6 rader ska alltid synas. */
+.log-card { flex: 1 1 auto; min-height: 260px; }
+.log-head { display: flex; align-items: center; justify-content: space-between; }
+.log {
+  font-family: 'Spline Sans Mono', monospace; font-size: 12.5px;
+  overflow-x: hidden; overflow-wrap: anywhere;
+  color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px;
+  flex: 1 1 auto; min-height: 200px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 3px; user-select: text;
+  line-height: 1.6;
+}
+/* Egen scrollbar — Windows standardscrollbar syns knappt mot mörk botten. */
+.log::-webkit-scrollbar { width: 10px; }
+.log::-webkit-scrollbar-track { background: transparent; }
+.log::-webkit-scrollbar-thumb {
+  background: var(--line); border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+.log::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+.log .t { color: var(--muted); margin-right: 8px; opacity: .75; }
+.log .l-ok { color: var(--ok); }
+.log .l-bad { color: var(--bad); }
+.log .l-accent { color: var(--accent); }
+
+/* Blockfynd */
+.block-overlay {
+  position: fixed; inset: 0; background: rgba(20, 17, 15, .88);
+  display: flex; align-items: center; justify-content: center; z-index: 10;
+}
+.block-overlay.hidden { display: none; }
+.block-card {
+  background: var(--surface); border: 1px solid var(--accent);
+  border-radius: 14px; padding: 32px 40px; text-align: center;
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  box-shadow: 0 0 60px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.block-card h2 {
+  font-family: 'Chakra Petch', sans-serif; font-size: 26px; margin: 0;
+  color: var(--accent);
+}
+.block-card .mono {
+  font-family: 'Spline Sans Mono', monospace; font-size: 11.5px;
+  color: var(--muted); word-break: break-all; max-width: 380px; user-select: text;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .block-card { animation: pop .4s cubic-bezier(.2, .9, .3, 1.2); }
+  @keyframes pop { from { opacity: 0; transform: scale(.9); } to { opacity: 1; } }
+}

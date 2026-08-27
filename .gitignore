@@ -1,14 +1,21 @@
+# Byggartefakter (rot och per-target).
 /target
+/target-win
+/target-linux
+/target-msvc
+/target-gui
+/test-build
+
+# Färdiga releasepaket — OBS: mönstret måste vara rotankrat, annars
+# matchar det även gui/dist (GUI:ts frontend, som SKA ligga i repot).
+/dist
+
 node_modules/
-dist/
+
+# Genererade Tauri-artefakter och inbakad sidecar-binär.
+gui/src-tauri/gen/
+gui/src-tauri/binaries/*.exe
+
 .env
 .env.*
 !.env.example
-/target-win
-/target-linux
-/dist
-/test-build
-/target-msvc
-/target-gui
-gui/src-tauri/binaries/*.exe
-gui/src-tauri/gen/

@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bc3.online miner</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Figtree:wght@400;500;600&family=Spline+Sans+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg width="30" height="30" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+      <polygon points="32,4 56,17 56,23 32,10 8,23 8,17" fill="currentColor"/>
+      <polygon points="8,26 32,13 56,26 56,32 32,19 8,32" fill="#E07A3F"/>
+      <polygon points="8,35 32,22 56,35 56,47 32,60 8,47" fill="currentColor"/>
+    </svg>
+    <span class="wordmark">bc3<span>.online</span></span>
+  </div>
+  <div class="status" id="status">
+    <span class="dot" id="status-dot"></span><span id="status-text">Idle</span>
+  </div>
+</header>
+
+<main>
+  <!-- Inställningar -->
+  <section class="card" id="setup">
+    <label class="field">
+      <span class="label">Your BC3 wallet address</span>
+      <input id="address" type="text" spellcheck="false" autocomplete="off"
+             placeholder="bc1…" aria-describedby="address-error">
+      <span class="error" id="address-error"></span>
+      <span class="hint">Solo rewards are paid directly to this address in the block you find.</span>
+    </label>
+
+    <label class="field">
+      <span class="label">Rig name</span>
+      <input id="rig" type="text" spellcheck="false" autocomplete="off" placeholder="my-rig">
+    </label>
+
+    <div class="field">
+      <span class="label">Hardware</span>
+      <div class="modes" role="radiogroup" aria-label="Hardware">
+        <button class="mode active" data-hw="gpu" role="radio" aria-checked="true">
+          <strong>GPU</strong>
+          <span id="hw-gpu-sub">Fastest. Detecting…</span>
+        </button>
+        <button class="mode" data-hw="cpu" role="radio" aria-checked="false">
+          <strong>CPU</strong>
+          <span id="hw-cpu-sub">All cores</span>
+        </button>
+      </div>
+    </div>
+
+    <label class="field">
+      <span class="label">
+        Intensity <span class="hint-inline">— lower it to keep the machine cool and usable</span>
+      </span>
+      <div class="slider-row">
+        <input id="intensity" type="range" min="10" max="100" step="5" value="100">
+        <span class="slider-value mono" id="intensity-value">100%</span>
+      </div>
+    </label>
+
+    <div class="field">
+      <span class="label">Payout mode</span>
+      <div class="modes" role="radiogroup" aria-label="Payout mode">
+        <button class="mode active" data-mode="pplns" role="radio" aria-checked="true">
+          <strong>PPLNS</strong>
+          <span>Steady payouts, proportional to your shares. Port 3111.</span>
+        </button>
+        <button class="mode" data-mode="solo" role="radio" aria-checked="false">
+          <strong>Solo</strong>
+          <span>The whole block, or nothing. Port 3112.</span>
+        </button>
+      </div>
+    </div>
+
+    <button class="btn primary" id="toggle">Start mining</button>
+  </section>
+
+  <!-- Live -->
+  <section class="stats-grid">
+    <div class="card stat">
+      <span class="stat-title">Hashrate</span>
+      <span class="stat-value" id="hashrate">—</span>
+      <span class="stat-sub" id="hashrate-sub"></span>
+      <canvas id="spark" height="48" aria-label="Hashrate over time"></canvas>
+    </div>
+    <div class="card stat">
+      <span class="stat-title">Shares</span>
+      <span class="stat-value"><span id="accepted" class="ok">0</span> <span class="sep">/</span> <span id="rejected" class="bad">0</span></span>
+      <span class="stat-sub">accepted / rejected</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-title">Best share</span>
+      <span class="stat-value" id="best-share">—</span>
+      <span class="stat-sub" id="best-share-sub">highest difficulty hit</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-title">Blocks found</span>
+      <span class="stat-value" id="blocks">0</span>
+      <span class="stat-sub">this session</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-title">Est. time to block</span>
+      <span class="stat-value" id="eta">—</span>
+      <span class="stat-sub" id="netdiff">network difficulty —</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-title">Temperature</span>
+      <span class="stat-value" id="temp">—</span>
+      <span class="stat-sub" id="temp-sub">GPU / CPU</span>
+    </div>
+    <div class="card stat">
+      <span class="stat-title">Backend</span>
+      <span class="stat-value small" id="backend">—</span>
+      <span class="stat-sub" id="device"></span>
+    </div>
+    <div class="card stat" id="job-height-card">
+      <span class="stat-title">Mining block</span>
+      <span class="stat-value" id="job-height">—</span>
+      <span class="stat-sub" id="job-height-sub">waiting for a job</span>
+    </div>
+  </section>
+
+  <section class="card log-card">
+    <div class="log-head">
+      <span class="stat-title">Activity</span>
+      <button class="btn ghost" id="clear-log">Clear</button>
+    </div>
+    <div class="log" id="log" role="log" aria-live="polite"></div>
+  </section>
+</main>
+
+<!-- Blockfynd-overlay -->
+<div class="block-overlay hidden" id="block-overlay">
+  <div class="block-card">
+    <svg width="72" height="72" viewBox="0 0 64 64" fill="none" aria-hidden="true">
+      <polygon points="32,4 56,17 56,23 32,10 8,23 8,17" fill="currentColor"/>
+      <polygon points="8,26 32,13 56,26 56,32 32,19 8,32" fill="#E07A3F"/>
+      <polygon points="8,35 32,22 56,35 56,47 32,60 8,47" fill="currentColor"/>
+    </svg>
+    <h2>Block found!</h2>
+    <p class="mono" id="block-hash"></p>
+    <button class="btn primary" id="block-close">Nice</button>
+  </div>
+</div>
+
+<script src="main.js"></script>
+</body>
+</html>
