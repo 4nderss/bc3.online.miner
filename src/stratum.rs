@@ -22,6 +22,10 @@ pub fn run_client(shared: Arc<Shared>, submit_rx: Receiver<FoundShare>, cfg: Str
             Ok(()) => backoff = 1,
             Err(e) => {
                 eprintln!("[pool] anslutningsfel: {e} — återansluter om {backoff}s");
+                crate::ipc::emit(&crate::ipc::Event::Status {
+                    state: crate::ipc::StatusState::Connecting,
+                    message: format!("connection lost, retrying in {backoff}s"),
+                });
                 shared.clear_job();
                 std::thread::sleep(Duration::from_secs(backoff));
                 backoff = (backoff * 2).min(60);
@@ -35,7 +39,11 @@ fn session(
     submit_rx: &Receiver<FoundShare>,
     cfg: &StratumConfig,
 ) -> std::io::Result<()> {
-    println!("[pool] ansluter till {} som {}", cfg.pool, cfg.user);
+    crate::human!("[pool] ansluter till {} som {}", cfg.pool, cfg.user);
+    crate::ipc::emit(&crate::ipc::Event::Status {
+        state: crate::ipc::StatusState::Connecting,
+        message: format!("connecting to {}", cfg.pool),
+    });
     let stream = TcpStream::connect(&cfg.pool)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
@@ -60,7 +68,10 @@ fn session(
         // 1) Skicka in väntande shares.
         while let Ok(share) = submit_rx.try_recv() {
             if share.is_block_candidate {
-                println!("[MINER] ★ BLOCKKANDIDAT {} ★", share.hash_display);
+                    crate::human!("[MINER] ★ BLOCKKANDIDAT {} ★", share.hash_display);
+                crate::ipc::emit(&crate::ipc::Event::Block {
+                    hash: share.hash_display.clone(),
+                });
             }
             send(&mut writer, json!({"id": next_submit_id, "method": "mining.submit", "params": [
                 cfg.user, share.job_id, hex::encode(&share.extranonce2),
@@ -100,21 +111,31 @@ fn session(
         if msg["id"] == json!(2) {
             if msg["result"] != json!(true) {
                 eprintln!("[pool] AUKTORISERING AVVISAD: {}", msg["error"]);
+                crate::ipc::emit(&crate::ipc::Event::Status {
+                    state: crate::ipc::StatusState::Error,
+                    message: format!("pool rejected the address: {}", msg["error"]),
+                });
                 return Err(std::io::Error::new(ErrorKind::PermissionDenied, "authorize"));
             }
-            println!("[pool] auktoriserad");
+            crate::human!("[pool] auktoriserad");
+            crate::ipc::emit(&crate::ipc::Event::Status {
+                state: crate::ipc::StatusState::Mining,
+                message: "authorized — mining".into(),
+            });
             continue;
         }
         // Submit-svar.
         if let Some(id) = msg["id"].as_u64() {
             if id >= 100 {
                 use std::sync::atomic::Ordering;
-                if msg["result"] == json!(true) {
+                let accepted = msg["result"] == json!(true);
+                if accepted {
                     shared.stats.accepted.fetch_add(1, Ordering::Relaxed);
                 } else {
                     shared.stats.rejected.fetch_add(1, Ordering::Relaxed);
                     eprintln!("[pool] share avvisad: {}", msg["error"]);
                 }
+                crate::ipc::emit(&crate::ipc::Event::Share { accepted });
                 continue;
             }
         }

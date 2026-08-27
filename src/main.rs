@@ -7,6 +7,7 @@
 mod backend;
 mod consensus;
 mod gpu_worker;
+mod ipc;
 mod shared;
 mod stats;
 mod stratum;
@@ -43,10 +44,15 @@ struct Args {
     /// Sekunder mellan statistikrader.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
+
+    /// Skriv maskinläsbara JSON-rader på stdout i stället för text (GUI:t).
+    #[arg(long)]
+    json: bool,
 }
 
 fn main() {
     let args = Args::parse();
+    ipc::set_json_mode(args.json);
 
     let gpus = if matches!(args.backend, BackendKind::Cpu) {
         vec![]
@@ -63,7 +69,7 @@ fn main() {
                 eprintln!("bc3-miner: ingen OpenCL-GPU hittades");
                 std::process::exit(1);
             }
-            BackendKind::Auto => println!("[gpu] ingen GPU hittades — minar med CPU"),
+            BackendKind::Auto => human!("[gpu] ingen GPU hittades — minar med CPU"),
             BackendKind::Cpu => {}
         }
     }
@@ -76,10 +82,21 @@ fn main() {
         (None, false) => 0,        // GPU-läge: inga CPU-trådar om inte begärt
     };
 
-    println!("bc3-miner {} — {} GPU:er, {} CPU-trådar", env!("CARGO_PKG_VERSION"), gpus.len(), threads);
+    human!(
+        "bc3-miner {} — {} GPU:er, {} CPU-trådar",
+        env!("CARGO_PKG_VERSION"),
+        gpus.len(),
+        threads
+    );
     for gpu in &gpus {
-        println!("[gpu] hittad: {}", gpu.describe());
+        human!("[gpu] hittad: {}", gpu.describe());
     }
+    ipc::emit(&ipc::Event::Startup {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        backend: if gpus.is_empty() { "cpu".into() } else { "gpu".into() },
+        gpus: gpus.iter().map(|g| g.describe()).collect(),
+        cpu_threads: threads,
+    });
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel();
     let shared = Arc::new(shared::Shared::new(submit_tx));

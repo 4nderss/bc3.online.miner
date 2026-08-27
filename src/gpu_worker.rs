@@ -33,7 +33,7 @@ pub fn run_gpu_worker(
             return;
         }
     };
-    println!("[gpu] startad: {}", backend.name());
+    crate::human!("[gpu] startad: {}", backend.name());
 
     let mut batch = START_BATCH;
     loop {

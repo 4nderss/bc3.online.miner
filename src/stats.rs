@@ -21,15 +21,21 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
         let accepted = shared.stats.accepted.load(Ordering::Relaxed);
         let rejected = shared.stats.rejected.load(Ordering::Relaxed);
         let bits = shared.stats.network_bits.load(Ordering::Relaxed);
-        let eta = if rate > 0.0 && bits != 0 {
-            let expected_hashes = difficulty_of_bits(bits) * 4_294_967_296.0;
-            format_duration(expected_hashes / rate)
-        } else {
-            "—".to_string()
-        };
-        println!(
-            "[miner] {} | shares {accepted}✓ {rejected}✗ | est. block: {eta}",
-            format_hashrate(rate)
+        let network_difficulty = if bits != 0 { difficulty_of_bits(bits) } else { 0.0 };
+        let eta_secs = (rate > 0.0 && bits != 0)
+            .then(|| network_difficulty * 4_294_967_296.0 / rate);
+
+        crate::ipc::emit(&crate::ipc::Event::Stats {
+            hashrate: rate,
+            accepted,
+            rejected,
+            eta_secs,
+            network_difficulty,
+        });
+        crate::human!(
+            "[miner] {} | shares {accepted}✓ {rejected}✗ | est. block: {}",
+            format_hashrate(rate),
+            eta_secs.map(format_duration).unwrap_or_else(|| "—".into())
         );
     }
 }
