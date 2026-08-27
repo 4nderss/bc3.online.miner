@@ -1,0 +1,78 @@
+//! Hashrate-rapportering och est. time-to-block.
+
+use crate::consensus::difficulty_of_bits;
+use crate::shared::Shared;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
+    let mut last_hashes = 0u64;
+    let mut last_t = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_secs(interval_secs));
+        let hashes = shared.stats.hashes.load(Ordering::Relaxed);
+        let now = Instant::now();
+        let dt = now.duration_since(last_t).as_secs_f64();
+        let rate = (hashes - last_hashes) as f64 / dt.max(0.001);
+        last_hashes = hashes;
+        last_t = now;
+
+        let accepted = shared.stats.accepted.load(Ordering::Relaxed);
+        let rejected = shared.stats.rejected.load(Ordering::Relaxed);
+        let bits = shared.stats.network_bits.load(Ordering::Relaxed);
+        let eta = if rate > 0.0 && bits != 0 {
+            let expected_hashes = difficulty_of_bits(bits) * 4_294_967_296.0;
+            format_duration(expected_hashes / rate)
+        } else {
+            "—".to_string()
+        };
+        println!(
+            "[miner] {} | shares {accepted}✓ {rejected}✗ | est. block: {eta}",
+            format_hashrate(rate)
+        );
+    }
+}
+
+pub fn format_hashrate(rate: f64) -> String {
+    const UNITS: &[(&str, f64)] = &[
+        ("TH/s", 1e12),
+        ("GH/s", 1e9),
+        ("MH/s", 1e6),
+        ("kH/s", 1e3),
+    ];
+    for (unit, factor) in UNITS {
+        if rate >= *factor {
+            return format!("{:.2} {unit}", rate / factor);
+        }
+    }
+    format!("{rate:.0} H/s")
+}
+
+pub fn format_duration(secs: f64) -> String {
+    if !secs.is_finite() {
+        return "∞".into();
+    }
+    let s = secs as u64;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m {}s", s / 60, s % 60),
+        3600..=86_399 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+        _ => format!("{}d {}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats() {
+        assert_eq!(format_hashrate(1234.0), "1.23 kH/s");
+        assert_eq!(format_hashrate(2.5e9), "2.50 GH/s");
+        assert_eq!(format_hashrate(12.0), "12 H/s");
+        assert_eq!(format_duration(45.0), "45s");
+        assert_eq!(format_duration(3900.0), "1h 5m");
+        assert_eq!(format_duration(200_000.0), "2d 7h");
+    }
+}
