@@ -4,3 +4,6 @@ dist/
 .env
 .env.*
 !.env.example
+/target-win
+/target-linux
+/dist

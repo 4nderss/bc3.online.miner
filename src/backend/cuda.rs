@@ -1,9 +1,13 @@
-//! CUDA-backend via `cudarc` (driver-API + NVRTC). Ingen nvcc behövs vid
-//! bygge — kernelkällan kompileras till PTX i runtime. libcuda laddas
-//! dynamiskt, så binären startar även utan NVIDIA-drivrutin (detekteringen
-//! returnerar då bara en tom lista).
+//! CUDA-backend via `cudarc` (driver-API).
+//!
+//! Kerneln är FÖRKOMPILERAD till PTX vid bygget (se build.rs) och inbäddad i
+//! binären. Runtime behöver därför bara `nvcuda.dll`/`libcuda.so` — alltså
+//! grafikdrivrutinen — som JIT:ar PTX:en till kortets maskinkod. NVRTC
+//! används INTE: den ligger i CUDA Toolkit som slutanvändare inte har
+//! installerat. libcuda laddas dynamiskt, så binären startar även helt utan
+//! NVIDIA-drivrutin (detekteringen returnerar då en tom lista).
 
-use super::{header_lanes, target_limbs, MiningBackend, KERNEL_SOURCE, MAX_HITS};
+use super::{header_lanes, target_limbs, MiningBackend, MAX_HITS};
 use crate::consensus::Target;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
@@ -11,6 +15,9 @@ use cudarc::driver::{
 use std::sync::Arc;
 
 const BLOCK_DIM: u32 = 256;
+
+/// Förkompilerad kernel-PTX (byggd av build.rs).
+const SHA3T_PTX: &str = include_str!(env!("BC3_SHA3T_PTX"));
 
 /// Lista CUDA-enheter; tom lista om drivrutin/enheter saknas.
 ///
@@ -53,9 +60,11 @@ impl CudaBackend {
         let name = ctx.name().unwrap_or_else(|_| format!("CUDA-enhet {index}"));
         let stream = ctx.default_stream();
 
-        let ptx = cudarc::nvrtc::compile_ptx(KERNEL_SOURCE)
-            .map_err(|e| format!("NVRTC-kompilering av sha3t.cl misslyckades: {e}"))?;
-        let module = ctx.load_module(ptx).map_err(|e| format!("load_module: {e}"))?;
+        // Ladda den inbäddade PTX:en; drivrutinen JIT:ar den för kortet.
+        let ptx = cudarc::nvrtc::Ptx::from_src(SHA3T_PTX);
+        let module = ctx.load_module(ptx).map_err(|e| {
+            format!("kunde inte ladda kernel-PTX (drivrutin för gammal?): {e}")
+        })?;
         let func = module
             .load_function("sha3t_scan")
             .map_err(|e| format!("load_function: {e}"))?;

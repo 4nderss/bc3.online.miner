@@ -26,6 +26,8 @@ hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
+# nvrtc-featuren behövs bara för Ptx-typen — kerneln kompileras vid bygget
+# (build.rs), aldrig i runtime, så libnvrtc laddas aldrig.
 cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040",
 ], optional = true }
