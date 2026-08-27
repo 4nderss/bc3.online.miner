@@ -116,6 +116,7 @@ fn mine_job(
                 let is_block = block_target
                     .map(|t| hash_meets_target(&hash, &t))
                     .unwrap_or(false);
+                shared.record_share(crate::consensus::difficulty_of_hash(&hash), is_block);
                 let _ = shared.submit_tx.send(FoundShare {
                     job_id: job.job_id.clone(),
                     extranonce2: extranonce2.clone(),
@@ -127,6 +128,7 @@ fn mine_job(
             }
 
             shared.stats.hashes.fetch_add(count as u64, Ordering::Relaxed);
+            shared.stats.gpu_hashes.fetch_add(count as u64, Ordering::Relaxed);
 
             // Intensitet < 100 % ⇒ vila proportionellt (håller nere värme
             // och gör datorn användbar under mining).

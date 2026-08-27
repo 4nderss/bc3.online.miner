@@ -57,6 +57,7 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
                     let is_block = block_target
                         .map(|t| hash_meets_target(&hash, &t))
                         .unwrap_or(false);
+                    shared.record_share(crate::consensus::difficulty_of_hash(&hash), is_block);
                     let _ = shared.submit_tx.send(FoundShare {
                         job_id: job.job_id.clone(),
                         extranonce2: extranonce2.clone(),
@@ -74,6 +75,10 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
             shared
                 .stats
                 .hashes
+                .fetch_add(CHECK_INTERVAL as u64, Ordering::Relaxed);
+            shared
+                .stats
+                .cpu_hashes
                 .fetch_add(CHECK_INTERVAL as u64, Ordering::Relaxed);
             shared.throttle(batch_start.elapsed());
             if shared.generation.load(Ordering::Acquire) != generation {

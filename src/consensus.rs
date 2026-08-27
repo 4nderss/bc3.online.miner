@@ -136,6 +136,24 @@ pub fn target_for_difficulty(difficulty: f64) -> Target {
     out
 }
 
+/// Svårigheten en hash faktiskt nådde ("best share") = diff1-target / hash.
+/// Samma definition som poolen använder för sin best-share-statistik.
+pub fn difficulty_of_hash(hash: &[u8; 32]) -> f64 {
+    // Hashen är little-endian som tal; räkna om till f64 via big-endian-loop.
+    let mut h = 0.0f64;
+    for b in hash.iter().rev() {
+        h = h * 256.0 + *b as f64;
+    }
+    if h == 0.0 {
+        return f64::INFINITY;
+    }
+    let mut d1 = 0.0f64;
+    for b in compact_to_target(0x1d00ffff).unwrap() {
+        d1 = d1 * 256.0 + b as f64;
+    }
+    d1 / h
+}
+
 /// Nätverkssvårighet ur nBits (för ETA-beräkningen).
 pub fn difficulty_of_bits(bits: u32) -> f64 {
     let Some(t) = compact_to_target(bits) else {
@@ -243,6 +261,21 @@ mod tests {
         );
         assert!(hash_meets_target(&h, &compact_to_target(0x1d00ffff).unwrap()));
         assert!(!hash_meets_target(&h, &target_for_difficulty(100.0)));
+    }
+
+    #[test]
+    fn difficulty_of_hash_matches_known_values() {
+        // Genesis-hashen har ~36 nollbitar; diff1 motsvarar 32 ⇒ ca 2⁴.
+        let h = hash_from_display(
+            "000000000c226a41e70717f6d4fbdcb6bfb4fdc40831ccc87fa9cfdd2c57bff6",
+        );
+        let d = difficulty_of_hash(&h);
+        assert!(d > 1.0 && d < 100.0, "d = {d}");
+        // Ett target lika med diff1 ger per definition svårighet 1.
+        let diff1 = compact_to_target(0x1d00ffff).unwrap();
+        let mut le = diff1;
+        le.reverse(); // target är big-endian; hash tolkas little-endian
+        assert!((difficulty_of_hash(&le) - 1.0).abs() < 1e-9);
     }
 
     #[test]

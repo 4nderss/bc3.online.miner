@@ -36,10 +36,16 @@ pub struct FoundShare {
 
 #[derive(Default)]
 pub struct Stats {
+    /// Totalt (GPU + CPU) — summan av de två nedan.
     pub hashes: AtomicU64,
+    /// Uppdelat per backend så dual-läget kan visa båda var för sig.
+    pub gpu_hashes: AtomicU64,
+    pub cpu_hashes: AtomicU64,
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub blocks: AtomicU64,
+    /// Högsta uppnådda share-svårighet (f64 via `to_bits`) — "best share".
+    pub best_share_bits: AtomicU64,
     /// Senaste nätverks-nBits (för ETA-beräkning).
     pub network_bits: AtomicU32,
 }
@@ -67,6 +73,31 @@ impl Shared {
             stats: Stats::default(),
             submit_tx,
         }
+    }
+
+    /// Registrera en inskickad share: uppdaterar best share (och blockräknaren
+    /// när sharen också uppfyllde blockets target).
+    pub fn record_share(&self, difficulty: f64, is_block: bool) {
+        if is_block {
+            self.stats.blocks.fetch_add(1, Ordering::Relaxed);
+        }
+        let bits = difficulty.to_bits();
+        let mut cur = self.stats.best_share_bits.load(Ordering::Relaxed);
+        while difficulty > f64::from_bits(cur) {
+            match self.stats.best_share_bits.compare_exchange_weak(
+                cur,
+                bits,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    pub fn best_share(&self) -> f64 {
+        f64::from_bits(self.stats.best_share_bits.load(Ordering::Relaxed))
     }
 
     pub fn set_intensity(&self, percent: u32) {
@@ -142,6 +173,18 @@ mod tests {
         assert_eq!(s.intensity(), 1);
         s.set_intensity(9000);
         assert_eq!(s.intensity(), 100);
+    }
+
+    #[test]
+    fn best_share_keeps_the_maximum_and_counts_blocks() {
+        let s = shared();
+        assert_eq!(s.best_share(), 0.0);
+        s.record_share(12.5, false);
+        s.record_share(3.0, false); // lägre — ska inte skriva över
+        assert_eq!(s.best_share(), 12.5);
+        s.record_share(900.0, true); // ett block är också en share
+        assert_eq!(s.best_share(), 900.0);
+        assert_eq!(s.stats.blocks.load(Ordering::Relaxed), 1);
     }
 
     #[test]

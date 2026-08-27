@@ -32,13 +32,16 @@ pub struct StartOptions {
 
 /// Översätt hårdvaruvalet till CLI-flaggor.
 ///
-/// - gpu:  `--backend auto` (CLI:n startar inga CPU-trådar när en GPU finns)
-/// - cpu:  `--backend cpu` + alla kärnor
-/// - dual: `--backend auto --threads 0` (0 = alla kärnor, utöver GPU:n)
+/// - gpu: `--backend auto` (CLI:n startar inga CPU-trådar när en GPU finns)
+/// - cpu: `--backend cpu` + alla kärnor
+///
+/// Obs: kombinerad GPU+CPU-mining ("dual") finns medvetet inte i GUI:t —
+/// mätning visade lägre total hashrate än enbart GPU, eftersom CPU-trådarna
+/// konkurrerar ut GPU:ns matartråd och delar effekt/värmebudget med kortet.
+/// Den som ändå vill prova når det via CLI:n med `--threads N`.
 fn hardware_args(hardware: &str) -> Vec<String> {
     match hardware {
         "cpu" => vec!["--backend".into(), "cpu".into(), "--threads".into(), "0".into()],
-        "dual" => vec!["--backend".into(), "auto".into(), "--threads".into(), "0".into()],
         _ => vec!["--backend".into(), "auto".into()],
     }
 }
@@ -237,11 +240,8 @@ mod tests {
             hardware_args("cpu"),
             vec!["--backend", "cpu", "--threads", "0"]
         );
-        assert_eq!(
-            hardware_args("dual"),
-            vec!["--backend", "auto", "--threads", "0"]
-        );
-        // Okänt värde faller tillbaka på GPU-beteendet.
+        // Okänt värde (inkl. gammalt sparat "dual") ⇒ GPU-beteendet.
+        assert_eq!(hardware_args("dual"), vec!["--backend", "auto"]);
         assert_eq!(hardware_args("nonsense"), vec!["--backend", "auto"]);
     }
 

@@ -25,9 +25,10 @@ struct Args {
     #[arg(long, default_value = "bc3.online:3111")]
     pool: String,
 
-    /// Din BC3-adress, valfritt med riggnamn: adress.riggnamn
+    /// Din BC3-adress, valfritt med riggnamn: adress.riggnamn.
+    /// Krävs för mining, men inte för `--probe`.
     #[arg(long)]
-    user: String,
+    user: Option<String>,
 
     /// Backend: auto = CUDA om möjligt, annars OpenCL, annars CPU.
     #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
@@ -79,6 +80,11 @@ fn main() {
         return;
     }
 
+    let Some(user) = args.user else {
+        eprintln!("bc3-miner: --user <BC3-address[.rig]> is required for mining");
+        std::process::exit(2);
+    };
+
     let gpus = if matches!(args.backend, BackendKind::Cpu) {
         vec![]
     } else {
@@ -99,8 +105,13 @@ fn main() {
         }
     }
 
+    // "Alla kärnor" (0) betyder olika saker med och utan GPU: varje GPU har en
+    // matartråd som måste få CPU-tid för att hinna starta nästa kernel. Låter
+    // vi CPU-mining ta alla kärnor svälter matarna och GPU-hashraten sjunker
+    // mer än CPU:n tillför. Därför reserveras en kärna per GPU plus en till.
     let threads = match (args.threads, gpus.is_empty()) {
-        (Some(0), _) => all_cores,
+        (Some(0), true) => all_cores,
+        (Some(0), false) => all_cores.saturating_sub(gpus.len() + 1).max(1),
         (Some(n), _) => n,
         (None, true) => all_cores, // ren CPU-mining som förr
         (None, false) => 0,        // GPU-läge: inga CPU-trådar om inte begärt
@@ -156,7 +167,7 @@ fn main() {
         submit_rx,
         stratum::StratumConfig {
             pool: args.pool,
-            user: args.user,
+            user,
         },
     );
 }

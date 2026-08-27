@@ -36,8 +36,15 @@ pub enum Event {
     /// Periodisk statistik (samma takt som textutskriften).
     Stats {
         hashrate: f64,
+        /// Uppdelat per backend (0 när backenden inte används).
+        hashrate_gpu: f64,
+        hashrate_cpu: f64,
         accepted: u64,
         rejected: u64,
+        /// Högsta uppnådda share-svårighet under körningen.
+        best_share: f64,
+        /// Antal block denna körning hittat.
+        blocks: u64,
         /// Förväntad tid till block i sekunder; `null` innan hashrate finns.
         eta_secs: Option<f64>,
         network_difficulty: f64,
@@ -104,8 +111,12 @@ mod tests {
 
         let s = serde_json::to_string(&Event::Stats {
             hashrate: 1.5,
+            hashrate_gpu: 1.5,
+            hashrate_cpu: 0.0,
             accepted: 3,
             rejected: 0,
+            best_share: 1234.5,
+            blocks: 0,
             eta_secs: None,
             network_difficulty: 42.0,
             telemetry: crate::telemetry::Reading {
