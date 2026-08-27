@@ -11,8 +11,8 @@
     "windows": [
       {
         "title": "bc3.online miner",
-        "width": 980,
-        "height": 900,
+        "width": 1000,
+        "height": 980,
         "minWidth": 760,
         "minHeight": 660,
         "resizable": true,
