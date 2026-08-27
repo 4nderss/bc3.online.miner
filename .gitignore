@@ -7,3 +7,8 @@ dist/
 /target-win
 /target-linux
 /dist
+/test-build
+/target-msvc
+/target-gui
+gui/src-tauri/binaries/*.exe
+gui/src-tauri/gen/

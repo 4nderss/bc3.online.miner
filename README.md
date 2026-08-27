@@ -12,7 +12,19 @@ Release binaries are published as zip packages under [Releases](../../releases),
 
 > **Note:** mining software is often flagged by antivirus heuristics (false positive). Verify the checksum of your download against the release notes.
 
-## Quick start
+## Quick start — GUI
+
+Run **bc3-miner-gui.exe**. Paste your BC3 address, name your rig, pick PPLNS or
+Solo, press *Start mining*. The window shows live hashrate with a sparkline,
+accepted/rejected shares, estimated time to block, which backend is running,
+and a full-screen celebration when you find a block. Settings are remembered
+between runs.
+
+The GUI runs the mining core (`bc3-miner.exe`) as a child process and reads its
+JSON event stream — a GPU crash can never take the window down, and the core
+stays independently testable.
+
+## Quick start — command line
 
 ```
 bc3-miner --user <your bc1... address>.<rigname>
@@ -26,15 +38,17 @@ Backend selection is automatic: CUDA if an NVIDIA GPU is present, otherwise Open
 | `--backend auto\|cuda\|opencl\|cpu` | Force a backend (default `auto`) |
 | `--gpu-id N` | Use only the N:th detected GPU |
 | `--threads N` | CPU threads (default: all cores in CPU mode, none in GPU mode — set explicitly to mine with both) |
+| `--json` | Emit machine-readable JSON events on stdout (used by the GUI) |
 
 Solo rewards are paid directly to your address in the block you find.
 
 ## Architecture
 
 - SHA3-256t = three sequential rounds of NIST SHA3-256 over the 80-byte block header. The header fits in a single SHA3-256 rate block, so each hash is exactly 3 keccak-f[1600] permutations.
-- One shared kernel source (`src/kernels/sha3t.cl`) is compiled both by NVRTC (CUDA) and by the OpenCL runtime — the keccak core is byte-for-byte identical for both backends.
+- One shared kernel source (`src/kernels/sha3t.cl`) is compiled both to CUDA PTX (at build time) and by the OpenCL runtime — the keccak core is byte-for-byte identical for both backends.
 - The CPU builds coinbase/merkle root per extranonce2; the GPU grinds the 2³² nonce space in auto-tuned batches (~100 ms per launch). Every GPU hit is re-verified on the CPU against the consensus reference before submission.
-- CUDA and NVRTC libraries are loaded dynamically at runtime — the same binary runs on machines without an NVIDIA driver and falls back gracefully.
+- **The CUDA kernel is precompiled to PTX at build time** (see `build.rs`) and embedded in the binary. NVRTC ships with the CUDA *Toolkit*, not with the graphics driver, so runtime compilation would fail on end-user machines. The driver JITs the embedded PTX for whatever card is installed — the binary only needs `nvcuda.dll`.
+- CUDA libraries are loaded dynamically — the same binary runs on machines without an NVIDIA driver and falls back to CPU gracefully.
 
 ## Performance
 

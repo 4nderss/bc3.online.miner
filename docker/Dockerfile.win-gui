@@ -1,0 +1,19 @@
+# Korskompilering av Windows-GUI:t (Tauri, MSVC-target) från Linux.
+#
+# Tauri på Windows kräver MSVC-toolchain — cargo-xwin hämtar Microsofts
+# CRT/SDK-headers och länkar med lld. Byggs som image så att CI och lokala
+# byggen får identisk miljö.
+FROM rust:1-trixie
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+      clang lld llvm nsis nsis-pluginapi ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-msvc \
+    && cargo install --locked cargo-xwin \
+    && cargo install --locked tauri-cli --version "^2"
+
+ENV XWIN_ARCH=x86_64 \
+    XWIN_ACCEPT_LICENSE=1
+
+WORKDIR /work
