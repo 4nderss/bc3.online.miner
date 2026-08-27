@@ -48,6 +48,9 @@ pub enum Event {
         /// Förväntad tid till block i sekunder; `null` innan hashrate finns.
         eta_secs: Option<f64>,
         network_difficulty: f64,
+        /// Blockhöjden poolens senaste jobb gäller — visar att klienten är
+        /// i synk med poolen och malar på rätt block. 0 = inget jobb ännu.
+        job_height: u32,
         /// Temperatur/effekt där plattformen exponerar det (annars null).
         #[serde(flatten)]
         telemetry: crate::telemetry::Reading,
@@ -56,6 +59,8 @@ pub enum Event {
     Share { accepted: bool },
     /// Vi hittade ett block (hash i display-ordning).
     Block { hash: String },
+    /// Poolen började på ett nytt block (höjden ur jobbets coinbase).
+    NewBlockHeight { height: u32 },
     /// Svar på `--probe`: tillgänglig hårdvara (GUI:t frågar innan start).
     Probe {
         gpus: Vec<String>,
@@ -119,6 +124,7 @@ mod tests {
             blocks: 0,
             eta_secs: None,
             network_difficulty: 42.0,
+            job_height: 59_342,
             telemetry: crate::telemetry::Reading {
                 gpu_temp_c: Some(64),
                 ..Default::default()

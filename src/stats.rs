@@ -47,6 +47,7 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
             blocks: shared.stats.blocks.load(Ordering::Relaxed),
             eta_secs,
             network_difficulty,
+            job_height: shared.stats.job_height.load(Ordering::Relaxed),
             telemetry: temps,
         });
         let temp_text = match (temps.gpu_temp_c, temps.cpu_temp_c) {

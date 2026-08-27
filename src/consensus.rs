@@ -136,6 +136,36 @@ pub fn target_for_difficulty(difficulty: f64) -> Target {
     out
 }
 
+/// Läs blockhöjden ur coinbasens scriptSig (BIP34: höjden är första pushen).
+///
+/// `coinb1` är stratums första coinbase-del: version(4) | in-count(1) |
+/// prevout(36) | scriptSig-längd(varint) | scriptSig-prefix… Höjden ligger
+/// först i scriptSig som `<len> <len bytes little-endian>`.
+pub fn bip34_height(coinb1: &[u8]) -> Option<u32> {
+    let mut pos = 4 + 1 + 36; // version + antal inputs + null-prevout
+    // Hoppa över scriptSig-längden (varint).
+    let first = *coinb1.get(pos)?;
+    pos += match first {
+        0xfd => 3,
+        0xfe => 5,
+        0xff => 9,
+        _ => 1,
+    };
+    let push_len = *coinb1.get(pos)? as usize;
+    // BIP34-höjden är en minimal CScriptNum: 1–4 bytes räcker för alla
+    // realistiska höjder (>4 vore ogiltigt här).
+    if push_len == 0 || push_len > 4 {
+        return None;
+    }
+    pos += 1;
+    let bytes = coinb1.get(pos..pos + push_len)?;
+    let mut height = 0u32;
+    for (i, b) in bytes.iter().enumerate() {
+        height |= (*b as u32) << (8 * i);
+    }
+    Some(height)
+}
+
 /// Svårigheten en hash faktiskt nådde ("best share") = diff1-target / hash.
 /// Samma definition som poolen använder för sin best-share-statistik.
 pub fn difficulty_of_hash(hash: &[u8; 32]) -> f64 {
@@ -261,6 +291,31 @@ mod tests {
         );
         assert!(hash_meets_target(&h, &compact_to_target(0x1d00ffff).unwrap()));
         assert!(!hash_meets_target(&h, &target_for_difficulty(100.0)));
+    }
+
+    #[test]
+    fn bip34_height_reads_the_coinbase() {
+        // Bygg ett coinb1 som poolen gör: version | 1 input | null-prevout |
+        // scriptlen | <3><ce e7 00> (=59342) | tagg…
+        let mut cb = Vec::new();
+        cb.extend_from_slice(&2u32.to_le_bytes());
+        cb.push(0x01);
+        cb.extend_from_slice(&[0u8; 32]);
+        cb.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        cb.push(24); // scriptSig-längd (varint < 0xfd)
+        cb.extend_from_slice(&[0x03, 0xce, 0xe7, 0x00]);
+        cb.extend_from_slice(b"/bc3.online/solo/");
+        assert_eq!(bip34_height(&cb), Some(59_342));
+
+        // Två-bytes-höjd (forkhöjden 30240 = 0x7620).
+        let mut cb2 = cb[..41].to_vec();
+        cb2.push(20);
+        cb2.extend_from_slice(&[0x02, 0x20, 0x76]);
+        assert_eq!(bip34_height(&cb2), Some(30_240));
+
+        // Trasig indata ska ge None, inte panik.
+        assert_eq!(bip34_height(&[]), None);
+        assert_eq!(bip34_height(&cb[..30]), None);
     }
 
     #[test]

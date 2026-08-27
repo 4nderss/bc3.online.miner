@@ -48,6 +48,9 @@ pub struct Stats {
     pub best_share_bits: AtomicU64,
     /// Senaste nätverks-nBits (för ETA-beräkning).
     pub network_bits: AtomicU32,
+    /// Höjden på blocket vi malar på just nu (ur jobbets coinbase, BIP34).
+    /// 0 = okänd (inget jobb ännu).
+    pub job_height: AtomicU32,
 }
 
 pub struct Shared {
@@ -130,6 +133,15 @@ impl Shared {
 
     pub fn publish_job(&self, job: MinerJob) {
         self.stats.network_bits.store(job.bits, Ordering::Relaxed);
+        if let Some(h) = crate::consensus::bip34_height(&job.coinb1) {
+            // Rapportera bara vid faktiskt höjdbyte — poolen skickar nya jobb
+            // även inom samma block (nya transaktioner, ny ntime).
+            let prev = self.stats.job_height.swap(h, Ordering::Relaxed);
+            if prev != h {
+                crate::ipc::emit(&crate::ipc::Event::NewBlockHeight { height: h });
+                crate::human!("[pool] now working on block #{h}");
+            }
+        }
         *self.job.lock().unwrap() = Some(job);
         self.generation.fetch_add(1, Ordering::Release);
         self.job_cv.notify_all();
