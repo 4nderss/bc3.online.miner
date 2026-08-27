@@ -1,0 +1,15 @@
+# Utvecklings-/testimage för GPU-testerna: Rust + CUDA-runtime (libnvrtc).
+# Bygg:  docker build -t bc3-miner-cuda-dev -f docker/Dockerfile.cuda-dev .
+# Kör:   docker run --rm --gpus all -v <repo>:/work -v bc3-cargo-registry:/root/.cargo/registry \
+#          -w /work bc3-miner-cuda-dev cargo test --release -- --ignored --nocapture
+#
+# Obs: bygg sker i denna image (ubuntu 24.04) och inte i rust:1-trixie,
+# eftersom trixies glibc är nyare än ubuntu 24.04:s.
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
