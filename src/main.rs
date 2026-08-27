@@ -1,14 +1,18 @@
 //! bc3-miner — CPU/GPU-miner för BC3 (bc3.online-klienten).
 //!
-//! Denna version minar med CPU (flertrådad SHA3-256t). GPU-backends (CUDA,
-//! OpenCL) ansluts i samma jobbpipeline.
+//! GPU-backends (CUDA via NVRTC, OpenCL) och CPU-trådar delar samma
+//! jobbpipeline: stratum-klienten publicerar jobb, arbetarna partitionerar
+//! extranonce2-rymden disjunkt och rapporterar shares på samma kanal.
 
+mod backend;
 mod consensus;
+mod gpu_worker;
 mod shared;
 mod stats;
 mod stratum;
 mod worker;
 
+use backend::BackendKind;
 use clap::Parser;
 use std::sync::Arc;
 
@@ -23,9 +27,18 @@ struct Args {
     #[arg(long)]
     user: String,
 
-    /// Antal CPU-trådar (0 = alla kärnor).
-    #[arg(long, default_value_t = 0)]
-    threads: usize,
+    /// Backend: auto = CUDA om möjligt, annars OpenCL, annars CPU.
+    #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
+    backend: BackendKind,
+
+    /// Använd bara en specifik GPU (index i den detekterade listan).
+    #[arg(long)]
+    gpu_id: Option<usize>,
+
+    /// Antal CPU-trådar (0 = alla kärnor). Med GPU-backend är standard att
+    /// inga CPU-trådar startas — ange flaggan för att mina med båda.
+    #[arg(long)]
+    threads: Option<usize>,
 
     /// Sekunder mellan statistikrader.
     #[arg(long, default_value_t = 5)]
@@ -34,23 +47,58 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    let threads = if args.threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+
+    let gpus = if matches!(args.backend, BackendKind::Cpu) {
+        vec![]
     } else {
-        args.threads
+        backend::detect_gpus(args.backend, args.gpu_id)
+    };
+    if gpus.is_empty() {
+        match args.backend {
+            BackendKind::Cuda => {
+                eprintln!("bc3-miner: ingen CUDA-enhet hittades");
+                std::process::exit(1);
+            }
+            BackendKind::Opencl => {
+                eprintln!("bc3-miner: ingen OpenCL-GPU hittades");
+                std::process::exit(1);
+            }
+            BackendKind::Auto => println!("[gpu] ingen GPU hittades — minar med CPU"),
+            BackendKind::Cpu => {}
+        }
+    }
+
+    let all_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads = match (args.threads, gpus.is_empty()) {
+        (Some(0), _) => all_cores,
+        (Some(n), _) => n,
+        (None, true) => all_cores, // ren CPU-mining som förr
+        (None, false) => 0,        // GPU-läge: inga CPU-trådar om inte begärt
     };
 
-    println!("bc3-miner {} — {} CPU-trådar", env!("CARGO_PKG_VERSION"), threads);
+    println!("bc3-miner {} — {} GPU:er, {} CPU-trådar", env!("CARGO_PKG_VERSION"), gpus.len(), threads);
+    for gpu in &gpus {
+        println!("[gpu] hittad: {}", gpu.describe());
+    }
 
     let (submit_tx, submit_rx) = std::sync::mpsc::channel();
     let shared = Arc::new(shared::Shared::new(submit_tx));
 
+    // CPU-trådar och GPU:er delar en gemensam disjunkt extranonce2-partition.
+    let total_workers = threads + gpus.len();
     for i in 0..threads {
         let s = shared.clone();
         std::thread::Builder::new()
             .name(format!("worker-{i}"))
-            .spawn(move || worker::run_worker(s, i, threads))
+            .spawn(move || worker::run_worker(s, i, total_workers))
             .expect("kunde inte starta arbetstråd");
+    }
+    for (g, gpu) in gpus.into_iter().enumerate() {
+        let s = shared.clone();
+        std::thread::Builder::new()
+            .name(format!("gpu-{g}"))
+            .spawn(move || gpu_worker::run_gpu_worker(s, gpu, threads + g, total_workers))
+            .expect("kunde inte starta GPU-tråd");
     }
     {
         let s = shared.clone();

@@ -85,7 +85,8 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
     }
 }
 
-fn encode_extranonce2(counter: u64, size: usize) -> Vec<u8> {
+/// Delas med GPU-workern (samma partitionering av extranonce2-rymden).
+pub fn encode_extranonce2(counter: u64, size: usize) -> Vec<u8> {
     let bytes = counter.to_be_bytes();
     if size >= 8 {
         let mut v = vec![0u8; size - 8];
