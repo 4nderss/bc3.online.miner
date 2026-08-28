@@ -107,6 +107,46 @@ pub fn encode_extranonce2(counter: u64, size: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    /// Arbetarna far ALDRIG mala pa samma sak. Varje arbetare startar pa sitt
+    /// eget index och kliver med antalet arbetare, sa extranonce2-serierna ar
+    /// disjunkta. Overlappade de skulle en rigg med N tradar gora N ganger
+    /// samma arbete och hashraten vore en illusion.
+    #[test]
+    fn workers_never_share_an_extranonce2() {
+        let total_workers = 8usize;
+        let per_worker = 500u64;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for worker_index in 0..total_workers {
+            let mut counter = worker_index as u64;
+            for _ in 0..per_worker {
+                let en2 = encode_extranonce2(counter, 4);
+                assert!(
+                    seen.insert(en2.clone()),
+                    "arbetare {worker_index} fick en extranonce2 nagon annan redan hade: {en2:02x?}"
+                );
+                counter += total_workers as u64;
+            }
+        }
+        assert_eq!(seen.len(), total_workers * per_worker as usize);
+    }
+
+    /// Samma partitionering maste galla oavsett antal arbetare — aven 1.
+    #[test]
+    fn partitioning_holds_for_any_worker_count() {
+        for total in [1usize, 2, 3, 20] {
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            for w in 0..total {
+                let mut c = w as u64;
+                for _ in 0..50 {
+                    assert!(seen.insert(encode_extranonce2(c, 4)));
+                    c += total as u64;
+                }
+            }
+            assert_eq!(seen.len(), total * 50);
+        }
+    }
 
     #[test]
     fn extranonce2_encoding() {
