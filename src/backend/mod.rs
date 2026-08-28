@@ -8,6 +8,8 @@
 #[cfg(feature = "cuda")]
 pub mod cuda;
 #[cfg(feature = "opencl")]
+pub mod cl_sys;
+#[cfg(feature = "opencl")]
 pub mod opencl;
 
 use crate::consensus::Target;

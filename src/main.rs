@@ -68,10 +68,18 @@ fn main() {
     let all_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
     if args.probe {
-        let gpus: Vec<String> = backend::detect_gpus(BackendKind::Auto, None)
+        // Proben är diagnostik: lista BÅDA vägarna, inte bara den Auto skulle
+        // valt. På ett NVIDIA-kort vinner CUDA i Auto, och då hade man aldrig
+        // sett om OpenCL-runtimen också fungerar.
+        let mut gpus: Vec<String> = backend::detect_gpus(BackendKind::Cuda, None)
             .iter()
             .map(|g| g.describe())
             .collect();
+        gpus.extend(
+            backend::detect_gpus(BackendKind::Opencl, None)
+                .iter()
+                .map(|g| g.describe()),
+        );
         ipc::emit(&ipc::Event::Probe {
             gpus: gpus.clone(),
             cpu_cores: all_cores,

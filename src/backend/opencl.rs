@@ -1,36 +1,74 @@
-//! OpenCL-backend via `opencl3` (NVIDIA/AMD/Intel). Delar kernelkälla med
-//! CUDA-backenden (src/kernels/sha3t.cl) — bitexaktheten följer därmed av
-//! CUDA-testerna; runtime-test av just OpenCL-vägen kräver native Windows
-//! (ingen OpenCL-GPU-runtime i WSL/Docker), se test nederst.
+//! OpenCL-backend (AMD/Intel/NVIDIA). Delar kernelkälla med CUDA-backenden
+//! (src/kernels/sha3t.cl), så bitexaktheten följer av samma kernel.
+//!
+//! Runtime laddas dynamiskt (se `cl_sys`) — binären startar och faller
+//! tillbaka på CPU även på maskiner helt utan OpenCL.
 
+use super::cl_sys::{
+    check, cl, cl_handle, cl_int, cl_uint, cstr, err_str, info_string, CL_DEVICE_NAME,
+    CL_DEVICE_TYPE_GPU, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_PROGRAM_BUILD_LOG, CL_SUCCESS,
+    CL_TRUE,
+};
 use super::{header_lanes, target_limbs, MiningBackend, KERNEL_SOURCE, MAX_HITS};
 use crate::consensus::Target;
-use opencl3::command_queue::CommandQueue;
-use opencl3::context::Context;
-use opencl3::device::{Device, CL_DEVICE_TYPE_GPU};
-use opencl3::kernel::{ExecuteKernel, Kernel};
-use opencl3::memory::{Buffer, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE};
-use opencl3::platform::get_platforms;
-use opencl3::program::Program;
-use opencl3::types::CL_BLOCKING;
+use std::ffi::c_void;
 use std::ptr;
 
 const LOCAL_SIZE: usize = 256;
 
-/// Lista alla GPU-enheter över alla OpenCL-plattformar; tom vid fel.
+/// Enheter per plattform, i samma ordning som `list_devices` numrerar dem.
+fn devices_of(platform: cl_handle, dtype: u64) -> Vec<cl_handle> {
+    let Ok(cl) = cl() else { return vec![] };
+    let mut n: cl_uint = 0;
+    // SAFETY: OpenCL-anrop med giltiga pekare; n skrivs bara vid CL_SUCCESS.
+    unsafe {
+        if (cl.get_device_ids)(platform, dtype, 0, ptr::null_mut(), &mut n)
+            != CL_SUCCESS
+            || n == 0
+        {
+            return vec![];
+        }
+        let mut ids = vec![ptr::null_mut(); n as usize];
+        if (cl.get_device_ids)(platform, dtype, n, ids.as_mut_ptr(), ptr::null_mut())
+            != CL_SUCCESS
+        {
+            return vec![];
+        }
+        ids
+    }
+}
+
+fn platforms() -> Vec<cl_handle> {
+    let Ok(cl) = cl() else { return vec![] };
+    let mut n: cl_uint = 0;
+    unsafe {
+        if (cl.get_platform_ids)(0, ptr::null_mut(), &mut n) != CL_SUCCESS || n == 0 {
+            return vec![];
+        }
+        let mut ids = vec![ptr::null_mut(); n as usize];
+        if (cl.get_platform_ids)(n, ids.as_mut_ptr(), ptr::null_mut()) != CL_SUCCESS {
+            return vec![];
+        }
+        ids
+    }
+}
+
+fn device_name(device: cl_handle) -> Option<String> {
+    let cl = cl().ok()?;
+    info_string(|size, buf, len| unsafe {
+        (cl.get_device_info)(device, CL_DEVICE_NAME, size, buf, len)
+    })
+    .ok()
+    .filter(|s| !s.is_empty())
+}
+
+/// Lista alla GPU-enheter över alla plattformar; tom lista vid fel eller om
+/// ingen OpenCL-runtime finns.
 pub fn list_devices() -> Vec<super::GpuDevice> {
-    let Ok(platforms) = get_platforms() else {
-        return vec![];
-    };
     let mut out = Vec::new();
-    for (pi, platform) in platforms.iter().enumerate() {
-        let Ok(ids) = platform.get_devices(CL_DEVICE_TYPE_GPU) else {
-            continue;
-        };
-        for (di, id) in ids.into_iter().enumerate() {
-            let name = Device::new(id)
-                .name()
-                .unwrap_or_else(|_| format!("OpenCL-enhet {pi}.{di}"));
+    for (pi, platform) in platforms().into_iter().enumerate() {
+        for (di, device) in devices_of(platform, CL_DEVICE_TYPE_GPU).into_iter().enumerate() {
+            let name = device_name(device).unwrap_or_else(|| format!("OpenCL device {pi}.{di}"));
             out.push(super::GpuDevice::Opencl { platform: pi, device: di, name });
         }
     }
@@ -38,61 +76,165 @@ pub fn list_devices() -> Vec<super::GpuDevice> {
 }
 
 pub struct OpenClBackend {
-    queue: CommandQueue,
-    kernel: Kernel,
+    context: cl_handle,
+    queue: cl_handle,
+    program: cl_handle,
+    kernel: cl_handle,
+    d_lanes: cl_handle,
+    d_hits: cl_handle,
     name: String,
-    d_lanes: Buffer<u64>,
-    d_hits: Buffer<u32>,
     hits_reset: Vec<u32>,
-    // Context måste överleva buffertarna.
-    _context: Context,
 }
 
 impl OpenClBackend {
     pub fn new(platform_idx: usize, device_idx: usize) -> Result<Self, String> {
-        let platforms = get_platforms().map_err(|e| format!("get_platforms: {e}"))?;
-        let platform = platforms
+        Self::new_typed(platform_idx, device_idx, CL_DEVICE_TYPE_GPU)
+    }
+
+    /// Enhetstypen är en parameter så att testerna kan köra mot pocl, som
+    /// exponerar en CPU-enhet. Produktionsvägen tar bara GPU:er — en
+    /// OpenCL-CPU vore långsammare än vår egen CPU-backend.
+    fn new_typed(platform_idx: usize, device_idx: usize, dtype: u64) -> Result<Self, String> {
+        let cl = cl()?;
+        let platform = *platforms()
             .get(platform_idx)
-            .ok_or_else(|| format!("OpenCL-plattform {platform_idx} saknas"))?;
-        let ids = platform
-            .get_devices(CL_DEVICE_TYPE_GPU)
-            .map_err(|e| format!("get_devices: {e}"))?;
-        let id = *ids
+            .ok_or_else(|| format!("OpenCL platform {platform_idx} not found"))?;
+        let device = *devices_of(platform, dtype)
             .get(device_idx)
-            .ok_or_else(|| format!("OpenCL-enhet {platform_idx}.{device_idx} saknas"))?;
-        let device = Device::new(id);
-        let name = device
-            .name()
-            .unwrap_or_else(|_| format!("OpenCL-enhet {platform_idx}.{device_idx}"));
+            .ok_or_else(|| format!("OpenCL device {platform_idx}.{device_idx} not found"))?;
+        let name =
+            device_name(device).unwrap_or_else(|| format!("OpenCL device {platform_idx}.{device_idx}"));
 
-        let context = Context::from_device(&device).map_err(|e| format!("Context: {e}"))?;
-        let program = Program::create_and_build_from_source(&context, KERNEL_SOURCE, "")
-            .map_err(|e| format!("OpenCL-bygge av sha3t.cl misslyckades:\n{e}"))?;
-        let kernel = Kernel::create(&program, "sha3t_scan").map_err(|e| format!("Kernel: {e}"))?;
-        // Legacy-kön (clCreateCommandQueue) fungerar på alla OpenCL-versioner
-        // — den "moderna" varianten kräver OpenCL 2.0-runtime.
-        #[allow(deprecated)]
-        let queue =
-            CommandQueue::create_default(&context, 0).map_err(|e| format!("CommandQueue: {e}"))?;
+        unsafe {
+            let mut err: cl_int = CL_SUCCESS;
+            let context = (cl.create_context)(
+                ptr::null(),
+                1,
+                &device,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut err,
+            );
+            check("clCreateContext", err)?;
+            if context.is_null() {
+                return Err("clCreateContext returned null".into());
+            }
+            // Städa upp allt som hunnit skapas om ett senare steg fallerar.
+            let guard = |c: cl_handle| {
+                let _ = (cl.release_context)(c);
+            };
 
-        let d_lanes = unsafe {
-            Buffer::<u64>::create(&context, CL_MEM_READ_ONLY, 10, ptr::null_mut())
-                .map_err(|e| format!("alloc lanes: {e}"))?
-        };
-        let d_hits = unsafe {
-            Buffer::<u32>::create(&context, CL_MEM_READ_WRITE, 1 + MAX_HITS, ptr::null_mut())
-                .map_err(|e| format!("alloc hits: {e}"))?
-        };
+            // Kön: den gamla varianten fungerar överallt, den nya krävs på
+            // runtimes som tagit bort den (OpenCL 2.0+ utan kompatibilitet).
+            let queue = if let Some(f) = cl.create_command_queue {
+                f(context, device, 0, &mut err)
+            } else {
+                let props = [0u64; 1]; // tom, nullterminerad egenskapslista
+                (cl.create_command_queue_with_properties.unwrap())(
+                    context,
+                    device,
+                    props.as_ptr(),
+                    &mut err,
+                )
+            };
+            if err != CL_SUCCESS || queue.is_null() {
+                guard(context);
+                return Err(format!("clCreateCommandQueue: {}", err_str(err)));
+            }
 
-        Ok(Self {
-            queue,
-            kernel,
-            name,
-            d_lanes,
-            d_hits,
-            hits_reset: vec![0u32; 1 + MAX_HITS],
-            _context: context,
-        })
+            let src = cstr(KERNEL_SOURCE);
+            let src_ptr = src.as_ptr();
+            let src_len = KERNEL_SOURCE.len();
+            let program =
+                (cl.create_program_with_source)(context, 1, &src_ptr, &src_len, &mut err);
+            if err != CL_SUCCESS || program.is_null() {
+                let _ = (cl.release_command_queue)(queue);
+                guard(context);
+                return Err(format!("clCreateProgramWithSource: {}", err_str(err)));
+            }
+
+            let code = (cl.build_program)(
+                program,
+                1,
+                &device,
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            if code != CL_SUCCESS {
+                // Byggloggen är det enda som säger VAD som gick fel i kerneln.
+                let log = info_string(|size, buf, len| {
+                    (cl.get_program_build_info)(
+                        program,
+                        device,
+                        CL_PROGRAM_BUILD_LOG,
+                        size,
+                        buf,
+                        len,
+                    )
+                })
+                .unwrap_or_else(|e| format!("(build log unavailable: {e})"));
+                let _ = (cl.release_program)(program);
+                let _ = (cl.release_command_queue)(queue);
+                guard(context);
+                return Err(format!(
+                    "building sha3t.cl failed: {}\n{log}",
+                    err_str(code)
+                ));
+            }
+
+            let kname = cstr("sha3t_scan");
+            let kernel = (cl.create_kernel)(program, kname.as_ptr(), &mut err);
+            if err != CL_SUCCESS || kernel.is_null() {
+                let _ = (cl.release_program)(program);
+                let _ = (cl.release_command_queue)(queue);
+                guard(context);
+                return Err(format!("clCreateKernel: {}", err_str(err)));
+            }
+
+            let d_lanes = (cl.create_buffer)(
+                context,
+                CL_MEM_READ_ONLY,
+                10 * std::mem::size_of::<u64>(),
+                ptr::null_mut(),
+                &mut err,
+            );
+            check("clCreateBuffer(lanes)", err)?;
+            let d_hits = (cl.create_buffer)(
+                context,
+                CL_MEM_READ_WRITE,
+                (1 + MAX_HITS) * std::mem::size_of::<u32>(),
+                ptr::null_mut(),
+                &mut err,
+            );
+            check("clCreateBuffer(hits)", err)?;
+
+            Ok(Self {
+                context,
+                queue,
+                program,
+                kernel,
+                d_lanes,
+                d_hits,
+                name,
+                hits_reset: vec![0u32; 1 + MAX_HITS],
+            })
+        }
+    }
+}
+
+impl Drop for OpenClBackend {
+    fn drop(&mut self) {
+        let Ok(cl) = cl() else { return };
+        // Omvänd skapandeordning; felkoder är ointressanta här.
+        unsafe {
+            let _ = (cl.release_mem_object)(self.d_hits);
+            let _ = (cl.release_mem_object)(self.d_lanes);
+            let _ = (cl.release_kernel)(self.kernel);
+            let _ = (cl.release_program)(self.program);
+            let _ = (cl.release_command_queue)(self.queue);
+            let _ = (cl.release_context)(self.context);
+        }
     }
 }
 
@@ -111,38 +253,90 @@ impl MiningBackend for OpenClBackend {
         if count == 0 {
             return Ok(vec![]);
         }
+        let cl = cl()?;
         let lanes = header_lanes(header76);
         let t = target_limbs(target);
+        let max_hits = MAX_HITS as u32;
 
         unsafe {
-            self.queue
-                .enqueue_write_buffer(&mut self.d_lanes, CL_BLOCKING, 0, &lanes, &[])
-                .map_err(|e| format!("write lanes: {e}"))?;
-            self.queue
-                .enqueue_write_buffer(&mut self.d_hits, CL_BLOCKING, 0, &self.hits_reset, &[])
-                .map_err(|e| format!("write hits: {e}"))?;
+            check(
+                "write lanes",
+                (cl.enqueue_write_buffer)(
+                    self.queue,
+                    self.d_lanes,
+                    CL_TRUE,
+                    0,
+                    std::mem::size_of_val(&lanes),
+                    lanes.as_ptr() as *mut c_void,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+            )?;
+            check(
+                "reset hits",
+                (cl.enqueue_write_buffer)(
+                    self.queue,
+                    self.d_hits,
+                    CL_TRUE,
+                    0,
+                    std::mem::size_of_val(&self.hits_reset[..]),
+                    self.hits_reset.as_ptr() as *mut c_void,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+            )?;
+
+            // Argumentordningen måste matcha sha3t_scan i sha3t.cl exakt.
+            let set = |i: cl_uint, size: usize, p: *const c_void| -> Result<(), String> {
+                check(&format!("set arg {i}"), (cl.set_kernel_arg)(self.kernel, i, size, p))
+            };
+            let hsz = std::mem::size_of::<cl_handle>();
+            set(0, hsz, &self.d_lanes as *const _ as *const c_void)?;
+            set(1, 4, &start_nonce as *const _ as *const c_void)?;
+            set(2, 4, &count as *const _ as *const c_void)?;
+            for (k, limb) in t.iter().enumerate() {
+                set(3 + k as cl_uint, 8, limb as *const _ as *const c_void)?;
+            }
+            set(7, hsz, &self.d_hits as *const _ as *const c_void)?;
+            set(8, 4, &max_hits as *const _ as *const c_void)?;
 
             // Global rundas upp till multipel av local; kerneln vaktar count.
             let global = (count as usize).div_ceil(LOCAL_SIZE) * LOCAL_SIZE;
-            ExecuteKernel::new(&self.kernel)
-                .set_arg(&self.d_lanes)
-                .set_arg(&start_nonce)
-                .set_arg(&count)
-                .set_arg(&t[0])
-                .set_arg(&t[1])
-                .set_arg(&t[2])
-                .set_arg(&t[3])
-                .set_arg(&self.d_hits)
-                .set_arg(&(MAX_HITS as u32))
-                .set_global_work_size(global)
-                .set_local_work_size(LOCAL_SIZE)
-                .enqueue_nd_range(&self.queue)
-                .map_err(|e| format!("enqueue: {e}"))?;
+            let local = LOCAL_SIZE;
+            check(
+                "clEnqueueNDRangeKernel",
+                (cl.enqueue_nd_range_kernel)(
+                    self.queue,
+                    self.kernel,
+                    1,
+                    ptr::null(),
+                    &global,
+                    &local,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+            )?;
 
             let mut hits = vec![0u32; 1 + MAX_HITS];
-            self.queue
-                .enqueue_read_buffer(&self.d_hits, CL_BLOCKING, 0, &mut hits, &[])
-                .map_err(|e| format!("read hits: {e}"))?;
+            check(
+                "read hits",
+                (cl.enqueue_read_buffer)(
+                    self.queue,
+                    self.d_hits,
+                    CL_TRUE,
+                    0,
+                    std::mem::size_of_val(&hits[..]),
+                    hits.as_mut_ptr() as *mut c_void,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
+            )?;
+            check("clFinish", (cl.finish)(self.queue))?;
+
             let n = (hits[0] as usize).min(MAX_HITS);
             Ok(hits[1..1 + n].to_vec())
         }
@@ -152,16 +346,25 @@ impl MiningBackend for OpenClBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::cl_sys::CL_DEVICE_TYPE_ALL;
     use crate::consensus::{hash_meets_target, sha3t};
 
-    // Kan bara köras på en maskin med OpenCL-GPU-runtime (t.ex. native
-    // Windows med NVIDIA-drivrutin) — inte i WSL/Docker. Samma facit-metod
-    // som CUDA-testerna: exakt träffmängdsjämförelse mot CPU-referensen.
+    /// Kräver en OpenCL-runtime. I CI/Docker räcker pocl (CPU-implementation):
+    ///   apt-get install -y pocl-opencl-icd
+    ///   cargo test --features opencl -- --ignored opencl
+    /// På en riktig maskin testas i stället GPU-drivrutinens runtime.
+    ///
+    /// Samma facit-metod som CUDA-testerna: exakt jämförelse av träffmängden
+    /// mot CPU-referensen, plus en nonce som garanterat MÅSTE hittas.
     #[test]
-    #[ignore = "kräver OpenCL-GPU-runtime (native Windows) — ej WSL/Docker"]
+    #[ignore = "requires an OpenCL runtime (pocl in Docker, or a GPU driver)"]
     fn opencl_matches_cpu_on_random_headers() {
-        let mut backend = OpenClBackend::new(0, 0).expect("OpenCL-backend");
+        // ALL i stället för GPU: pocl exponerar en CPU-enhet, och poängen
+        // med testet är kernelvägen — inte vilken sorts enhet som kör den.
+        let mut backend = OpenClBackend::new_typed(0, 0, CL_DEVICE_TYPE_ALL)
+            .expect("OpenCL backend");
         println!("backend: {}", backend.name());
+
         let mut seed = 0xbc3_0c1_u64;
         let mut xorshift = move || {
             seed ^= seed << 13;
@@ -176,8 +379,7 @@ mod tests {
             }
             let start = xorshift() as u32;
             let count = 4096u32;
-            // Target = minsta hashen i intervallet ⇒ exakt en garanterad träff
-            // (samma metod som CUDA-testet).
+            // Target = minsta hashen i intervallet ⇒ exakt en garanterad träff.
             let mut header80 = [0u8; 80];
             header80[..76].copy_from_slice(&header76);
             let (pick, target) = (0..count)
@@ -201,8 +403,25 @@ mod tests {
                 })
                 .collect();
             cpu.sort_unstable();
-            assert!(gpu.contains(&pick), "runda {round}: vald nonce saknas");
-            assert_eq!(gpu, cpu, "runda {round}: GPU- och CPU-mängderna skiljer");
+            assert!(gpu.contains(&pick), "round {round}: the chosen nonce is missing");
+            assert_eq!(gpu, cpu, "round {round}: GPU and CPU hit sets differ");
         }
+    }
+
+    /// Tomt intervall får aldrig nå fram till en kernel-launch.
+    #[test]
+    #[ignore = "requires an OpenCL runtime"]
+    fn zero_count_is_a_no_op() {
+        let mut backend = OpenClBackend::new_typed(0, 0, CL_DEVICE_TYPE_ALL)
+            .expect("OpenCL backend");
+        let hits = backend.scan_range(&[0u8; 76], 0, 0, &[0xff; 32]).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    /// Utan runtime ska list_devices ge tom lista, inte panik. Kan köras
+    /// överallt.
+    #[test]
+    fn list_devices_never_panics() {
+        let _ = list_devices();
     }
 }

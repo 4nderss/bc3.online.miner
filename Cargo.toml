@@ -13,11 +13,14 @@ path = "src/main.rs"
 [features]
 # CUDA är på som standard: libcuda/libnvrtc laddas dynamiskt i runtime, så
 # binären fungerar även på maskiner utan NVIDIA-drivrutin (CPU-fallback).
-default = ["cuda"]
+# Bada GPU-vagarna ingar i standardbygget: bada laddas dynamiskt i runtime,
+# sa EN binar kor CUDA pa NVIDIA, OpenCL pa AMD/Intel och CPU om inget finns.
+default = ["cuda", "opencl"]
 cuda = ["dep:cudarc", "dep:nvml-wrapper"]
-# OpenCL kräver en OpenCL-loader vid länkning (OpenCL.dll/libOpenCL.so) och
-# byggs därför bara på begäran: cargo build --features opencl
-opencl = ["dep:opencl3"]
+# OpenCL laddas dynamiskt via src/backend/cl_sys.rs — INTE lankat mot
+# OpenCL.lib/libOpenCL.so. Statisk lankning hade gjort att binaren vagrade
+# starta pa maskiner utan OpenCL-runtime.
+opencl = ["dep:libloading"]
 
 [dependencies]
 sha3 = "0.10"
@@ -32,7 +35,7 @@ nvml-wrapper = { version = "0.10", optional = true }
 cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040",
 ], optional = true }
-opencl3 = { version = "0.9", optional = true }
+libloading = { version = "0.8", optional = true }
 
 # Obs: inte panic = "abort" — cudarc:s dynamiska laddare panikar om libcuda
 # saknas, och CUDA-detekteringen fångar det med catch_unwind (CPU-fallback).
