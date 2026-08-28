@@ -28,8 +28,12 @@ stays independently testable.
 ## Quick start — command line
 
 ```
-bc3-miner --user <your bc1... address>.<rigname>
+bc3-miner --user <your BC3 address>.<rigname>
 ```
+
+Any Bitcoin-format address works: native segwit (bc1q...), taproot (bc1p...)
+and the legacy formats (1... and 3...). Payouts go to it directly in the
+block's coinbase.
 
 Backend selection is automatic: CUDA if an NVIDIA GPU is present, otherwise OpenCL, otherwise CPU. Options:
 
