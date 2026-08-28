@@ -183,11 +183,23 @@ function updateIntensityLabel() {
 el("intensity").addEventListener("input", updateIntensityLabel);
 el("intensity").addEventListener("change", saveSettings);
 
-/// En BC3-adress är bech32 med hrp "bc" — poolen gör den slutgiltiga
-/// valideringen, här räcker en grovkoll så Start inte kan tryckas i onödan.
+/// Grovkoll så Start inte kan tryckas i onödan — poolen gör den slutgiltiga
+/// valideringen vid authorize.
+///
+/// BC3 använder Bitcoins alla adressformat. Den här funktionen krävde
+/// tidigare prefixet "bc1" och stängde därmed av Start helt för alla med en
+/// legacy-adress (1… eller 3…), trots att poolen accepterar dem. Att vara
+/// för strikt här är just vad som bröt det — hellre släppa igenom något
+/// tveksamt och låta poolen säga ifrån.
 function addressLooksValid(addr) {
-  const a = addr.trim().toLowerCase();
-  return a.startsWith("bc1") && a.length >= 26 && a.length <= 90 && /^[a-z0-9]+$/.test(a);
+  const a = (addr || "").trim();
+  if (!a) return false;
+  // bech32/bech32m (segwit v0 och taproot). BIP173 tillåter en helt versal
+  // adress, så prefixet måste matchas skiftlägesokänsligt.
+  if (/^bc1[a-z0-9]{20,87}$/i.test(a)) return true;
+  // Legacy base58check: P2PKH (1…) och P2SH (3…). Base58 saknar 0, O, I och l.
+  if (/^[13][1-9A-HJ-NP-Za-km-z]{25,39}$/.test(a)) return true;
+  return false;
 }
 
 /// Start är avstängd tills adressen ser rimlig ut (och alltid aktiv för Stop).
@@ -197,7 +209,7 @@ function updateStartEnabled() {
   const err = el("address-error");
   const typed = el("address").value.trim().length > 0;
   if (!ok && typed) {
-    err.textContent = "A BC3 address starts with bc1…";
+    err.textContent = "Enter a BC3 address — bc1…, 1… or 3…";
     el("address").classList.add("invalid");
   } else {
     err.textContent = "";
