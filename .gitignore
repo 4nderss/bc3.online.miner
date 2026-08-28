@@ -5,6 +5,8 @@
 /target-msvc
 /target-gui
 /test-build
+# wasm-craten har eget target — /target ovan ar rotankrat och matchar inte det.
+wasm/target
 
 # Färdiga releasepaket — OBS: mönstret måste vara rotankrat, annars
 # matchar det även gui/dist (GUI:ts frontend, som SKA ligga i repot).
