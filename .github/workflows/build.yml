@@ -37,7 +37,11 @@ jobs:
       # The GUI embeds the CLI as a Tauri sidecar, so it has to be in place
       # before the GUI is built - not copied into the zip afterwards.
       - name: Stage sidecar
-        run: copy target\release\bc3-miner.exe gui\src-tauri\binaries\bc3-miner-x86_64-pc-windows-msvc.exe
+        shell: pwsh
+        run: |
+          # binaries/ is gitignored, so on a fresh checkout it does not exist.
+          New-Item -ItemType Directory -Force -Path gui/src-tauri/binaries | Out-Null
+          Copy-Item target/release/bc3-miner.exe gui/src-tauri/binaries/bc3-miner-x86_64-pc-windows-msvc.exe
 
       - name: Build GUI
         run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml
