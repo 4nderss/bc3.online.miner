@@ -71,6 +71,15 @@ struct Args {
     #[arg(long)]
     json: bool,
 
+    /// Exit instead of falling back to CPU when no GPU is found.
+    ///
+    /// For rented GPU machines: a container that quietly mines on CPU is
+    /// still billed at GPU prices, and the only symptom is a hashrate that
+    /// looks like someone unplugged something. Failing makes the host's
+    /// restart policy or alerting notice.
+    #[arg(long, env = "BC3_REQUIRE_GPU")]
+    require_gpu: bool,
+
     /// List available hardware and exit (the GUI asks before starting).
     #[arg(long)]
     probe: bool,
@@ -173,6 +182,12 @@ fn main() {
             }
             BackendKind::Opencl => {
                 eprintln!("bc3-miner: no OpenCL GPU found");
+                std::process::exit(1);
+            }
+            BackendKind::Auto if args.require_gpu => {
+                eprintln!("bc3-miner: no GPU found, and --require-gpu is set.");
+                eprintln!("  On a container host this usually means the NVIDIA runtime");
+                eprintln!("  is not in use, so no device ever reached the container.");
                 std::process::exit(1);
             }
             BackendKind::Auto => human!("[gpu] no GPU found — mining on CPU"),

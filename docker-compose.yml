@@ -1,19 +1,21 @@
-# Example. Copy, set your address, and `docker compose up -d`.
+# Two patterns. Pick one, set your address, and `docker compose up -d`.
 #
 #   docker compose up -d          start
-#   docker compose logs -f        watch it
+#   docker compose logs -f        watch it; the first lines say how many GPUs
 #   docker compose down           stop
 services:
+  # ONE CONTAINER, ALL GPUS.
+  # Simplest, and correct: every card gets its own worker with its own slice
+  # of the nonce space. The pool sees one rig with the combined hashrate.
   bc3-miner:
     image: ghcr.io/4nderss/bc3-miner:latest
     restart: unless-stopped
     environment:
       BC3_WALLET: bc1qyouraddresshere
       BC3_WORKER: rig1
-      # BC3_MODE: solo        # default is pplns
-      # BC3_INTENSITY: 80     # below 100 the machine stays usable
-    # NVIDIA. Remove this block to mine on CPU, or swap it for the devices
-    # block below on AMD/Intel.
+      # BC3_MODE: solo          # default is pplns
+      # BC3_INTENSITY: 80       # below 100 the machine stays usable
+      # BC3_REQUIRE_GPU: "1"    # exit instead of mining on CPU
     deploy:
       resources:
         reservations:
@@ -21,7 +23,33 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    # AMD or Intel via OpenCL:
+    # AMD or Intel via OpenCL - replace the deploy block above with:
     # devices:
     #   - /dev/kfd
     #   - /dev/dri
+
+  # ONE CONTAINER PER GPU.
+  # More to write, but the pool then reports hashrate, last share and found
+  # blocks per card. On a machine you rent by the hour that is the difference
+  # between "the hashrate dipped" and "card 2 is dead". Uncomment to use, and
+  # delete the single-container service above.
+  #
+  # gpu0:
+  #   image: ghcr.io/4nderss/bc3-miner:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     BC3_WALLET: bc1qyouraddresshere
+  #     BC3_WORKER: rig1-gpu0
+  #     BC3_GPU_ID: "0"
+  #     BC3_REQUIRE_GPU: "1"
+  #   deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: all, capabilities: [gpu] }] } } }
+  #
+  # gpu1:
+  #   image: ghcr.io/4nderss/bc3-miner:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     BC3_WALLET: bc1qyouraddresshere
+  #     BC3_WORKER: rig1-gpu1
+  #     BC3_GPU_ID: "1"
+  #     BC3_REQUIRE_GPU: "1"
+  #   deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: all, capabilities: [gpu] }] } } }

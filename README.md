@@ -88,6 +88,8 @@ to CPU when there is nothing.
 | `BC3_BACKEND` | `auto` | `auto`, `cuda`, `opencl` or `cpu`. |
 | `BC3_THREADS` | none in GPU mode | CPU threads. |
 | `BC3_INTENSITY` | `100` | 1–100. Below 100 the machine stays usable. |
+| `BC3_GPU_ID` | all | Use only this one GPU, counting from 0. |
+| `BC3_REQUIRE_GPU` | unset | Exit rather than fall back to CPU. |
 
 Casing does not matter: `BC3_WALLET` and `bc3_wallet` both work. Environment
 variables *are* case-sensitive on Linux and Docker passes them through
@@ -106,8 +108,27 @@ canonical one before reading them.
 Without GPU access the miner does not fail — it mines on CPU. Check
 `docker logs bc3-miner` to see which backend it picked.
 
-`docker-compose.yml` in this repository is a working example, including the
-GPU reservation block.
+### On rented GPU hosts
+
+Most GPU rental platforms only let you name an image and set environment
+variables - there is no place to put `--gpus all`. That is fine: those hosts
+run the NVIDIA container runtime as Docker's *default* runtime, and `--gpus
+all` is only a wrapper that sets `NVIDIA_VISIBLE_DEVICES`. This image already
+declares it, so the GPUs are exposed without any flag. Set
+`NVIDIA_VISIBLE_DEVICES=0,1` yourself if you want only some of them.
+
+One container uses **every** GPU it finds, each with its own worker and its own
+slice of the nonce space. Running one container per card with `BC3_GPU_ID` is
+worth it anyway on a rented machine: the pool then reports hashrate, last share
+and found blocks per card, so a dead card is visible as a dead card rather than
+as an unexplained dip.
+
+Set `BC3_REQUIRE_GPU=1` there. Without it the miner falls back to CPU when no
+device reaches the container, and you go on paying GPU prices for CPU hashrate
+with nothing in the logs but a low number. With it the container exits and the
+host's restart policy or alerting has something to notice.
+
+`docker-compose.yml` in this repository has both patterns as a working example.
 
 ## Architecture
 
