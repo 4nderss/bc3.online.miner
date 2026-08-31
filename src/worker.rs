@@ -1,5 +1,5 @@
-//! Arbetstrådar: bygger coinbase per extranonce2, malar nonce-rymden med
-//! SHA3-256t och rapporterar shares.
+//! Worker threads: build the coinbase per extranonce2, grind the nonce space
+//! with SHA3-256t and report shares.
 
 use crate::consensus::{
     compact_to_target, hash_meets_target, root_from_steps, sha256d, BlockHeader,
@@ -8,7 +8,7 @@ use crate::shared::{FoundShare, MinerJob, Shared};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// Hur ofta trådarna kollar efter nya jobb (i antal hashar).
+/// How often the threads check for new jobs (counted in hashes).
 const CHECK_INTERVAL: u32 = 4096;
 
 pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize) {
@@ -20,13 +20,14 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize) {
 
 fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, num_threads: usize) {
     let block_target = compact_to_target(job.bits);
-    // Varje tråd tar var N:te extranonce2 — disjunkta sökrymder utan samordning.
+    // Each thread takes every Nth extranonce2 - disjoint search spaces with
+    // no coordination.
     let mut en2_counter = thread_id as u64;
 
     loop {
         let extranonce2 = encode_extranonce2(en2_counter, job.extranonce2_size);
 
-        // Coinbase → txid → merklerot (en gång per extranonce2).
+        // Coinbase -> txid -> merkle root (once per extranonce2).
         let mut coinbase = Vec::with_capacity(
             job.coinb1.len() + job.extranonce1.len() + extranonce2.len() + job.coinb2.len(),
         );
@@ -69,7 +70,7 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
                 }
                 nonce = nonce.wrapping_add(1);
                 if nonce == 0 {
-                    break; // nonce-rymden uttömd för denna extranonce2
+                    break; // nonce space exhausted for this extranonce2
                 }
             }
             shared
@@ -82,7 +83,7 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
                 .fetch_add(CHECK_INTERVAL as u64, Ordering::Relaxed);
             shared.throttle(batch_start.elapsed());
             if shared.generation.load(Ordering::Acquire) != generation {
-                return; // nytt jobb — släpp det gamla direkt
+                return; // new job - drop the old one right away
             }
             if nonce == 0 {
                 break;
@@ -92,7 +93,7 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
     }
 }
 
-/// Delas med GPU-workern (samma partitionering av extranonce2-rymden).
+/// Shared with the GPU worker (same partitioning of the extranonce2 space).
 pub fn encode_extranonce2(counter: u64, size: usize) -> Vec<u8> {
     let bytes = counter.to_be_bytes();
     if size >= 8 {
@@ -109,10 +110,10 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// Arbetarna far ALDRIG mala pa samma sak. Varje arbetare startar pa sitt
-    /// eget index och kliver med antalet arbetare, sa extranonce2-serierna ar
-    /// disjunkta. Overlappade de skulle en rigg med N tradar gora N ganger
-    /// samma arbete och hashraten vore en illusion.
+    /// The workers must NEVER grind on the same thing. Every worker starts at
+    /// its own index and steps by the number of workers, so the extranonce2
+    /// series are disjoint. If they overlapped, a rig with N threads would do
+    /// the same work N times and the hashrate would be an illusion.
     #[test]
     fn workers_never_share_an_extranonce2() {
         let total_workers = 8usize;
@@ -132,7 +133,7 @@ mod tests {
         assert_eq!(seen.len(), total_workers * per_worker as usize);
     }
 
-    /// Samma partitionering maste galla oavsett antal arbetare — aven 1.
+    /// The same partitioning must hold for any number of workers - even 1.
     #[test]
     fn partitioning_holds_for_any_worker_count() {
         for total in [1usize, 2, 3, 20] {

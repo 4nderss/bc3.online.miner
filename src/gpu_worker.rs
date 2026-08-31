@@ -1,6 +1,7 @@
-//! GPU-arbetstråd: samma jobbpipeline som CPU-workern, men nonce-grindningen
-//! sker på GPU i batchar. Coinbase→merklerot byggs på CPU per extranonce2
-//! (billigt), och varje GPU-träff CPU-verifieras innan submit.
+//! GPU worker thread: the same job pipeline as the CPU worker, but the nonce
+//! grinding happens on the GPU in batches. Coinbase -> merkle root is built on
+//! the CPU per extranonce2 (cheap), and every GPU hit is verified on the CPU
+//! before submit.
 
 use crate::backend::{open_backend, GpuDevice, MiningBackend};
 use crate::consensus::{
@@ -11,25 +12,26 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Autotune-gränser för batchstorlek (noncer per kernel-launch).
+/// Autotune limits for the batch size (nonces per kernel launch).
 ///
-/// Taket måste ligga högt nog att autotunen faktiskt når TARGET_LAUNCH även på
-/// ett snabbt kort. Med det gamla taket 1 << 24 blev en launch bara ~12 ms på
-/// ett RTX 4090 — autotunen slog i taket och varje launch betalade full
-/// synk-overhead (två H2D, en D2H, cuCtxSynchronize) mot alldeles för lite
-/// arbete. Det syntes som ~96 % GPU-användning i stället för ~99 %.
+/// The ceiling has to sit high enough that the autotune actually reaches
+/// TARGET_LAUNCH even on a fast card. With the old ceiling of 1 << 24 a launch
+/// took only ~12 ms on an RTX 4090 - the autotune hit the ceiling and every
+/// launch paid the full sync overhead (two H2D, one D2H, cuCtxSynchronize) for
+/// far too little work. It showed up as ~96 % GPU usage instead of ~99 %.
 ///
-/// 1 << 29 ger utrymme upp till ~5 GH/s innan taket biter igen. Autotunen
-/// stannar ändå kring TARGET_LAUNCH, så långsamma kort påverkas inte — och
-/// ingen launch blir lång nog att närma sig Windows TDR-vakthund (2 s).
+/// 1 << 29 leaves room up to ~5 GH/s before the ceiling bites again. The
+/// autotune still settles around TARGET_LAUNCH, so slow cards are unaffected -
+/// and no launch gets long enough to approach the Windows TDR watchdog (2 s).
 const MIN_BATCH: u32 = 1 << 18;
 const MAX_BATCH: u32 = 1 << 29;
 const START_BATCH: u32 = 1 << 20;
-/// Måltid per launch — lagom för snabb jobbväxling utan launch-overhead.
+/// Target time per launch - short enough for fast job switching, long enough
+/// to keep launch overhead down.
 const TARGET_LAUNCH: Duration = Duration::from_millis(100);
 
-/// `worker_index`/`total_workers` partitionerar extranonce2-rymden disjunkt
-/// mellan alla arbetare (CPU-trådar + GPU:er), precis som i worker.rs.
+/// `worker_index`/`total_workers` partition the extranonce2 space disjointly
+/// across all workers (CPU threads + GPUs), exactly as in worker.rs.
 pub fn run_gpu_worker(
     shared: Arc<Shared>,
     device: GpuDevice,
@@ -67,7 +69,7 @@ fn mine_job(
     loop {
         let extranonce2 = crate::worker::encode_extranonce2(en2_counter, job.extranonce2_size);
 
-        // Coinbase → txid → merklerot (en gång per extranonce2).
+        // Coinbase -> txid -> merkle root (once per extranonce2).
         let mut coinbase = Vec::with_capacity(
             job.coinb1.len() + job.extranonce1.len() + extranonce2.len() + job.coinb2.len(),
         );
@@ -88,7 +90,7 @@ fn mine_job(
         };
         let header76: [u8; 76] = header.serialize()[..76].try_into().unwrap();
 
-        // Grinda hela nonce-rymden i batchar.
+        // Grind the whole nonce space in batches.
         let mut start: u32 = 0;
         let mut errors = 0u32;
         loop {
@@ -112,7 +114,8 @@ fn mine_job(
             let elapsed = t0.elapsed();
             errors = 0;
 
-            // CPU-verifiera varje träff innan submit — skydd mot kernelbuggar.
+            // Verify every hit on the CPU before submit - guards against
+            // kernel bugs.
             for nonce in hits {
                 header.nonce = nonce;
                 let hash = header.hash();
@@ -140,11 +143,11 @@ fn mine_job(
             shared.stats.hashes.fetch_add(count as u64, Ordering::Relaxed);
             shared.stats.gpu_hashes.fetch_add(count as u64, Ordering::Relaxed);
 
-            // Intensitet < 100 % ⇒ vila proportionellt (håller nere värme
-            // och gör datorn användbar under mining).
+            // Intensity < 100 % -> idle proportionally (keeps heat down and
+            // the machine usable while mining).
             shared.throttle(elapsed);
 
-            // Enkel autotune mot ~TARGET_LAUNCH per launch.
+            // Simple autotune towards ~TARGET_LAUNCH per launch.
             if elapsed < TARGET_LAUNCH / 2 && *batch < MAX_BATCH {
                 *batch = (*batch * 2).min(MAX_BATCH);
             } else if elapsed > TARGET_LAUNCH * 5 / 2 && *batch > MIN_BATCH {
@@ -152,11 +155,11 @@ fn mine_job(
             }
 
             if shared.generation.load(Ordering::Acquire) != generation {
-                return; // nytt jobb — släpp det gamla direkt
+                return; // new job - drop the old one right away
             }
             let (next, wrapped) = start.overflowing_add(count);
             if wrapped {
-                break; // nonce-rymden uttömd för denna extranonce2
+                break; // nonce space exhausted for this extranonce2
             }
             start = next;
         }

@@ -1,16 +1,16 @@
-//! Minimal OpenCL-bindning som laddas DYNAMISKT i runtime.
+//! Minimal OpenCL binding, loaded DYNAMICALLY at runtime.
 //!
-//! Varför inte `opencl3`/`ocl`: de länkar mot `OpenCL.lib`/`libOpenCL.so` vid
-//! byggtillfället. En sådan binär vägrar starta på en maskin utan
-//! OpenCL-runtime — alltså skulle en NVIDIA-användare utan OpenCL, eller vem
-//! som helst utan GPU, inte kunna köra minern alls. Samma skäl som gör att
-//! CUDA laddas dynamiskt (cudarc `fallback-dynamic-loading`).
+//! Why not `opencl3`/`ocl`: they link against `OpenCL.lib`/`libOpenCL.so` at
+//! build time. Such a binary refuses to start on a machine without an
+//! OpenCL runtime - so an NVIDIA user without OpenCL, or anyone without a
+//! GPU at all, could not run the miner at all. Same reason CUDA is loaded
+//! dynamically (cudarc `fallback-dynamic-loading`).
 //!
-//! Med den här laddaren blir det EN binär: CUDA på NVIDIA, OpenCL på
-//! AMD/Intel, CPU om inget finns. Saknas biblioteket får vi ett Err i stället
-//! för en process som inte startar.
+//! With this loader it stays ONE binary: CUDA on NVIDIA, OpenCL on
+//! AMD/Intel, CPU if there is neither. If the library is missing we get an
+//! Err instead of a process that will not start.
 //!
-//! Bara de ~20 funktioner minern faktiskt använder bindas.
+//! Only the ~20 functions the miner actually uses are bound.
 
 #![allow(non_camel_case_types)]
 
@@ -23,13 +23,13 @@ pub type cl_int = i32;
 pub type cl_uint = u32;
 pub type cl_bitfield = u64;
 pub type cl_bool = cl_uint;
-/// Alla OpenCL-objekt är ogenomskinliga pekare.
+/// All OpenCL objects are opaque pointers.
 pub type cl_handle = *mut c_void;
 
 pub const CL_SUCCESS: cl_int = 0;
 pub const CL_TRUE: cl_bool = 1;
 pub const CL_DEVICE_TYPE_GPU: cl_bitfield = 1 << 2;
-/// Alla enhetstyper — bara för tester (pocl exponerar en CPU-enhet).
+/// All device types - for tests only (pocl exposes a CPU device).
 pub const CL_DEVICE_TYPE_ALL: cl_bitfield = 0xFFFF_FFFF;
 pub const CL_DEVICE_NAME: cl_uint = 0x102B;
 pub const CL_MEM_READ_WRITE: cl_bitfield = 1 << 0;
@@ -104,8 +104,8 @@ pub struct Cl {
     pub get_device_ids: FnGetDeviceIDs,
     pub get_device_info: FnGetDeviceInfo,
     pub create_context: FnCreateContext,
-    /// Borttagen ur OpenCL 2.0-headers men fortfarande exporterad av alla
-    /// ICD:er. `None` bara om en runtime verkligen saknar den.
+    /// Removed from the OpenCL 2.0 headers but still exported by every
+    /// ICD. `None` only if a runtime really does not have it.
     pub create_command_queue: Option<FnCreateCommandQueue>,
     pub create_command_queue_with_properties: Option<FnCreateCommandQueueWithProperties>,
     pub create_program_with_source: FnCreateProgramWithSource,
@@ -123,12 +123,12 @@ pub struct Cl {
     pub release_program: FnRelease,
     pub release_command_queue: FnRelease,
     pub release_context: FnRelease,
-    /// Måste leva så länge funktionspekarna används.
+    /// Must stay alive for as long as the function pointers are used.
     _lib: Library,
 }
 
-/// Biblioteksnamn per plattform. ICD-loadern heter olika saker och ligger
-/// inte alltid i sökvägen med samma namn.
+/// Library names per platform. The ICD loader goes by different names and is
+/// not always on the search path under the same one.
 #[cfg(target_os = "windows")]
 const CANDIDATES: &[&str] = &["OpenCL.dll"];
 #[cfg(target_os = "macos")]
@@ -138,7 +138,7 @@ const CANDIDATES: &[&str] = &["libOpenCL.so.1", "libOpenCL.so", "libOpenCL.so.1.
 
 static CL: OnceLock<Result<Cl, String>> = OnceLock::new();
 
-/// Hämta bindningen. Laddas en gång; efterföljande anrop är gratis.
+/// Get the binding. Loaded once; subsequent calls are free.
 pub fn cl() -> Result<&'static Cl, String> {
     CL.get_or_init(load).as_ref().map_err(|e| e.clone())
 }
@@ -146,20 +146,20 @@ pub fn cl() -> Result<&'static Cl, String> {
 fn load() -> Result<Cl, String> {
     let mut last = String::new();
     for name in CANDIDATES {
-        // SAFETY: vi laddar ett namngivet systembibliotek och slår bara upp
-        // symboler med signaturer ur OpenCL-specen.
+        // SAFETY: we load a named system library and only look up symbols
+        // whose signatures come straight from the OpenCL spec.
         match unsafe { Library::new(name) } {
             Ok(lib) => return build(lib),
             Err(e) => last = format!("{name}: {e}"),
         }
     }
     Err(format!(
-        "no OpenCL runtime found (tried {}) — last error: {last}",
+        "no OpenCL runtime found (tried {}) - last error: {last}",
         CANDIDATES.join(", ")
     ))
 }
 
-/// Slå upp en obligatorisk symbol.
+/// Look up a mandatory symbol.
 unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> Result<T, String> {
     let s: Symbol<T> = lib
         .get(name)
@@ -167,7 +167,7 @@ unsafe fn sym<T: Copy>(lib: &Library, name: &[u8]) -> Result<T, String> {
     Ok(*s)
 }
 
-/// Valfri symbol — saknas den använder vi den andra kövarianten.
+/// Optional symbol - if it is missing we use the other queue variant.
 unsafe fn sym_opt<T: Copy>(lib: &Library, name: &[u8]) -> Option<T> {
     lib.get::<T>(name).ok().map(|s| *s)
 }
@@ -208,7 +208,8 @@ fn build(lib: Library) -> Result<Cl, String> {
     }
 }
 
-/// Översätt en felkod till något läsbart. Bara koderna vi rimligen kan få.
+/// Translate an error code into something readable. Only the codes we can
+/// plausibly get.
 pub fn err_str(code: cl_int) -> String {
     let name = match code {
         0 => "CL_SUCCESS",
@@ -238,7 +239,7 @@ pub fn err_str(code: cl_int) -> String {
     format!("{name} ({code})")
 }
 
-/// `Err` om koden inte är CL_SUCCESS.
+/// `Err` if the code is not CL_SUCCESS.
 pub fn check(what: &str, code: cl_int) -> Result<(), String> {
     if code == CL_SUCCESS {
         Ok(())
@@ -247,7 +248,7 @@ pub fn check(what: &str, code: cl_int) -> Result<(), String> {
     }
 }
 
-/// Läs en strängegenskap (enhetsnamn, byggloggar) med tvåstegsanrop.
+/// Read a string property (device name, build logs) with a two-step call.
 pub fn info_string(
     mut query: impl FnMut(usize, *mut c_void, *mut usize) -> cl_int,
 ) -> Result<String, String> {
@@ -260,14 +261,14 @@ pub fn info_string(
     let mut buf = vec![0u8; len];
     let code = query(len, buf.as_mut_ptr() as *mut c_void, std::ptr::null_mut());
     check("query value", code)?;
-    // Strängarna är nullterminerade; ta bort terminatorn och skräp efter den.
+    // The strings are nul-terminated; drop the terminator and trailing junk.
     if let Some(pos) = buf.iter().position(|&b| b == 0) {
         buf.truncate(pos);
     }
     Ok(String::from_utf8_lossy(&buf).trim().to_string())
 }
 
-/// Hjälpare: gör en nullterminerad C-sträng utan att kunna panika på inre nollor.
+/// Helper: make a nul-terminated C string that cannot panic on interior nuls.
 pub fn cstr(s: &str) -> CString {
     CString::new(s.replace('\0', " ")).expect("no interior nul after replace")
 }
@@ -276,8 +277,8 @@ pub fn cstr(s: &str) -> CString {
 mod tests {
     use super::*;
 
-    /// Konstanterna måste matcha OpenCL-specen exakt — fel värde här ger
-    /// obegripliga runtime-fel långt senare.
+    /// The constants must match the OpenCL spec exactly - a wrong value here
+    /// turns into baffling runtime errors much later.
     #[test]
     fn constants_match_the_spec() {
         assert_eq!(CL_DEVICE_TYPE_GPU, 4);
@@ -288,15 +289,15 @@ mod tests {
         assert_eq!(CL_SUCCESS, 0);
     }
 
-    /// Saknad runtime ska ge ett begripligt fel, inte en krasch.
+    /// A missing runtime must give a sensible error, not a crash.
     #[test]
     fn missing_runtime_is_an_error_not_a_panic() {
-        // Vi kan inte avinstallera OpenCL i testet, så vi kontrollerar bara
-        // att anropet returnerar (Ok eller Err) utan att panika.
+        // We cannot uninstall OpenCL inside the test, so we only check that
+        // the call returns (Ok or Err) without panicking.
         let r = cl();
         match r {
             Ok(_) => {}
-            Err(e) => assert!(!e.is_empty(), "felmeddelandet måste säga något"),
+            Err(e) => assert!(!e.is_empty(), "the error message must say something"),
         }
     }
 
@@ -308,7 +309,7 @@ mod tests {
         assert!(check("x", -5).unwrap_err().contains("CL_OUT_OF_RESOURCES"));
     }
 
-    /// Inre nollbytes får inte fälla CString-konverteringen.
+    /// Interior nul bytes must not break the CString conversion.
     #[test]
     fn cstr_survives_interior_nul() {
         assert_eq!(cstr("a\0b").to_str().unwrap(), "a b");

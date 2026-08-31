@@ -1,9 +1,10 @@
-//! Mining-backends: abstraktion över CUDA/OpenCL-GPU:er (och CPU-fallback).
+//! Mining backends: an abstraction over CUDA/OpenCL GPUs (and the CPU
+//! fallback).
 //!
-//! En backend grindar ett nonce-intervall för en fast 76-bytes headerprefix
-//! och returnerar de noncer vars SHA3-256t-hash ≤ share-target. Alla träffar
-//! CPU-verifieras i gpu_worker innan submit — kernelbuggar kan aldrig ge
-//! felaktiga shares, bara missade.
+//! A backend grinds a nonce range for a fixed 76-byte header prefix and
+//! returns the nonces whose SHA3-256t hash is <= the share target. Every hit
+//! is re-checked on the CPU in gpu_worker before submit - a kernel bug can
+//! never produce a bad share, only a missed one.
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -14,21 +15,22 @@ pub mod opencl;
 
 use crate::consensus::Target;
 
-/// Delad kernelkälla (CUDA via NVRTC + OpenCL). Se filen för schema.
+/// Shared kernel source (CUDA via NVRTC + OpenCL). See that file for the
+/// lane layout.
 #[allow(dead_code)]
 pub const KERNEL_SOURCE: &str = include_str!("../kernels/sha3t.cl");
 
-/// Max antal träffar per launch som kerneln rapporterar (fler än så i en
-/// batch händer i praktiken aldrig med rimliga share-difficulties).
+/// Max number of hits per launch that the kernel reports (more than this in
+/// a single batch never happens in practice at sane share difficulties).
 #[allow(dead_code)]
 pub const MAX_HITS: usize = 64;
 
 pub trait MiningBackend {
-    /// Människoläsbart namn ("CUDA: NVIDIA GeForce RTX 3050 Ti ...").
+    /// Human-readable name ("CUDA: NVIDIA GeForce RTX 3050 Ti ...").
     fn name(&self) -> String;
 
-    /// Grinda [start_nonce, start_nonce+count) för headern (nonce-fältet
-    /// exkluderat) och returnera noncer med hash ≤ target.
+    /// Grind [start_nonce, start_nonce+count) for the header (nonce field
+    /// excluded) and return the nonces whose hash is <= target.
     fn scan_range(
         &mut self,
         header76: &[u8; 76],
@@ -38,7 +40,8 @@ pub trait MiningBackend {
     ) -> Result<Vec<u32>, String>;
 }
 
-/// En upptäckt GPU — bara data (Send), själva backenden öppnas i arbetstråden.
+/// A discovered GPU - data only (Send); the backend itself is opened in the
+/// worker thread.
 #[derive(Clone, Debug)]
 pub enum GpuDevice {
     #[cfg(feature = "cuda")]
@@ -62,18 +65,18 @@ impl GpuDevice {
     }
 }
 
-/// Vilka backends användaren bett om.
+/// Which backends the user asked for.
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum BackendKind {
-    /// CUDA om möjligt, annars OpenCL, annars CPU.
+    /// CUDA if possible, otherwise OpenCL, otherwise CPU.
     Auto,
     Cuda,
     Opencl,
     Cpu,
 }
 
-/// Lista GPU:er enligt önskad backend. `gpu_id` filtrerar till en enhet
-/// (CUDA-index resp. löpnummer i OpenCL-listan).
+/// List GPUs for the requested backend. `gpu_id` narrows it down to a single
+/// device (the CUDA index, or the position in the OpenCL list).
 pub fn detect_gpus(kind: BackendKind, gpu_id: Option<usize>) -> Vec<GpuDevice> {
     let mut found: Vec<GpuDevice> = Vec::new();
 
@@ -87,7 +90,7 @@ pub fn detect_gpus(kind: BackendKind, gpu_id: Option<usize>) -> Vec<GpuDevice> {
     {
         found.extend(opencl::list_devices());
     }
-    let _ = kind; // (om inga GPU-features är aktiva)
+    let _ = kind; // (in case no GPU features are enabled)
 
     if let Some(id) = gpu_id {
         found = found.into_iter().skip(id).take(1).collect();
@@ -95,7 +98,7 @@ pub fn detect_gpus(kind: BackendKind, gpu_id: Option<usize>) -> Vec<GpuDevice> {
     found
 }
 
-/// Öppna en backend för en upptäckt enhet (körs i GPU-arbetstråden).
+/// Open a backend for a discovered device (runs in the GPU worker thread).
 pub fn open_backend(dev: &GpuDevice) -> Result<Box<dyn MiningBackend>, String> {
     match dev {
         #[cfg(feature = "cuda")]
@@ -109,7 +112,7 @@ pub fn open_backend(dev: &GpuDevice) -> Result<Box<dyn MiningBackend>, String> {
     }
 }
 
-/// Packa 80-bytesheadern (med nonce = 0) som tio LE-u64-lanes åt kerneln.
+/// Pack the 80-byte header (nonce = 0) as ten LE u64 lanes for the kernel.
 #[allow(dead_code)]
 pub fn header_lanes(header76: &[u8; 76]) -> [u64; 10] {
     let mut buf = [0u8; 80];
@@ -121,8 +124,8 @@ pub fn header_lanes(header76: &[u8; 76]) -> [u64; 10] {
     lanes
 }
 
-/// Target ([u8;32] big-endian) → fyra u64-limbar [t0..t3], t3 mest signifikant.
-/// Matchar kernelns tolkning: hash-limb k = LE-u64 ur hashbytes 8k..8k+7.
+/// Target ([u8;32] big-endian) -> four u64 limbs [t0..t3], t3 most significant.
+/// Matches how the kernel reads them: hash limb k = LE u64 of bytes 8k..8k+7.
 #[allow(dead_code)]
 pub fn target_limbs(target: &Target) -> [u64; 4] {
     let mut t = [0u64; 4];
@@ -141,10 +144,10 @@ mod tests {
     };
 
     // ------------------------------------------------------------------
-    // Rust-spegel av kernelalgoritmen (samma lane-schema, padding och
-    // jämförelse som src/kernels/sha3t.cl). Verifierar kernelns matematik
-    // mot CPU-referensen utan GPU — bitexaktheten på riktig GPU låses sedan
-    // av de #[ignore]-markerade testen i cuda-backenden.
+    // Rust mirror of the kernel algorithm (same lane layout, padding and
+    // comparison as src/kernels/sha3t.cl). Verifies the kernel's math
+    // against the CPU reference without a GPU - bit-exactness on a real GPU
+    // is then pinned down by the #[ignore]d tests in the cuda backend.
     // ------------------------------------------------------------------
 
     const RC: [u64; 24] = [
@@ -201,7 +204,7 @@ mod tests {
         [st[0], st[1], st[2], st[3]]
     }
 
-    /// Exakt vad kerneln gör per nonce, i Rust.
+    /// Exactly what the kernel does per nonce, in Rust.
     fn kernel_mirror_hash(header76: &[u8; 76], nonce: u32) -> [u64; 4] {
         let lanes = header_lanes(header76);
         let mut st = [0u64; 25];
@@ -239,7 +242,7 @@ mod tests {
         }
     }
 
-    /// Enkel deterministisk PRNG för testheadrar (ingen rand-dependency).
+    /// Simple deterministic PRNG for test headers (no rand dependency).
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;
         *state ^= *state >> 7;
@@ -273,13 +276,13 @@ mod tests {
 
     #[test]
     fn target_limbs_comparison_matches_hash_meets_target() {
-        // Limb-jämförelsen (som kerneln gör) ska ge samma svar som
-        // consensus::hash_meets_target för slumpade hashar/targets.
+        // The limb comparison (the one the kernel does) must give the same
+        // answer as consensus::hash_meets_target for random hashes/targets.
         let mut seed = 0xbc3_0002u64;
         let targets = [
             compact_to_target(0x1d00ffff).unwrap(),
             target_for_difficulty(16.0),
-            target_for_difficulty(0.001), // högt target — många träffar
+            target_for_difficulty(0.001), // high target - many hits
         ];
         for target in targets {
             let t = target_limbs(&target);
@@ -288,7 +291,7 @@ mod tests {
                 for b in hash.iter_mut() {
                     *b = xorshift(&mut seed) as u8;
                 }
-                // Gör vissa hashar små så båda grenarna övas.
+                // Make some hashes small so both branches get exercised.
                 if seed % 3 == 0 {
                     for b in hash[4..].iter_mut() {
                         *b = 0;
@@ -318,15 +321,15 @@ mod tests {
             *b = i as u8;
         }
         let lanes = header_lanes(&header76);
-        // lane 9 = bytes 72..75 + nollad nonce.
+        // lane 9 = bytes 72..75 + a zeroed nonce.
         assert_eq!(lanes[9], u64::from_le_bytes([72, 73, 74, 75, 0, 0, 0, 0]));
         assert_eq!(lanes[0], u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7]));
     }
 
     #[test]
     fn sha3_vbit_headers_use_sha3t() {
-        // Sanity: jobb från poolen har alltid versionsbiten satt, så
-        // GPU-vägen (som alltid kör sha3t) matchar BlockHeader::hash.
+        // Sanity: jobs from the pool always have the version bit set, so
+        // the GPU path (which always runs sha3t) matches BlockHeader::hash.
         let mut h = genesis_header();
         h.version |= SHA3_VBIT;
         let ser = h.serialize();

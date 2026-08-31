@@ -1,4 +1,4 @@
-//! Delat tillstånd mellan stratum-klienten och arbetstrådarna.
+//! State shared between the stratum client and the worker threads.
 
 use crate::consensus::Target;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -6,7 +6,7 @@ use std::sync::{Condvar, Mutex};
 #[cfg(test)]
 use std::sync::Arc;
 
-/// Ett aktivt mining-jobb från poolen (allt arbetstrådarna behöver).
+/// An active mining job from the pool (all the worker threads need).
 #[derive(Clone)]
 pub struct MinerJob {
     pub job_id: String,
@@ -19,48 +19,49 @@ pub struct MinerJob {
     pub prev_hash: [u8; 32],
     pub bits: u32,
     pub ntime: u32,
-    /// Share-target enligt svårigheten som gällde vid notify.
+    /// Share target for the difficulty that was in effect at notify time.
     pub share_target: Target,
 }
 
-/// En funnen share på väg till poolen.
+/// A found share on its way to the pool.
 pub struct FoundShare {
     pub job_id: String,
     pub extranonce2: Vec<u8>,
     pub ntime: u32,
     pub nonce: u32,
-    /// Hash i display-format (för loggning) + om den även når block-target.
+    /// Hash in display format (for logging) + whether it also meets the
+    /// block target.
     pub hash_display: String,
     pub is_block_candidate: bool,
 }
 
 #[derive(Default)]
 pub struct Stats {
-    /// Totalt (GPU + CPU) — summan av de två nedan.
+    /// Total (GPU + CPU) - the sum of the two below.
     pub hashes: AtomicU64,
-    /// Uppdelat per backend så dual-läget kan visa båda var för sig.
+    /// Split per backend so dual mode can show each of them separately.
     pub gpu_hashes: AtomicU64,
     pub cpu_hashes: AtomicU64,
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub blocks: AtomicU64,
-    /// Högsta uppnådda share-svårighet (f64 via `to_bits`) — "best share".
+    /// Highest share difficulty reached (f64 via `to_bits`) - "best share".
     pub best_share_bits: AtomicU64,
-    /// Senaste nätverks-nBits (för ETA-beräkning).
+    /// Latest network nBits (for the ETA calculation).
     pub network_bits: AtomicU32,
-    /// Höjden på blocket vi malar på just nu (ur jobbets coinbase, BIP34).
-    /// 0 = okänd (inget jobb ännu).
+    /// Height of the block we are mining on right now (from the job's
+    /// coinbase, BIP34). 0 = unknown (no job yet).
     pub job_height: AtomicU32,
 }
 
 pub struct Shared {
     job: Mutex<Option<MinerJob>>,
     job_cv: Condvar,
-    /// Intensitet 1–100 (%). 100 = full fart; lägre värden lägger in vila
-    /// mellan arbetspass så att kort/CPU inte går varma och datorn förblir
-    /// användbar. Läses av arbetarna varje batch.
+    /// Intensity 1-100 (%). 100 = full speed; lower values insert idle time
+    /// between work passes so the card/CPU does not run hot and the machine
+    /// stays usable. Read by the workers on every batch.
     intensity: AtomicU32,
-    /// Bumpas vid varje nytt jobb — arbetstrådarna pollar den billigt.
+    /// Bumped on every new job - the worker threads poll it cheaply.
     pub generation: AtomicU64,
     pub stats: Stats,
     pub submit_tx: std::sync::mpsc::Sender<FoundShare>,
@@ -78,8 +79,8 @@ impl Shared {
         }
     }
 
-    /// Registrera en inskickad share: uppdaterar best share (och blockräknaren
-    /// när sharen också uppfyllde blockets target).
+    /// Record a submitted share: updates the best share (and the block
+    /// counter when the share also met the block's target).
     pub fn record_share(&self, difficulty: f64, is_block: bool) {
         if is_block {
             self.stats.blocks.fetch_add(1, Ordering::Relaxed);
@@ -111,21 +112,22 @@ impl Shared {
         self.intensity.load(Ordering::Relaxed)
     }
 
-    /// Vila proportionellt mot senaste arbetspasset så att arbetscykeln
-    /// blir ungefär `intensity`%. Vid 100 % blir det ingen vila alls.
+    /// Idle in proportion to the last work pass so that the duty cycle ends
+    /// up at roughly `intensity`%. At 100% there is no idling at all.
     pub fn throttle(&self, worked: std::time::Duration) {
         let pct = self.intensity();
         if pct >= 100 {
             return;
         }
-        // arbete/(arbete+vila) = pct/100  ⇒  vila = arbete * (100-pct)/pct
+        // work/(work+idle) = pct/100  ->  idle = work * (100-pct)/pct
         let idle = worked.mul_f64((100 - pct) as f64 / pct as f64);
-        // Ta i småbitar så ett nytt jobb inte behöver vänta ut hela vilan.
+        // Take it in small pieces so a new job need not wait out the whole
+        // idle period.
         let deadline = std::time::Instant::now() + idle;
         let gen = self.generation.load(Ordering::Acquire);
         while std::time::Instant::now() < deadline {
             if self.generation.load(Ordering::Acquire) != gen {
-                return; // nytt jobb — sluta vila direkt
+                return; // new job - stop idling right away
             }
             std::thread::sleep(std::time::Duration::from_millis(5).min(idle));
         }
@@ -134,8 +136,8 @@ impl Shared {
     pub fn publish_job(&self, job: MinerJob) {
         self.stats.network_bits.store(job.bits, Ordering::Relaxed);
         if let Some(h) = crate::consensus::bip34_height(&job.coinb1) {
-            // Rapportera bara vid faktiskt höjdbyte — poolen skickar nya jobb
-            // även inom samma block (nya transaktioner, ny ntime).
+            // Only report on an actual height change - the pool sends new
+            // jobs within the same block too (new transactions, new ntime).
             let prev = self.stats.job_height.swap(h, Ordering::Relaxed);
             if prev != h {
                 crate::ipc::emit(&crate::ipc::Event::NewBlockHeight { height: h });
@@ -152,7 +154,7 @@ impl Shared {
         self.generation.fetch_add(1, Ordering::Release);
     }
 
-    /// Blockera tills ett jobb finns; returnera (generation, jobb).
+    /// Block until a job exists; return (generation, job).
     pub fn wait_for_job(&self) -> (u64, MinerJob) {
         let mut guard = self.job.lock().unwrap();
         loop {
@@ -180,7 +182,7 @@ mod tests {
         assert_eq!(s.intensity(), 100);
         s.set_intensity(50);
         assert_eq!(s.intensity(), 50);
-        // Utanför intervallet klampas i stället för att stänga av mining.
+        // Out-of-range values are clamped instead of turning mining off.
         s.set_intensity(0);
         assert_eq!(s.intensity(), 1);
         s.set_intensity(9000);
@@ -192,9 +194,9 @@ mod tests {
         let s = shared();
         assert_eq!(s.best_share(), 0.0);
         s.record_share(12.5, false);
-        s.record_share(3.0, false); // lägre — ska inte skriva över
+        s.record_share(3.0, false); // lower - must not overwrite
         assert_eq!(s.best_share(), 12.5);
-        s.record_share(900.0, true); // ett block är också en share
+        s.record_share(900.0, true); // a block is a share as well
         assert_eq!(s.best_share(), 900.0);
         assert_eq!(s.stats.blocks.load(Ordering::Relaxed), 1);
     }
@@ -210,7 +212,7 @@ mod tests {
     #[test]
     fn throttle_sleeps_proportionally() {
         let s = shared();
-        s.set_intensity(50); // 50% ⇒ vila ≈ lika länge som arbetet
+        s.set_intensity(50); // 50% -> idle about as long as the work
         let t0 = Instant::now();
         s.throttle(Duration::from_millis(40));
         let waited = t0.elapsed();
@@ -221,14 +223,14 @@ mod tests {
     #[test]
     fn throttle_aborts_on_new_job() {
         let s = Arc::new(shared());
-        s.set_intensity(10); // ⇒ lång vila (9× arbetet)
+        s.set_intensity(10); // -> long idle (9x the work)
         let s2 = s.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             s2.generation.fetch_add(1, Ordering::Release);
         });
         let t0 = Instant::now();
-        s.throttle(Duration::from_millis(100)); // skulle annars vila ~900 ms
+        s.throttle(Duration::from_millis(100)); // would otherwise idle ~900 ms
         assert!(t0.elapsed() < Duration::from_millis(300), "vilan avbröts inte");
     }
 }

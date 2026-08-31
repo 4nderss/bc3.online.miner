@@ -1,4 +1,4 @@
-//! Hashrate-rapportering och est. time-to-block.
+//! Hashrate reporting and estimated time to block.
 
 use crate::consensus::difficulty_of_bits;
 use crate::shared::Shared;
@@ -20,7 +20,7 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
         let rate = (hashes - last_hashes) as f64 / dt.max(0.001);
         last_hashes = hashes;
 
-        // Per backend, så dual-läget kan visa vad var och en bidrar med.
+        // Per backend, so dual mode can show what each one contributes.
         let gpu_total = shared.stats.gpu_hashes.load(Ordering::Relaxed);
         let cpu_total = shared.stats.cpu_hashes.load(Ordering::Relaxed);
         let gpu_rate = (gpu_total - last_gpu) as f64 / dt.max(0.001);

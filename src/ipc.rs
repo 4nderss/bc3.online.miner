@@ -1,13 +1,13 @@
-//! Maskinläsbar utdata (`--json`): en JSON-rad per händelse på stdout.
+//! Machine-readable output (`--json`): one JSON line per event on stdout.
 //!
-//! GUI:t startar CLI-binären som barnprocess och läser dessa rader. Formatet
-//! är avsiktligt platt och stabilt — ett fält får läggas till, aldrig byta
-//! betydelse.
+//! The GUI starts the CLI binary as a child process and reads these lines.
+//! The format is deliberately flat and stable - a field may be added, never
+//! change meaning.
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Sätts av `--json`; styr om utdata är JSON-rader eller människotext.
+/// Set by `--json`; decides whether output is JSON lines or human text.
 static JSON_MODE: AtomicBool = AtomicBool::new(false);
 
 pub fn set_json_mode(on: bool) {
@@ -21,47 +21,49 @@ pub fn json_mode() -> bool {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Event {
-    /// Uppstart: vilka backends och enheter som hittades.
+    /// Startup: which backends and devices were found.
     Startup {
         version: String,
         backend: String,
         gpus: Vec<String>,
         cpu_threads: usize,
     },
-    /// Anslutningsläge mot poolen.
+    /// Connection state towards the pool.
     Status {
         state: StatusState,
         message: String,
     },
-    /// Periodisk statistik (samma takt som textutskriften).
+    /// Periodic statistics (same cadence as the text output).
     Stats {
         hashrate: f64,
-        /// Uppdelat per backend (0 när backenden inte används).
+        /// Split per backend (0 when that backend is not in use).
         hashrate_gpu: f64,
         hashrate_cpu: f64,
         accepted: u64,
         rejected: u64,
-        /// Högsta uppnådda share-svårighet under körningen.
+        /// Highest share difficulty reached during this run.
         best_share: f64,
-        /// Antal block denna körning hittat.
+        /// Number of blocks found during this run.
         blocks: u64,
-        /// Förväntad tid till block i sekunder; `null` innan hashrate finns.
+        /// Expected time to a block in seconds; `null` before there is a
+        /// hashrate.
         eta_secs: Option<f64>,
         network_difficulty: f64,
-        /// Blockhöjden poolens senaste jobb gäller — visar att klienten är
-        /// i synk med poolen och malar på rätt block. 0 = inget jobb ännu.
+        /// The block height the pool's latest job applies to - shows that the
+        /// client is in sync with the pool and mining on the right block.
+        /// 0 = no job yet.
         job_height: u32,
-        /// Temperatur/effekt där plattformen exponerar det (annars null).
+        /// Temperature/power where the platform exposes it (else null).
         #[serde(flatten)]
         telemetry: crate::telemetry::Reading,
     },
-    /// En share skickades in och poolen svarade.
+    /// A share was submitted and the pool answered.
     Share { accepted: bool },
-    /// Vi hittade ett block (hash i display-ordning).
+    /// We found a block (hash in display order).
     Block { hash: String },
-    /// Poolen började på ett nytt block (höjden ur jobbets coinbase).
+    /// The pool moved on to a new block (height from the job's coinbase).
     NewBlockHeight { height: u32 },
-    /// Svar på `--probe`: tillgänglig hårdvara (GUI:t frågar innan start).
+    /// Answer to `--probe`: available hardware (the GUI asks before start).
     Probe {
         gpus: Vec<String>,
         cpu_cores: usize,
@@ -77,7 +79,7 @@ pub enum StatusState {
     Error,
 }
 
-/// Skriv en händelse som JSON-rad (no-op när `--json` inte är satt).
+/// Write an event as a JSON line (no-op when `--json` is not set).
 pub fn emit(ev: &Event) {
     if !json_mode() {
         return;
@@ -87,8 +89,8 @@ pub fn emit(ev: &Event) {
     }
 }
 
-/// Skriv människoläsbar text — men bara när JSON-läget är av, så att
-/// stdout förblir ren JSON för GUI:t.
+/// Write human-readable text - but only when JSON mode is off, so that
+/// stdout stays pure JSON for the GUI.
 #[macro_export]
 macro_rules! human {
     ($($arg:tt)*) => {
@@ -133,7 +135,7 @@ mod tests {
         .unwrap();
         assert!(s.starts_with(r#"{"type":"stats","hashrate":1.5"#));
         assert!(s.contains(r#""eta_secs":null"#));
-        // Telemetrin plattas ut i samma objekt.
+        // The telemetry is flattened into the same object.
         assert!(s.contains(r#""gpu_temp_c":64"#));
         assert!(s.contains(r#""cpu_temp_c":null"#));
     }

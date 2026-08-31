@@ -9,14 +9,14 @@ description = "SHA3-256t-sokkarna for bc3.online:s webbaserade miner (WebAssembl
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Samma hashimplementation som CLI-minern anvander. Kerneln maste vara
-# bit-exakt lika — en share som webbminern hittar ska poolen acceptera.
+# The same hash implementation the CLI miner uses. The kernel must be
+# bit-exactly equal - a share the web miner finds must be accepted by the pool.
 sha3 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 [profile.release]
-# Hastighet framfor storlek: det har ar en hashloop, inte en widget.
+# Speed over size: this is a hash loop, not a widget.
 opt-level = 3
 lto = "fat"
 codegen-units = 1

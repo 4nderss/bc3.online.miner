@@ -9,10 +9,16 @@ first edit; it encodes decisions that are expensive to rediscover.
 commit messages, documentation, and every string a user can see. The project
 had a mixed-language period; do not add to it.
 
-**Write ASCII.** No typographic dashes, arrows, quotes, or superscripts - use
-`-`, `->`, `"`, and `2^32`. This is not pedantry: the repository has already
-lost characters twice to encoding round-trips, once through a tool that
-re-encoded an entire UTF-8 file. ASCII cannot be damaged that way.
+**Write ASCII in source.** Comments, commit messages, identifiers and log
+output: no typographic dashes, arrows, quotes or superscripts - use `-`,
+`->`, `"` and `2^32`. This is not pedantry. The repository has already lost
+characters twice to encoding round-trips, once through a tool that re-encoded
+an entire UTF-8 file in place. ASCII cannot be damaged that way.
+
+The exception is **text a user reads in the GUI**, where the correct character
+is the right choice: a degree sign is a degree sign, and an em dash reads
+better than a hyphen as an empty-value placeholder. Keep those; just never let
+them migrate into comments or commit messages.
 
 Comments here explain **why**, not what. A comment that restates the code is
 worse than none. The valuable ones carry the measurement or the bug that

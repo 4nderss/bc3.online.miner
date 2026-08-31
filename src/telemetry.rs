@@ -1,24 +1,25 @@
-//! Temperaturavläsning för GPU och CPU.
+//! Temperature readings for GPU and CPU.
 //!
-//! GPU: NVML (`nvml.dll` / `libnvidia-ml.so`) följer med NVIDIA-drivrutinen,
-//! så inget toolkit behövs — samma princip som PTX-lösningen för kerneln.
-//! Biblioteket laddas dynamiskt och saknad NVML ger bara `None`.
+//! GPU: NVML (`nvml.dll` / `libnvidia-ml.so`) ships with the NVIDIA driver,
+//! so no toolkit is needed - the same principle as the PTX solution for the
+//! kernel. The library is loaded dynamically and a missing NVML just gives
+//! `None`.
 //!
-//! CPU: ingen portabel API finns. Linux har hwmon i sysfs; på Windows kräver
-//! riktig kärntemperatur en signerad drivrutin (LibreHardwareMonitor m.fl.),
-//! vilket vi inte vill bunta med en miner. Vi läser därför det som går utan
-//! extra rättigheter och visar annars "—".
+//! CPU: there is no portable API. Linux has hwmon in sysfs; on Windows a real
+//! core temperature requires a signed driver (LibreHardwareMonitor and
+//! others), which we do not want to bundle with a miner. So we read what can
+//! be had without extra privileges and otherwise show "-".
 
 #[cfg(feature = "cuda")]
 use nvml_wrapper::Nvml;
 
-/// Öppnad telemetrikälla. `None`-fälten betyder "inte tillgängligt här".
+/// An opened telemetry source. `None` fields mean "not available here".
 pub struct Telemetry {
     #[cfg(feature = "cuda")]
     nvml: Option<Nvml>,
 }
 
-/// En avläsning; alla fält kan saknas beroende på plattform/hårdvara.
+/// One reading; any field may be missing depending on platform/hardware.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct Reading {
     pub gpu_temp_c: Option<u32>,
@@ -28,8 +29,8 @@ pub struct Reading {
 }
 
 impl Telemetry {
-    /// Öppna tillgängliga källor. NVML-laddaren kan panika om biblioteket
-    /// saknas — samma skydd som i CUDA-detekteringen.
+    /// Open the available sources. The NVML loader can panic if the library
+    /// is missing - the same guard as in the CUDA detection.
     pub fn open() -> Self {
         #[cfg(feature = "cuda")]
         {
@@ -43,7 +44,8 @@ impl Telemetry {
         Self {}
     }
 
-    /// Läs aktuella värden. Fel svälјs — telemetri får aldrig störa mining.
+    /// Read current values. Errors are swallowed - telemetry must never
+    /// disturb mining.
     pub fn read(&self, gpu_index: u32) -> Reading {
         let mut r = Reading {
             cpu_temp_c: read_cpu_temp(),
@@ -57,7 +59,7 @@ impl Telemetry {
                     .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
                     .ok();
                 r.gpu_fan_pct = dev.fan_speed(0).ok();
-                // NVML rapporterar milliwatt.
+                // NVML reports milliwatts.
                 r.gpu_power_w = dev.power_usage().ok().map(|mw| mw as f64 / 1000.0);
             }
         }
@@ -66,10 +68,10 @@ impl Telemetry {
     }
 }
 
-/// CPU-temperatur där plattformen exponerar den utan extra rättigheter.
+/// CPU temperature where the platform exposes it without extra privileges.
 #[cfg(target_os = "linux")]
 fn read_cpu_temp() -> Option<u32> {
-    // Leta upp ett hwmon som rapporterar paket-/kärntemperatur.
+    // Look for an hwmon that reports package/core temperature.
     let dir = std::fs::read_dir("/sys/class/hwmon").ok()?;
     for entry in dir.flatten() {
         let base = entry.path();
@@ -78,7 +80,7 @@ fn read_cpu_temp() -> Option<u32> {
         if !matches!(name, "coretemp" | "k10temp" | "zenpower" | "cpu_thermal") {
             continue;
         }
-        // temp1_input är paketet på coretemp/k10temp; värdet är millicelsius.
+        // temp1_input is the package on coretemp/k10temp; value in millicelsius.
         if let Ok(v) = std::fs::read_to_string(base.join("temp1_input")) {
             if let Ok(milli) = v.trim().parse::<i64>() {
                 return u32::try_from(milli / 1000).ok();
@@ -88,9 +90,9 @@ fn read_cpu_temp() -> Option<u32> {
     None
 }
 
-/// Windows: `MSAcpi_ThermalZoneTemperature` är den enda källan som inte
-/// kräver en egen kärndrivrutin. Många moderkort rapporterar inget alls där —
-/// då blir svaret `None` och GUI:t visar "—".
+/// Windows: `MSAcpi_ThermalZoneTemperature` is the only source that does not
+/// require a kernel driver of our own. Many motherboards report nothing at all
+/// there - then the answer is `None` and the GUI shows "-".
 #[cfg(target_os = "windows")]
 fn read_cpu_temp() -> Option<u32> {
     use std::os::windows::process::CommandExt;
@@ -112,7 +114,7 @@ fn read_cpu_temp() -> Option<u32> {
     if decikelvin <= 0.0 {
         return None;
     }
-    // Värdet är tiondels kelvin.
+    // The value is in tenths of a kelvin.
     let celsius = decikelvin / 10.0 - 273.15;
     (0.0..150.0).contains(&celsius).then(|| celsius.round() as u32)
 }
@@ -128,10 +130,10 @@ mod tests {
 
     #[test]
     fn opening_telemetry_never_panics() {
-        // Utan NVIDIA-drivrutin ska detta ge en tom källa, inte krascha.
+        // Without an NVIDIA driver this must give an empty source, not crash.
         let t = Telemetry::open();
         let r = t.read(0);
-        // Inga krav på värden — bara att anropet överlever.
+        // No requirements on the values - only that the call survives.
         let _ = (r.gpu_temp_c, r.cpu_temp_c, r.gpu_power_w, r.gpu_fan_pct);
     }
 

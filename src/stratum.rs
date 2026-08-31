@@ -1,5 +1,5 @@
-//! Stratum v1-klient: håller anslutningen till poolen, tar emot jobb och
-//! skickar in funna shares. Återansluter med backoff vid avbrott.
+//! Stratum v1 client: keeps the connection to the pool, receives jobs and
+//! submits found shares. Reconnects with backoff when the link drops.
 
 use crate::consensus::{swab32, target_for_difficulty};
 use crate::shared::{FoundShare, MinerJob, Shared};
@@ -65,7 +65,7 @@ fn session(
     let mut line = String::new();
 
     loop {
-        // 1) Skicka in väntande shares.
+        // 1) Submit pending shares.
         while let Ok(share) = submit_rx.try_recv() {
             if share.is_block_candidate {
                 crate::human!("[miner] ★ BLOCK CANDIDATE {} ★", share.hash_display);
@@ -80,7 +80,8 @@ fn session(
             next_submit_id += 1;
         }
 
-        // 2) Läs ev. rad från poolen (timeout 200 ms håller loopen igång).
+        // 2) Read any line from the pool (the 200 ms timeout keeps the loop
+        // running).
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
@@ -124,7 +125,7 @@ fn session(
             });
             continue;
         }
-        // Submit-svar.
+        // Submit responses.
         if let Some(id) = msg["id"].as_u64() {
             if id >= 100 {
                 use std::sync::atomic::Ordering;

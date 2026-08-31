@@ -1,17 +1,20 @@
-// SHA3-256t-kernel (trippel NIST SHA3-256) — DELAD källa för CUDA och OpenCL.
+// SHA3-256t kernel (triple NIST SHA3-256) - SHARED source for CUDA and OpenCL.
 //
-// Samma fil kompileras av NVRTC (som CUDA C++) och av OpenCL-runtimen (som
-// OpenCL C). Alla skillnader kapslas i makronen nedan — själva keccak-kärnan
-// är identisk, så bitexakthet verifierad för den ena backenden gäller båda.
+// The same file is compiled by NVRTC (as CUDA C++) and by the OpenCL runtime
+// (as OpenCL C). All differences are encapsulated in the macros below - the
+// keccak core itself is identical, so bit-exactness verified for one backend
+// holds for both.
 //
-// Hashschema (se src/consensus.rs för CPU-referensen):
-//   - Headern är 80 bytes och SHA3-256-raten är 136 bytes ⇒ ETT absorb-block.
-//   - Padding (NIST SHA3, inte rå keccak): 0x06 på byte 80, 0x80 på byte 135.
-//   - Varv 2 och 3 hashar 32 bytes: 0x06 på byte 32, 0x80 på byte 135.
-//   - Totalt exakt 3 keccak-f[1600]-permutationer per nonce.
+// Hash scheme (see src/consensus.rs for the CPU reference):
+//   - The header is 80 bytes and the SHA3-256 rate is 136 bytes -> ONE
+//     absorb block.
+//   - Padding (NIST SHA3, not raw keccak): 0x06 at byte 80, 0x80 at byte 135.
+//   - Rounds 2 and 3 hash 32 bytes: 0x06 at byte 32, 0x80 at byte 135.
+//   - Exactly 3 keccak-f[1600] permutations per nonce in total.
 //
-// Värden packas som u64-lanes i little-endian (lane i = bytes 8i..8i+7), så
-// hela headern får plats i lane 0..9 och noncen är höga halvan av lane 9.
+// Values are packed as u64 lanes in little-endian (lane i = bytes 8i..8i+7),
+// so the whole header fits in lanes 0..9 and the nonce is the high half of
+// lane 9.
 
 #if defined(__OPENCL_VERSION__)
   typedef ulong u64;
@@ -23,9 +26,9 @@
   #define GLOBAL_ID() ((u32)get_global_id(0))
   #define ATOMIC_INC_U32(p) atomic_inc(p)
   #define ROTL64(x, n) rotate((u64)(x), (u64)(n))
-  // Ingen utrullning har: vinsten ar uppmatt pa NVIDIA, och pa AMD kan
-  // full utrullning i stallet driva upp registertrycket. Matt innan det
-  // slas pa for OpenCL.
+  // No unrolling here: the gain is measured on NVIDIA, and on AMD full
+  // unrolling can instead drive up the register pressure. Measure before
+  // it is turned on for OpenCL.
   #define UNROLL_ROUNDS
 #else /* CUDA (NVRTC) */
   typedef unsigned long long u64;
@@ -37,26 +40,27 @@
   #define GLOBAL_ID() ((u32)(blockIdx.x * blockDim.x + threadIdx.x))
   #define ATOMIC_INC_U32(p) atomicAdd(p, 1u)
   #define ROTL64(x, n) (((u64)(x) << (n)) | ((u64)(x) >> (64 - (n))))
-  // Full utrullning av de 24 varven. Tva effekter, bada uppmatta: de fem
-  // overhead-instruktionerna per varv (rundkonstant, raknare, jamforelse,
-  // hopp) forsvinner, och ptxas kommer ner fran 80 till 64 register, vilket
-  // hojer occupancy fran 25 till 32 warps per SM. Delvis utrullning (2, 4, 8)
-  // ar SAMRE an ingen alls - da behalls bade loopen och de 80 registren.
+  // Full unrolling of the 24 rounds. Two effects, both measured: the five
+  // overhead instructions per round (round constant, counter, comparison,
+  // branch) disappear, and ptxas comes down from 80 to 64 registers, which
+  // raises occupancy from 25 to 32 warps per SM. Partial unrolling (2, 4, 8)
+  // is WORSE than none at all - it keeps both the loop and the 80 registers.
   #define UNROLL_ROUNDS _Pragma("unroll")
 #endif
 
-// Trevags-XOR. Ampere/Ada har LOP3, som raknar ut en GODTYCKLIG funktion av
-// tre indata i EN instruktion (immLut 0x96 = a^b^c). ptxas hittar en del av
-// dessa monster sjalv, men inte alla — att skriva dem explicit tar theta fran
-// 50 till 35 logikoperationer per varv. Pa AMD (RDNA2+) monstermatchar
-// kompilatorn `a^b^c` till v_xor3_b32, sa OpenCL-grenen behover ingen asm.
+// Three-way XOR. Ampere/Ada have LOP3, which computes an ARBITRARY function
+// of three inputs in ONE instruction (immLut 0x96 = a^b^c). ptxas finds some
+// of these patterns by itself, but not all - writing them explicitly takes
+// theta from 50 down to 35 logic operations per round. On AMD (RDNA2+) the
+// compiler pattern-matches `a^b^c` to v_xor3_b32, so the OpenCL branch needs
+// no asm.
 #if defined(__OPENCL_VERSION__)
   #define XOR3(a, b, c) ((a) ^ (b) ^ (c))
 #else
 DEVICE_FN u64 xor3_lop3(u64 a, u64 b, u64 c) {
   u64 r;
-  // En rad: PTX-satser avslutas med semikolon, sa inga radbrytningar
-  // behovs — och da finns inga escape-sekvenser som kan ga sonder.
+  // One line: PTX statements end with a semicolon, so no line breaks are
+  // needed - and then there are no escape sequences that can break.
   asm("{ .reg .b32 al, ah, bl, bh, cl, ch, rl, rh; mov.b64 {al,ah}, %1; mov.b64 {bl,bh}, %2; mov.b64 {cl,ch}, %3; lop3.b32 rl, al, bl, cl, 0x96; lop3.b32 rh, ah, bh, ch, 0x96; mov.b64 %0, {rl,rh}; }" : "=l"(r) : "l"(a), "l"(b), "l"(c));
   return r;
 }
@@ -74,18 +78,18 @@ CONST_ARR u64 KECCAK_RC[24] = {
   0x8000000000008080UL, 0x0000000080000001UL, 0x8000000080008008UL
 };
 
-// VIKTIGT för prestanda: rundfunktionen är HELT utrullad med konstanta
-// index — dynamisk indexering av st[] gör att tillståndet spiller till
-// local memory och kerneln blir ~100× långsammare. (Verifierat empiriskt:
-// den kompakta tabellstyrda varianten gav 4 MH/s i stället för GH/s-klass.)
+// IMPORTANT for performance: the round function is FULLY unrolled with
+// constant indices - dynamic indexing of st[] makes the state spill to
+// local memory and the kernel becomes ~100x slower. (Verified empirically:
+// the compact table-driven variant gave 4 MH/s instead of the GH/s class.)
 DEVICE_FN void keccakf(u64 st[25]) {
   u64 bc0, bc1, bc2, bc3, bc4, t, tmp;
   UNROLL_ROUNDS
   for (int round = 0; round < 24; round++) {
-    // Theta. Kolumnsummorna som XOR3-par; appliceringen vager in bade
-    // C[x-1] och ROTL(C[x+1],1) i samma instruktion, sa D[x] aldrig
-    // materialiseras. `t` haller bara rotationen — en levande vardet i
-    // taget, precis som forr, sa registertrycket ar oforandrat.
+    // Theta. The column sums as XOR3 pairs; the application folds in both
+    // C[x-1] and ROTL(C[x+1],1) in the same instruction, so D[x] is never
+    // materialized. `t` holds only the rotation - one live value at a
+    // time, just as before, so the register pressure is unchanged.
     bc0 = XOR3(st[0], st[5], st[10]);  bc0 = XOR3(bc0, st[15], st[20]);
     bc1 = XOR3(st[1], st[6], st[11]);  bc1 = XOR3(bc1, st[16], st[21]);
     bc2 = XOR3(st[2], st[7], st[12]);  bc2 = XOR3(bc2, st[17], st[22]);
@@ -107,7 +111,7 @@ DEVICE_FN void keccakf(u64 st[25]) {
     st[4] = XOR3(st[4], bc3, t); st[9] = XOR3(st[9], bc3, t); st[14] = XOR3(st[14], bc3, t);
     st[19] = XOR3(st[19], bc3, t); st[24] = XOR3(st[24], bc3, t);
 
-    // Rho + Pi (Saarinens ordning, utrullad: (lane, rot) per steg)
+    // Rho + Pi (Saarinen's ordering, unrolled: (lane, rot) per step)
     t = st[1];
     tmp = st[10]; st[10] = ROTL64(t, 1);  t = tmp;
     tmp = st[7];  st[7]  = ROTL64(t, 3);  t = tmp;
@@ -134,7 +138,7 @@ DEVICE_FN void keccakf(u64 st[25]) {
     tmp = st[6];  st[6]  = ROTL64(t, 20); t = tmp;
     st[1] = ROTL64(t, 44);
 
-    // Chi, rad för rad
+    // Chi, row by row
     bc0 = st[0]; bc1 = st[1]; bc2 = st[2]; bc3 = st[3]; bc4 = st[4];
     st[0] ^= (~bc1) & bc2; st[1] ^= (~bc2) & bc3; st[2] ^= (~bc3) & bc4;
     st[3] ^= (~bc4) & bc0; st[4] ^= (~bc0) & bc1;
@@ -156,8 +160,8 @@ DEVICE_FN void keccakf(u64 st[25]) {
   }
 }
 
-// SHA3-256 av 32 bytes (lane 0..3) → 32 bytes. Padding: 0x06 på byte 32
-// (lane 4, byte 0) och 0x80 på byte 135 (lane 16, byte 7).
+// SHA3-256 of 32 bytes (lanes 0..3) -> 32 bytes. Padding: 0x06 at byte 32
+// (lane 4, byte 0) and 0x80 at byte 135 (lane 16, byte 7).
 DEVICE_FN void sha3_256_32(u64 out[4], const u64 in[4]) {
   u64 st[25];
   for (int i = 0; i < 25; i++)
@@ -175,13 +179,14 @@ DEVICE_FN void sha3_256_32(u64 out[4], const u64 in[4]) {
   out[3] = st[3];
 }
 
-// Grinda nonce-rymden [start_nonce, start_nonce + nonce_count).
+// Grind the nonce space [start_nonce, start_nonce + nonce_count).
 //
-//   hdr_lanes: 10 u64 — 80-bytesheadern (nonce-fältet = 0) som LE-lanes.
-//   t0..t3:    share-target som fyra u64-limbar; t3 mest signifikant.
-//              (Hashen tolkas som little-endian 256-bitars tal; limb k = u64
-//               ur hashbytes 8k..8k+7, jfr consensus::hash_meets_target.)
-//   hits:      hits[0] = atomisk träffräknare, hits[1..1+max_hits] = noncer.
+//   hdr_lanes: 10 u64 - the 80-byte header (nonce field = 0) as LE lanes.
+//   t0..t3:    share target as four u64 limbs; t3 most significant.
+//              (The hash is read as a little-endian 256-bit number; limb k =
+//               u64 from hash bytes 8k..8k+7, cf.
+//               consensus::hash_meets_target.)
+//   hits:      hits[0] = atomic hit counter, hits[1..1+max_hits] = nonces.
 KERNEL_FN void sha3t_scan(GLOBAL const u64 *hdr_lanes,
                           u32 start_nonce,
                           u32 nonce_count,
@@ -193,24 +198,25 @@ KERNEL_FN void sha3t_scan(GLOBAL const u64 *hdr_lanes,
     return;
   u32 nonce = start_nonce + gid;
 
-  // Varv 1: 80-bytesheadern. Noncen är bytes 76..79 = höga halvan av lane 9.
+  // Round 1: the 80-byte header. The nonce is bytes 76..79 = the high half
+  // of lane 9.
   u64 st[25];
   for (int i = 0; i < 25; i++)
     st[i] = 0;
   for (int i = 0; i < 10; i++)
     st[i] = hdr_lanes[i];
   st[9] |= (u64)nonce << 32;
-  st[10] = 0x06UL;                  // paddingbyte 80
-  st[16] = 0x8000000000000000UL;    // paddingbyte 135
+  st[10] = 0x06UL;                  // padding byte 80
+  st[16] = 0x8000000000000000UL;    // padding byte 135
   keccakf(st);
 
-  // Varv 2 och 3: 32-bytes mellanhash.
+  // Rounds 2 and 3: the 32-byte intermediate hash.
   u64 h[4], h2[4];
   h[0] = st[0]; h[1] = st[1]; h[2] = st[2]; h[3] = st[3];
   sha3_256_32(h2, h);
   sha3_256_32(h, h2);
 
-  // hash ≤ target (little-endian 256-bitars tal, limb 3 mest signifikant).
+  // hash <= target (little-endian 256-bit number, limb 3 most significant).
   bool ok;
   if (h[3] != t3)      ok = h[3] < t3;
   else if (h[2] != t2) ok = h[2] < t2;

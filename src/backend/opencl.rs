@@ -1,8 +1,9 @@
-//! OpenCL-backend (AMD/Intel/NVIDIA). Delar kernelkälla med CUDA-backenden
-//! (src/kernels/sha3t.cl), så bitexaktheten följer av samma kernel.
+//! OpenCL backend (AMD/Intel/NVIDIA). Shares the kernel source with the CUDA
+//! backend (src/kernels/sha3t.cl), so bit-exactness follows from it being the
+//! same kernel.
 //!
-//! Runtime laddas dynamiskt (se `cl_sys`) — binären startar och faller
-//! tillbaka på CPU även på maskiner helt utan OpenCL.
+//! The runtime is loaded dynamically (see `cl_sys`) - the binary starts and
+//! falls back to the CPU even on machines with no OpenCL at all.
 
 use super::cl_sys::{
     check, cl, cl_handle, cl_int, cl_uint, cstr, err_str, info_string, CL_DEVICE_NAME,
@@ -16,11 +17,11 @@ use std::ptr;
 
 const LOCAL_SIZE: usize = 256;
 
-/// Enheter per plattform, i samma ordning som `list_devices` numrerar dem.
+/// Devices of a platform, in the same order `list_devices` numbers them.
 fn devices_of(platform: cl_handle, dtype: u64) -> Vec<cl_handle> {
     let Ok(cl) = cl() else { return vec![] };
     let mut n: cl_uint = 0;
-    // SAFETY: OpenCL-anrop med giltiga pekare; n skrivs bara vid CL_SUCCESS.
+    // SAFETY: OpenCL calls with valid pointers; n is written only on success.
     unsafe {
         if (cl.get_device_ids)(platform, dtype, 0, ptr::null_mut(), &mut n)
             != CL_SUCCESS
@@ -62,8 +63,8 @@ fn device_name(device: cl_handle) -> Option<String> {
     .filter(|s| !s.is_empty())
 }
 
-/// Lista alla GPU-enheter över alla plattformar; tom lista vid fel eller om
-/// ingen OpenCL-runtime finns.
+/// List all GPU devices across all platforms; empty list on error or if there
+/// is no OpenCL runtime.
 pub fn list_devices() -> Vec<super::GpuDevice> {
     let mut out = Vec::new();
     for (pi, platform) in platforms().into_iter().enumerate() {
@@ -91,9 +92,9 @@ impl OpenClBackend {
         Self::new_typed(platform_idx, device_idx, CL_DEVICE_TYPE_GPU)
     }
 
-    /// Enhetstypen är en parameter så att testerna kan köra mot pocl, som
-    /// exponerar en CPU-enhet. Produktionsvägen tar bara GPU:er — en
-    /// OpenCL-CPU vore långsammare än vår egen CPU-backend.
+    /// The device type is a parameter so the tests can run against pocl,
+    /// which exposes a CPU device. The production path takes GPUs only - an
+    /// OpenCL CPU would be slower than our own CPU backend.
     fn new_typed(platform_idx: usize, device_idx: usize, dtype: u64) -> Result<Self, String> {
         let cl = cl()?;
         let platform = *platforms()
@@ -119,17 +120,18 @@ impl OpenClBackend {
             if context.is_null() {
                 return Err("clCreateContext returned null".into());
             }
-            // Städa upp allt som hunnit skapas om ett senare steg fallerar.
+            // Clean up whatever got created if a later step fails.
             let guard = |c: cl_handle| {
                 let _ = (cl.release_context)(c);
             };
 
-            // Kön: den gamla varianten fungerar överallt, den nya krävs på
-            // runtimes som tagit bort den (OpenCL 2.0+ utan kompatibilitet).
+            // The queue: the old variant works everywhere, the new one is
+            // required on runtimes that dropped it (OpenCL 2.0+ without
+            // backwards compatibility).
             let queue = if let Some(f) = cl.create_command_queue {
                 f(context, device, 0, &mut err)
             } else {
-                let props = [0u64; 1]; // tom, nullterminerad egenskapslista
+                let props = [0u64; 1]; // empty, nul-terminated property list
                 (cl.create_command_queue_with_properties.unwrap())(
                     context,
                     device,
@@ -162,7 +164,7 @@ impl OpenClBackend {
                 ptr::null_mut(),
             );
             if code != CL_SUCCESS {
-                // Byggloggen är det enda som säger VAD som gick fel i kerneln.
+                // The build log is the only thing that says WHAT went wrong.
                 let log = info_string(|size, buf, len| {
                     (cl.get_program_build_info)(
                         program,
@@ -226,7 +228,7 @@ impl OpenClBackend {
 impl Drop for OpenClBackend {
     fn drop(&mut self) {
         let Ok(cl) = cl() else { return };
-        // Omvänd skapandeordning; felkoder är ointressanta här.
+        // Reverse of creation order; error codes are of no interest here.
         unsafe {
             let _ = (cl.release_mem_object)(self.d_hits);
             let _ = (cl.release_mem_object)(self.d_lanes);
@@ -288,7 +290,7 @@ impl MiningBackend for OpenClBackend {
                 ),
             )?;
 
-            // Argumentordningen måste matcha sha3t_scan i sha3t.cl exakt.
+            // The argument order must match sha3t_scan in sha3t.cl exactly.
             let set = |i: cl_uint, size: usize, p: *const c_void| -> Result<(), String> {
                 check(&format!("set arg {i}"), (cl.set_kernel_arg)(self.kernel, i, size, p))
             };
@@ -302,7 +304,7 @@ impl MiningBackend for OpenClBackend {
             set(7, hsz, &self.d_hits as *const _ as *const c_void)?;
             set(8, 4, &max_hits as *const _ as *const c_void)?;
 
-            // Global rundas upp till multipel av local; kerneln vaktar count.
+            // Global rounds up to a multiple of local; the kernel guards count.
             let global = (count as usize).div_ceil(LOCAL_SIZE) * LOCAL_SIZE;
             let local = LOCAL_SIZE;
             check(
@@ -349,18 +351,19 @@ mod tests {
     use super::super::cl_sys::CL_DEVICE_TYPE_ALL;
     use crate::consensus::{hash_meets_target, sha3t};
 
-    /// Kräver en OpenCL-runtime. I CI/Docker räcker pocl (CPU-implementation):
+    /// Requires an OpenCL runtime. In CI/Docker pocl (a CPU implementation)
+    /// is enough:
     ///   apt-get install -y pocl-opencl-icd
     ///   cargo test --features opencl -- --ignored opencl
-    /// På en riktig maskin testas i stället GPU-drivrutinens runtime.
+    /// On a real machine the GPU driver's runtime gets tested instead.
     ///
-    /// Samma facit-metod som CUDA-testerna: exakt jämförelse av träffmängden
-    /// mot CPU-referensen, plus en nonce som garanterat MÅSTE hittas.
+    /// Same ground-truth method as the CUDA tests: exact comparison of the
+    /// hit set against the CPU reference, plus one nonce that MUST be found.
     #[test]
     #[ignore = "requires an OpenCL runtime (pocl in Docker, or a GPU driver)"]
     fn opencl_matches_cpu_on_random_headers() {
-        // ALL i stället för GPU: pocl exponerar en CPU-enhet, och poängen
-        // med testet är kernelvägen — inte vilken sorts enhet som kör den.
+        // ALL instead of GPU: pocl exposes a CPU device, and the point of
+        // the test is the kernel path - not what kind of device runs it.
         let mut backend = OpenClBackend::new_typed(0, 0, CL_DEVICE_TYPE_ALL)
             .expect("OpenCL backend");
         println!("backend: {}", backend.name());
@@ -379,7 +382,8 @@ mod tests {
             }
             let start = xorshift() as u32;
             let count = 4096u32;
-            // Target = minsta hashen i intervallet ⇒ exakt en garanterad träff.
+            // Target = smallest hash in the range -> exactly one guaranteed
+            // hit.
             let mut header80 = [0u8; 80];
             header80[..76].copy_from_slice(&header76);
             let (pick, target) = (0..count)
@@ -408,7 +412,7 @@ mod tests {
         }
     }
 
-    /// Tomt intervall får aldrig nå fram till en kernel-launch.
+    /// An empty range must never make it as far as a kernel launch.
     #[test]
     #[ignore = "requires an OpenCL runtime"]
     fn zero_count_is_a_no_op() {
@@ -418,8 +422,8 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    /// Utan runtime ska list_devices ge tom lista, inte panik. Kan köras
-    /// överallt.
+    /// Without a runtime, list_devices must give an empty list, not a panic.
+    /// Can be run anywhere.
     #[test]
     fn list_devices_never_panics() {
         let _ = list_devices();

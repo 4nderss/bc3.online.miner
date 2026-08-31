@@ -1,8 +1,9 @@
-//! bc3-miner — CPU/GPU-miner för BC3 (bc3.online-klienten).
+//! bc3-miner - CPU/GPU miner for BC3 (the bc3.online client).
 //!
-//! GPU-backends (CUDA via NVRTC, OpenCL) och CPU-trådar delar samma
-//! jobbpipeline: stratum-klienten publicerar jobb, arbetarna partitionerar
-//! extranonce2-rymden disjunkt och rapporterar shares på samma kanal.
+//! The GPU backends (CUDA via NVRTC, OpenCL) and the CPU threads share the
+//! same job pipeline: the stratum client publishes jobs, the workers
+//! partition the extranonce2 space disjointly and report shares on the same
+//! channel.
 
 mod backend;
 mod consensus;
@@ -21,42 +22,42 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "bc3-miner", version, about = "BC3 (SHA3-256t) miner — bc3.online")]
 struct Args {
-    /// Pooladress (host:port). PPLNS: bc3.online:3111, solo: bc3.online:3112.
+    /// Pool address (host:port). PPLNS: bc3.online:3111, solo: bc3.online:3112.
     #[arg(long, default_value = "bc3.online:3111")]
     pool: String,
 
-    /// Din BC3-adress, valfritt med riggnamn: adress.riggnamn.
-    /// Krävs för mining, men inte för `--probe`.
+    /// Your BC3 address, optionally with a rig name: address.rigname.
+    /// Required for mining, but not for `--probe`.
     #[arg(long)]
     user: Option<String>,
 
-    /// Backend: auto = CUDA om möjligt, annars OpenCL, annars CPU.
+    /// Backend: auto = CUDA if possible, else OpenCL, else CPU.
     #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
     backend: BackendKind,
 
-    /// Använd bara en specifik GPU (index i den detekterade listan).
+    /// Use only one specific GPU (index into the detected list).
     #[arg(long)]
     gpu_id: Option<usize>,
 
-    /// Antal CPU-trådar (0 = alla kärnor). Med GPU-backend är standard att
-    /// inga CPU-trådar startas — ange flaggan för att mina med båda.
+    /// Number of CPU threads (0 = all cores). With a GPU backend the default
+    /// is to start no CPU threads - pass the flag to mine with both.
     #[arg(long)]
     threads: Option<usize>,
 
-    /// Intensitet 1–100 %. Under 100 vilar arbetarna mellan pass, vilket
-    /// sänker värme/strömförbrukning och gör datorn användbar under mining.
+    /// Intensity 1-100 %. Below 100 the workers idle between passes, which
+    /// lowers heat/power draw and keeps the machine usable while mining.
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
     intensity: u32,
 
-    /// Sekunder mellan statistikrader.
+    /// Seconds between statistics lines.
     #[arg(long, default_value_t = 5)]
     stats_interval: u64,
 
-    /// Skriv maskinläsbara JSON-rader på stdout i stället för text (GUI:t).
+    /// Print machine-readable JSON lines on stdout instead of text (the GUI).
     #[arg(long)]
     json: bool,
 
-    /// Lista tillgänglig hårdvara och avsluta (GUI:t frågar innan start).
+    /// List available hardware and exit (the GUI asks before starting).
     #[arg(long)]
     probe: bool,
 }
@@ -68,9 +69,9 @@ fn main() {
     let all_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
     if args.probe {
-        // Proben är diagnostik: lista BÅDA vägarna, inte bara den Auto skulle
-        // valt. På ett NVIDIA-kort vinner CUDA i Auto, och då hade man aldrig
-        // sett om OpenCL-runtimen också fungerar.
+        // The probe is a diagnostic: list BOTH paths, not just the one Auto
+        // would have picked. On an NVIDIA card CUDA wins in Auto, and then
+        // you would never see whether the OpenCL runtime works too.
         let mut gpus: Vec<String> = backend::detect_gpus(BackendKind::Cuda, None)
             .iter()
             .map(|g| g.describe())
@@ -113,16 +114,17 @@ fn main() {
         }
     }
 
-    // "Alla kärnor" (0) betyder olika saker med och utan GPU: varje GPU har en
-    // matartråd som måste få CPU-tid för att hinna starta nästa kernel. Låter
-    // vi CPU-mining ta alla kärnor svälter matarna och GPU-hashraten sjunker
-    // mer än CPU:n tillför. Därför reserveras en kärna per GPU plus en till.
+    // "All cores" (0) means different things with and without a GPU: every
+    // GPU has a feeder thread that must get CPU time to launch the next
+    // kernel in time. If we let CPU mining take every core the feeders starve
+    // and the GPU hashrate drops more than the CPU adds. So we reserve one
+    // core per GPU plus one more.
     let threads = match (args.threads, gpus.is_empty()) {
         (Some(0), true) => all_cores,
         (Some(0), false) => all_cores.saturating_sub(gpus.len() + 1).max(1),
         (Some(n), _) => n,
-        (None, true) => all_cores, // ren CPU-mining som förr
-        (None, false) => 0,        // GPU-läge: inga CPU-trådar om inte begärt
+        (None, true) => all_cores, // pure CPU mining, as before
+        (None, false) => 0,        // GPU mode: no CPU threads unless asked for
     };
 
     human!(
@@ -148,7 +150,7 @@ fn main() {
         human!("[miner] intensity {}%", args.intensity);
     }
 
-    // CPU-trådar och GPU:er delar en gemensam disjunkt extranonce2-partition.
+    // CPU threads and GPUs share one common disjoint extranonce2 partition.
     let total_workers = threads + gpus.len();
     for i in 0..threads {
         let s = shared.clone();

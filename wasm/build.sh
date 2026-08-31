@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Bygger WASM-kärnan för web-minern och kopierar den till webbrepot.
+# Builds the WASM kernel for the web miner and copies it to the web repo.
 #
-# Körs i Docker (Smart App Control blockerar lokala Rust-byggen på Windows):
+# Runs in Docker (Smart App Control blocks local Rust builds on Windows):
 #   docker run --rm -v C:/dev/bc3.online/miner:/work \
 #     -v bc3-cargo-registry:/usr/local/cargo/registry \
 #     -w /work/wasm rust:1-trixie ./build.sh
@@ -10,10 +10,10 @@ set -euo pipefail
 TARGET=wasm32-unknown-unknown
 OUT=target/$TARGET/release/bc3_miner_wasm.wasm
 
-# Targetet ligger inte i basimagen och försvinner med containern.
+# The target is not in the base image and disappears with the container.
 rustup target list --installed | grep -qx "$TARGET" || rustup target add "$TARGET"
 
-echo "== Enhetstester (värdplattformen) =="
+echo "== Unit tests (host platform) =="
 cargo test --lib
 
 echo
@@ -25,7 +25,7 @@ echo
 echo "OK: $OUT ($SIZE bytes)"
 sha256sum "$OUT"
 
-# Kopiera till webbrepot om det är monterat bredvid.
+# Copy to the web repo if it is mounted alongside.
 if [ -d /web/vendor ]; then
   cp "$OUT" /web/vendor/bc3-miner.wasm
   echo "Kopierad till /web/vendor/bc3-miner.wasm"

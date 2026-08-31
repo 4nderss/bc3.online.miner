@@ -1,26 +1,26 @@
-//! SHA3-256t-sökkärna för web-minern, kompilerad till WebAssembly.
+//! SHA3-256t search kernel for the web miner, compiled to WebAssembly.
 //!
-//! Medvetet UTAN wasm-bindgen: gränssnittet är fyra tal och två byte-buffertar,
-//! så bindgen skulle bara lägga till glue och ett byggberoende. JS skriver
-//! direkt i wasm-minnet och anropar exporterna.
+//! Deliberately WITHOUT wasm-bindgen: the interface is four numbers and two
+//! byte buffers, so bindgen would only add glue and a build dependency. JS
+//! writes directly into the wasm memory and calls the exports.
 //!
-//! Konsensuskoden delas med CLI-minern via `#[path]` i stället för att
-//! kopieras — en webbshare måste hashas exakt som en GPU-share, annars
-//! avvisar poolen den.
+//! The consensus code is shared with the CLI miner via `#[path]` instead of
+//! being copied - a web share must be hashed exactly like a GPU share, or
+//! else the pool rejects it.
 
-// `consensus` drar in fler funktioner än sökloopen använder (merkle, bip34,
-// adresser). De är testade och kostar inget i den kompilerade modulen.
+// `consensus` pulls in more functions than the search loop uses (merkle,
+// bip34, addresses). They are tested and cost nothing in the compiled module.
 #[allow(dead_code)]
 #[path = "../../src/consensus.rs"]
 mod consensus;
 
 use consensus::{hash_meets_target, sha3t, Target};
 
-/// Wasm har ingen allokator som JS kan nå direkt. De här två exporterna gör
-/// att JS kan reservera minne för header och target.
+/// Wasm has no allocator that JS can reach directly. These two exports let
+/// JS reserve memory for the header and the target.
 ///
 /// # Safety
-/// Anroparen äger blocket tills `dealloc` anropas med samma längd.
+/// The caller owns the block until `dealloc` is called with the same length.
 #[no_mangle]
 pub extern "C" fn alloc(len: usize) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(len);
@@ -30,7 +30,7 @@ pub extern "C" fn alloc(len: usize) -> *mut u8 {
 }
 
 /// # Safety
-/// `ptr` måste komma från `alloc` med samma `len`.
+/// `ptr` must come from `alloc` with the same `len`.
 #[no_mangle]
 pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: usize) {
     if !ptr.is_null() && len > 0 {
@@ -38,18 +38,18 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Sök igenom ett nonce-intervall efter en hash som möter target.
+/// Search a nonce range for a hash that meets the target.
 ///
-/// `header_ptr` pekar på 80 bytes serialiserad blockheader; noncen på offset
-/// 76 skrivs över för varje försök. `target_ptr` pekar på 32 bytes big-endian
-/// target (poolens share-target, inte nätverkets).
+/// `header_ptr` points at 80 bytes of serialized block header; the nonce at
+/// offset 76 is overwritten for every attempt. `target_ptr` points at 32
+/// bytes of big-endian target (the pool's share target, not the network's).
 ///
-/// Returnerar noncen som funktion av f64 — `-1.0` betyder "hittade inget i
-/// intervallet". f64 i stället för i64 för att slippa BigInt i JS; alla u32
-/// ryms exakt i en f64.
+/// Returns the nonce as an f64 - `-1.0` means "found nothing in the range".
+/// f64 instead of i64 to avoid BigInt in JS; every u32 fits exactly in an
+/// f64.
 ///
 /// # Safety
-/// Bufferterna måste vara 80 respektive 32 bytes och komma från `alloc`.
+/// The buffers must be 80 and 32 bytes respectively and come from `alloc`.
 #[no_mangle]
 pub unsafe extern "C" fn search(
     header_ptr: *const u8,
@@ -60,16 +60,17 @@ pub unsafe extern "C" fn search(
     if header_ptr.is_null() || target_ptr.is_null() {
         return -1.0;
     }
-    // Kopiera in headern på stacken: att skriva noncen genom en rå pekare i
-    // loopen hindrar optimeringar och tvingar en läsning per varv.
+    // Copy the header onto the stack: writing the nonce through a raw
+    // pointer in the loop blocks optimizations and forces one read per
+    // iteration.
     let mut header = [0u8; 80];
     core::ptr::copy_nonoverlapping(header_ptr, header.as_mut_ptr(), 80);
     let mut target: Target = [0u8; 32];
     core::ptr::copy_nonoverlapping(target_ptr, target.as_mut_ptr(), 32);
 
     for i in 0..nonce_count {
-        // wrapping: nonce-rymden är cirkulär, och en arbetare som får ett
-        // intervall nära u32::MAX ska inte panika.
+        // wrapping: the nonce space is circular, and a worker that gets a
+        // range close to u32::MAX must not panic.
         let nonce = nonce_start.wrapping_add(i);
         header[76..80].copy_from_slice(&nonce.to_le_bytes());
         let hash = sha3t(&header);
@@ -80,12 +81,12 @@ pub unsafe extern "C" fn search(
     -1.0
 }
 
-/// Hasha en header en gång och skriv resultatet till `out_ptr` (32 bytes).
-/// Används av huvudtråden för att verifiera en träff innan den skickas, och
-/// av självtestet nedan.
+/// Hash a header once and write the result to `out_ptr` (32 bytes). Used by
+/// the main thread to verify a hit before it is submitted, and by the self
+/// test below.
 ///
 /// # Safety
-/// `header_ptr` måste peka på 80 bytes, `out_ptr` på minst 32.
+/// `header_ptr` must point at 80 bytes, `out_ptr` at at least 32.
 #[no_mangle]
 pub unsafe extern "C" fn hash_header(header_ptr: *const u8, out_ptr: *mut u8) {
     if header_ptr.is_null() || out_ptr.is_null() {
@@ -97,10 +98,10 @@ pub unsafe extern "C" fn hash_header(header_ptr: *const u8, out_ptr: *mut u8) {
     core::ptr::copy_nonoverlapping(hash.as_ptr(), out_ptr, 32);
 }
 
-/// SHA256d över godtycklig buffert (coinbase-txid, merklesteg).
+/// SHA256d over an arbitrary buffer (coinbase txid, merkle steps).
 ///
 /// # Safety
-/// `ptr` måste peka på `len` läsbara bytes, `out_ptr` på minst 32.
+/// `ptr` must point at `len` readable bytes, `out_ptr` at at least 32.
 #[no_mangle]
 pub unsafe extern "C" fn sha256d_into(ptr: *const u8, len: usize, out_ptr: *mut u8) {
     if ptr.is_null() || out_ptr.is_null() {
@@ -111,10 +112,10 @@ pub unsafe extern "C" fn sha256d_into(ptr: *const u8, len: usize, out_ptr: *mut 
     core::ptr::copy_nonoverlapping(h.as_ptr(), out_ptr, 32);
 }
 
-/// Stratums prevhash-ordning → intern ordning (4-bytesordsreversering).
+/// Stratum's prevhash ordering -> internal ordering (4-byte word reversal).
 ///
 /// # Safety
-/// Båda pekarna måste peka på minst 32 bytes.
+/// Both pointers must point at at least 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn swab32_into(in_ptr: *const u8, out_ptr: *mut u8) {
     if in_ptr.is_null() || out_ptr.is_null() {
@@ -126,7 +127,8 @@ pub unsafe extern "C" fn swab32_into(in_ptr: *const u8, out_ptr: *mut u8) {
     core::ptr::copy_nonoverlapping(out.as_ptr(), out_ptr, 32);
 }
 
-/// Merklerot ur coinbase-txid och stratums grenar (`steps_count` × 32 bytes).
+/// Merkle root from the coinbase txid and stratum's branches
+/// (`steps_count` x 32 bytes).
 ///
 /// # Safety
 /// `txid_ptr` 32 bytes, `steps_ptr` `steps_count * 32` bytes, `out_ptr` 32.
@@ -152,10 +154,10 @@ pub unsafe extern "C" fn merkle_root_into(
     core::ptr::copy_nonoverlapping(root.as_ptr(), out_ptr, 32);
 }
 
-/// Share-target för en stratum-svårighet.
+/// Share target for a stratum difficulty.
 ///
 /// # Safety
-/// `out_ptr` måste peka på minst 32 bytes.
+/// `out_ptr` must point at at least 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn target_for_difficulty_into(difficulty: f64, out_ptr: *mut u8) {
     if out_ptr.is_null() {
@@ -165,11 +167,11 @@ pub unsafe extern "C" fn target_for_difficulty_into(difficulty: f64, out_ptr: *m
     core::ptr::copy_nonoverlapping(t.as_ptr(), out_ptr, 32);
 }
 
-/// Serialisera en 80-byte header. Fältordningen ligger i Rust så att JS
-/// aldrig kan lägga ett fält på fel offset.
+/// Serialize an 80-byte header. The field ordering lives in Rust so that JS
+/// can never put a field at the wrong offset.
 ///
 /// # Safety
-/// `prev_ptr` och `merkle_ptr` 32 bytes vardera, `out_ptr` minst 80.
+/// `prev_ptr` and `merkle_ptr` 32 bytes each, `out_ptr` at least 80.
 #[no_mangle]
 pub unsafe extern "C" fn build_header(
     version: u32,
@@ -198,10 +200,10 @@ pub unsafe extern "C" fn build_header(
     core::ptr::copy_nonoverlapping(ser.as_ptr(), out_ptr, 80);
 }
 
-/// Svårigheten en hash motsvarar — för att visa "best share" i UI:t.
+/// The difficulty a hash corresponds to - for showing "best share" in the UI.
 ///
 /// # Safety
-/// `hash_ptr` måste peka på 32 bytes.
+/// `hash_ptr` must point at 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn difficulty_of_hash(hash_ptr: *const u8) -> f64 {
     if hash_ptr.is_null() {
@@ -212,26 +214,27 @@ pub unsafe extern "C" fn difficulty_of_hash(hash_ptr: *const u8) -> f64 {
     consensus::difficulty_of_hash(&h)
 }
 
-/// Självtest mot en kedjeverifierad vektor. Returnerar 1 vid rätt svar.
+/// Self test against a chain-verified vector. Returns 1 on the right answer.
 ///
-/// Finns för att web-minern ska kunna vägra starta om den kompilerade
-/// modulen hashar fel — en trasig kärna skulle annars bara producera
-/// avvisade shares utan att någon förstod varför.
+/// It exists so that the web miner can refuse to start if the compiled
+/// module hashes incorrectly - a broken kernel would otherwise just produce
+/// rejected shares without anyone understanding why.
 #[no_mangle]
 pub extern "C" fn self_test() -> u32 {
-    // BC3:s genesisheader (samma vektor som CLI-minerns tester).
+    // BC3's genesis header (the same vector as the CLI miner's tests).
     let mut header = [0u8; 80];
     header[0..4].copy_from_slice(&1u32.to_le_bytes());
     let hash = sha3t(&header);
-    // Vi jämför inte mot genesis här (headern ovan är inte genesis) utan mot
-    // ett fast facit för just den här indatan, framräknat med samma kod i
-    // testet `wasm_self_test_vector_matches` nedan.
+    // We do not compare against genesis here (the header above is not
+    // genesis) but against a fixed expected value for exactly this input,
+    // computed with the same code in the test
+    // `wasm_self_test_vector_matches` below.
     let expected: [u8; 32] = SELF_TEST_DIGEST;
     u32::from(hash == expected)
 }
 
-/// Facit för `self_test`. Låst av enhetstestet längst ned, som räknar fram
-/// samma värde med den delade konsensuskoden.
+/// The expected value for `self_test`. Locked down by the unit test at the
+/// bottom, which computes the same value with the shared consensus code.
 const SELF_TEST_DIGEST: [u8; 32] = [
     0x6b, 0x5a, 0xb1, 0x5c, 0xea, 0x4b, 0x19, 0xaa, 0x64, 0x94, 0x5e, 0x06, 0xfa, 0xf0, 0x2e, 0x00,
     0xdb, 0x3c, 0x48, 0x84, 0xf3, 0x47, 0xc0, 0xe0, 0x74, 0x72, 0x52, 0xb0, 0x5e, 0xd9, 0xc6, 0xa6,
@@ -241,17 +244,18 @@ const SELF_TEST_DIGEST: [u8; 32] = [
 mod tests {
     use super::*;
 
-    /// Sökloopen måste hitta exakt den nonce vars hash möter target, och
-    /// returnera -1 när intervallet är tomt på träffar.
+    /// The search loop must find exactly the nonce whose hash meets the
+    /// target, and return -1 when the range holds no hits.
     #[test]
     fn search_finds_the_matching_nonce() {
         let mut header = [0u8; 80];
         header[0..4].copy_from_slice(&0x2000_1000u32.to_le_bytes());
-        // Ett löst target: första byten < 0x10 räcker, så en träff finns nära.
+        // A loose target: first byte < 0x10 is enough, so a hit is nearby.
         let mut target = [0xffu8; 32];
         target[0] = 0x0f;
 
-        // Facit räknat rakt fram med samma hashfunktion.
+        // Expected value computed straightforwardly with the same hash
+        // function.
         let mut expected = None;
         for n in 0..200_000u32 {
             let mut h = header;
@@ -261,48 +265,50 @@ mod tests {
                 break;
             }
         }
-        let expected = expected.expect("ett löst target måste ge en träff");
+        let expected = expected.expect("a loose target must produce a hit");
 
         let got = unsafe { search(header.as_ptr(), target.as_ptr(), 0, 200_000) };
         assert_eq!(got, expected as f64, "search hittade fel nonce");
 
-        // Intervall som slutar före träffen ⇒ ingen träff.
+        // A range that ends before the hit -> no hit.
         let miss = unsafe { search(header.as_ptr(), target.as_ptr(), 0, expected) };
-        assert_eq!(miss, -1.0, "search får inte rapportera en träff utanför intervallet");
+        assert_eq!(miss, -1.0, "search must not report a hit outside the range");
     }
 
-    /// Noncen skrivs på rätt offset (76..80, little-endian). Skrivs den fel
-    /// hashar webbminern en annan header än poolen validerar.
+    /// The nonce is written at the right offset (76..80, little-endian). If
+    /// it is written wrong, the web miner hashes a different header than the
+    /// one the pool validates.
     #[test]
     fn nonce_is_written_at_offset_76_little_endian() {
         let header = [0u8; 80];
-        let mut target = [0u8; 32]; // omöjligt target ⇒ search returnerar -1
+        let mut target = [0u8; 32]; // impossible target -> search returns -1
         target[31] = 1;
         let _ = unsafe { search(header.as_ptr(), target.as_ptr(), 0, 1) };
 
-        // Verifiera mot hash_header med en manuellt satt nonce.
+        // Verify against hash_header with a manually set nonce.
         let mut manual = [0u8; 80];
         let nonce = 0x1234_5678u32;
         manual[76..80].copy_from_slice(&nonce.to_le_bytes());
-        assert_eq!(manual[76], 0x78, "little-endian: lägsta byten först");
+        assert_eq!(manual[76], 0x78, "little-endian: lowest byte first");
         assert_eq!(manual[79], 0x12);
 
         let mut out = [0u8; 32];
         unsafe { hash_header(manual.as_ptr(), out.as_mut_ptr()) };
-        assert_eq!(out, sha3t(&manual), "hash_header måste ge samma svar som sha3t");
+        assert_eq!(out, sha3t(&manual), "hash_header must agree with sha3t");
     }
 
-    /// Nonce nära u32::MAX får inte panika — intervallet wrappar.
+    /// A nonce close to u32::MAX must not panic - the range wraps.
     #[test]
     fn nonce_wraps_instead_of_panicking() {
         let header = [0u8; 80];
-        let target = [0u8; 32]; // träffas aldrig
+        let target = [0u8; 32]; // never hit
         let got = unsafe { search(header.as_ptr(), target.as_ptr(), u32::MAX - 2, 10) };
         assert_eq!(got, -1.0);
     }
 
-    /// Låser fast facit i `SELF_TEST_DIGEST`. Går det här testet sönder har
-    /// hashimplementationen ändrats — då är web-minerns självtest också fel.
+    /// Locks down the expected value in `SELF_TEST_DIGEST`. If this test
+    /// breaks, the hash implementation has changed - and then the web
+    /// miner's self test is wrong too.
     #[test]
     fn wasm_self_test_vector_matches() {
         let mut header = [0u8; 80];
