@@ -170,13 +170,18 @@ fn mine_job(
                 *batch = (*batch / 2).max(MIN_BATCH);
             }
 
+            // Where the batch we just finished ends - not where it began.
+            // Saving `start` re-hashed the whole batch on the next job, up to
+            // 2^29 nonces, and the shares found in it came back as duplicates.
+            // That is the very waste this bookkeeping exists to avoid.
+            let (next, wrapped) = start.overflowing_add(count);
+
             if shared.generation.load(Ordering::Acquire) != generation {
                 // Remember where we stopped: if the next job covers the same
                 // space we continue here instead of re-hashing it.
-                *nonce_start = start;
+                *nonce_start = if wrapped { 0 } else { next };
                 return;
             }
-            let (next, wrapped) = start.overflowing_add(count);
             if wrapped {
                 break; // nonce space exhausted for this extranonce2
             }
