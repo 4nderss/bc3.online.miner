@@ -77,7 +77,7 @@ fn endpoint(opts: &StartOptions) -> String {
 /// Start button, and only then failed - which reads as a broken miner rather
 /// than a rejected address.
 fn validate_address(addr: &str) -> Result<(), String> {
-    let incomplete = || Err("That doesn't look like a complete BC3 address".into());
+    const INCOMPLETE: &str = "That doesn't look like a complete BC3 address";
     let a = addr.trim();
     if a.is_empty() {
         return Err("Enter your BC3 address".into());
@@ -86,14 +86,19 @@ fn validate_address(addr: &str) -> Result<(), String> {
     // case-insensitively. Length only: the pool decides the rest.
     let lower = a.to_lowercase();
     if lower.starts_with("bc1") {
-        return if (23..=90).contains(&lower.len()) { Ok(()) } else { incomplete() };
+        if lower.len() < 23 || lower.len() > 90 {
+            return Err(INCOMPLETE.into());
+        }
+        return Ok(());
     }
     // Base58 IS case-sensitive, so this one checks the original string. The
     // alphabet omits 0, O, I and l precisely because they are easy to confuse.
     if a.starts_with('1') || a.starts_with('3') {
         const B58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-        let ok = (26..=40).contains(&a.len()) && a.chars().all(|c| B58.contains(c));
-        return if ok { Ok(()) } else { incomplete() };
+        if a.len() < 26 || a.len() > 40 || !a.chars().all(|c| B58.contains(c)) {
+            return Err(INCOMPLETE.into());
+        }
+        return Ok(());
     }
     Err("A BC3 address starts with bc1, 1 or 3".into())
 }
