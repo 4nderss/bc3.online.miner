@@ -23,6 +23,10 @@
   #define GLOBAL_ID() ((u32)get_global_id(0))
   #define ATOMIC_INC_U32(p) atomic_inc(p)
   #define ROTL64(x, n) rotate((u64)(x), (u64)(n))
+  // Ingen utrullning har: vinsten ar uppmatt pa NVIDIA, och pa AMD kan
+  // full utrullning i stallet driva upp registertrycket. Matt innan det
+  // slas pa for OpenCL.
+  #define UNROLL_ROUNDS
 #else /* CUDA (NVRTC) */
   typedef unsigned long long u64;
   typedef unsigned int u32;
@@ -33,6 +37,12 @@
   #define GLOBAL_ID() ((u32)(blockIdx.x * blockDim.x + threadIdx.x))
   #define ATOMIC_INC_U32(p) atomicAdd(p, 1u)
   #define ROTL64(x, n) (((u64)(x) << (n)) | ((u64)(x) >> (64 - (n))))
+  // Full utrullning av de 24 varven. Tva effekter, bada uppmatta: de fem
+  // overhead-instruktionerna per varv (rundkonstant, raknare, jamforelse,
+  // hopp) forsvinner, och ptxas kommer ner fran 80 till 64 register, vilket
+  // hojer occupancy fran 25 till 32 warps per SM. Delvis utrullning (2, 4, 8)
+  // ar SAMRE an ingen alls - da behalls bade loopen och de 80 registren.
+  #define UNROLL_ROUNDS _Pragma("unroll")
 #endif
 
 // Trevags-XOR. Ampere/Ada har LOP3, som raknar ut en GODTYCKLIG funktion av
@@ -70,6 +80,7 @@ CONST_ARR u64 KECCAK_RC[24] = {
 // den kompakta tabellstyrda varianten gav 4 MH/s i stället för GH/s-klass.)
 DEVICE_FN void keccakf(u64 st[25]) {
   u64 bc0, bc1, bc2, bc3, bc4, t, tmp;
+  UNROLL_ROUNDS
   for (int round = 0; round < 24; round++) {
     // Theta. Kolumnsummorna som XOR3-par; appliceringen vager in bade
     // C[x-1] och ROTL(C[x+1],1) i samma instruktion, sa D[x] aldrig
