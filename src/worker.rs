@@ -12,20 +12,36 @@ use std::sync::Arc;
 const CHECK_INTERVAL: u32 = 4096;
 
 pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize) {
+    // Position in the search space, carried across jobs that cover the same
+    // space. See MinerJob::same_search_space.
+    let mut prev: Option<MinerJob> = None;
+    let mut en2 = thread_id as u64;
+    let mut nonce: u32 = 0;
     loop {
         let (generation, job) = shared.wait_for_job();
-        mine_job(&shared, &job, generation, thread_id, num_threads);
+        if prev.as_ref().is_none_or(|p| !p.same_search_space(&job)) {
+            en2 = thread_id as u64;
+            nonce = 0;
+        }
+        mine_job(&shared, &job, generation, num_threads, &mut en2, &mut nonce);
+        prev = Some(job);
     }
 }
 
-fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, num_threads: usize) {
+fn mine_job(
+    shared: &Shared,
+    job: &MinerJob,
+    generation: u64,
+    num_threads: usize,
+    en2_counter: &mut u64,
+    nonce_start: &mut u32,
+) {
     let block_target = compact_to_target(job.bits);
     // Each thread takes every Nth extranonce2 - disjoint search spaces with
-    // no coordination.
-    let mut en2_counter = thread_id as u64;
-
+    // no coordination. The starting point comes from the caller so it can
+    // survive a job that covers the same space.
     loop {
-        let extranonce2 = encode_extranonce2(en2_counter, job.extranonce2_size);
+        let extranonce2 = encode_extranonce2(*en2_counter, job.extranonce2_size);
 
         // Coinbase -> txid -> merkle root (once per extranonce2).
         let mut coinbase = Vec::with_capacity(
@@ -47,7 +63,7 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
             nonce: 0,
         };
 
-        let mut nonce: u32 = 0;
+        let mut nonce: u32 = *nonce_start;
         loop {
             let batch_start = std::time::Instant::now();
             // Count iterations rather than compare against an end value.
@@ -90,13 +106,18 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
             shared.stats.cpu_hashes.fetch_add(done as u64, Ordering::Relaxed);
             shared.throttle(batch_start.elapsed());
             if shared.generation.load(Ordering::Acquire) != generation {
-                return; // new job - drop the old one right away
+                // Remember where we stopped: if the next job covers the same
+                // space we continue here instead of re-hashing it.
+                *nonce_start = nonce;
+                return;
             }
             if nonce == 0 {
                 break;
             }
         }
-        en2_counter += num_threads as u64;
+        // Done with this extranonce2 - next one, from the top of its nonces.
+        *en2_counter += num_threads as u64;
+        *nonce_start = 0;
     }
 }
 

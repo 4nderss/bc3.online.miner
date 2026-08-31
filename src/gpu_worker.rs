@@ -48,26 +48,42 @@ pub fn run_gpu_worker(
     crate::human!("[gpu] started: {}", backend.name());
 
     let mut batch = START_BATCH;
+    // Position in the search space, carried across jobs that cover the same
+    // space. See MinerJob::same_search_space.
+    let mut prev: Option<MinerJob> = None;
+    let mut en2 = worker_index as u64;
+    let mut nonce: u32 = 0;
     loop {
         let (generation, job) = shared.wait_for_job();
-        mine_job(&shared, &job, generation, worker_index, total_workers, &mut backend, &mut batch);
+        if prev.as_ref().is_none_or(|p| !p.same_search_space(&job)) {
+            en2 = worker_index as u64;
+            nonce = 0;
+        }
+        mine_job(
+            &shared, &job, generation, total_workers, &mut backend, &mut batch, &mut en2,
+            &mut nonce,
+        );
+        prev = Some(job);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mine_job(
     shared: &Shared,
     job: &MinerJob,
     generation: u64,
-    worker_index: usize,
     total_workers: usize,
     backend: &mut Box<dyn MiningBackend>,
     batch: &mut u32,
+    en2_counter: &mut u64,
+    nonce_start: &mut u32,
 ) {
     let block_target = compact_to_target(job.bits);
-    let mut en2_counter = worker_index as u64;
-
+    // Starting point comes from the caller so it can survive a job that
+    // covers the same space.
     loop {
-        let extranonce2 = crate::worker::encode_extranonce2(en2_counter, job.extranonce2_size);
+        let extranonce2 =
+            crate::worker::encode_extranonce2(*en2_counter, job.extranonce2_size);
 
         // Coinbase -> txid -> merkle root (once per extranonce2).
         let mut coinbase = Vec::with_capacity(
@@ -91,7 +107,7 @@ fn mine_job(
         let header76: [u8; 76] = header.serialize()[..76].try_into().unwrap();
 
         // Grind the whole nonce space in batches.
-        let mut start: u32 = 0;
+        let mut start: u32 = *nonce_start;
         let mut errors = 0u32;
         loop {
             let remaining = (u32::MAX - start).saturating_add(1).max(1);
@@ -155,7 +171,10 @@ fn mine_job(
             }
 
             if shared.generation.load(Ordering::Acquire) != generation {
-                return; // new job - drop the old one right away
+                // Remember where we stopped: if the next job covers the same
+                // space we continue here instead of re-hashing it.
+                *nonce_start = start;
+                return;
             }
             let (next, wrapped) = start.overflowing_add(count);
             if wrapped {
@@ -163,6 +182,8 @@ fn mine_job(
             }
             start = next;
         }
-        en2_counter += total_workers as u64;
+        // Done with this extranonce2 - next one, from the top of its nonces.
+        *en2_counter += total_workers as u64;
+        *nonce_start = 0;
     }
 }

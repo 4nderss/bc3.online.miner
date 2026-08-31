@@ -23,6 +23,30 @@ pub struct MinerJob {
     pub share_target: Target,
 }
 
+impl MinerJob {
+    /// Do two jobs cover the same header space?
+    ///
+    /// The pool sends a fresh job whenever it retargets our difficulty, and
+    /// that job is built from the same template: identical in every field that
+    /// feeds the hash. Restarting the search there re-covers ground we already
+    /// hashed, and the pool rejects the shares we re-find as duplicates -
+    /// which is correct of it, and pure waste for us.
+    ///
+    /// job_id and share_target are deliberately excluded: neither goes into
+    /// the header, so neither changes what there is to search.
+    pub fn same_search_space(&self, other: &MinerJob) -> bool {
+        self.extranonce1 == other.extranonce1
+            && self.extranonce2_size == other.extranonce2_size
+            && self.coinb1 == other.coinb1
+            && self.coinb2 == other.coinb2
+            && self.merkle_steps == other.merkle_steps
+            && self.version == other.version
+            && self.prev_hash == other.prev_hash
+            && self.bits == other.bits
+            && self.ntime == other.ntime
+    }
+}
+
 /// A found share on its way to the pool.
 pub struct FoundShare {
     pub job_id: String,
@@ -168,6 +192,59 @@ impl Shared {
 
 #[cfg(test)]
 mod tests {
+    fn a_job() -> MinerJob {
+        MinerJob {
+            job_id: "a".into(),
+            extranonce1: vec![1, 2, 3, 4],
+            extranonce2_size: 4,
+            coinb1: vec![9; 20],
+            coinb2: vec![8; 20],
+            merkle_steps: vec![[7u8; 32]],
+            version: 0x2000_1000,
+            prev_hash: [6u8; 32],
+            bits: 0x1d00_ffff,
+            ntime: 1_700_000_000,
+            share_target: [0xFFu8; 32],
+        }
+    }
+
+    /// A retarget must not look like new ground to search.
+    ///
+    /// The pool issues a fresh job every time it changes our difficulty, built
+    /// from the same template. Treating that as a new space made the miner
+    /// re-hash what it had already covered, and the pool rejects the shares it
+    /// re-finds as duplicates - correctly, and at our expense.
+    #[test]
+    fn a_retarget_is_the_same_search_space() {
+        let base = a_job();
+
+        // Only the job name and the target changed: same space.
+        let mut retarget = a_job();
+        retarget.job_id = "b".into();
+        retarget.share_target = [0x0Fu8; 32];
+        assert!(base.same_search_space(&retarget));
+
+        // Anything that feeds the header makes it a different space.
+        for mutate in [
+            (|j: &mut MinerJob| j.ntime += 1) as fn(&mut MinerJob),
+            |j: &mut MinerJob| j.prev_hash[0] ^= 1,
+            |j: &mut MinerJob| j.version ^= 1,
+            |j: &mut MinerJob| j.bits ^= 1,
+            |j: &mut MinerJob| j.coinb1.push(0),
+            |j: &mut MinerJob| j.coinb2.push(0),
+            |j: &mut MinerJob| j.extranonce1[0] ^= 1,
+            |j: &mut MinerJob| j.merkle_steps.push([0u8; 32]),
+            |j: &mut MinerJob| j.extranonce2_size = 8,
+        ] {
+            let mut other = a_job();
+            mutate(&mut other);
+            assert!(
+                !base.same_search_space(&other),
+                "a change that feeds the header must count as a new space"
+            );
+        }
+    }
+
     use super::*;
     use std::time::{Duration, Instant};
 
