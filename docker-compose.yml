@@ -1,0 +1,27 @@
+# Example. Copy, set your address, and `docker compose up -d`.
+#
+#   docker compose up -d          start
+#   docker compose logs -f        watch it
+#   docker compose down           stop
+services:
+  bc3-miner:
+    image: ghcr.io/4nderss/bc3-miner:latest
+    restart: unless-stopped
+    environment:
+      BC3_WALLET: bc1qyouraddresshere
+      BC3_WORKER: rig1
+      # BC3_MODE: solo        # default is pplns
+      # BC3_INTENSITY: 80     # below 100 the machine stays usable
+    # NVIDIA. Remove this block to mine on CPU, or swap it for the devices
+    # block below on AMD/Intel.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # AMD or Intel via OpenCL:
+    # devices:
+    #   - /dev/kfd
+    #   - /dev/dri

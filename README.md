@@ -65,6 +65,50 @@ Backend selection is automatic: CUDA if an NVIDIA GPU is present, otherwise Open
 
 Solo rewards are paid directly to your address in the block you find.
 
+## Quick start — Docker
+
+```
+docker run -d --name bc3-miner --restart unless-stopped --gpus all \
+  -e BC3_WALLET=bc1qyouraddresshere \
+  -e BC3_WORKER=rig1 \
+  ghcr.io/4nderss/bc3-miner
+```
+
+That is the whole thing for PPLNS. Set `BC3_MODE=solo` for solo. One image
+covers NVIDIA, AMD/Intel and CPU: the miner opens the GPU runtimes with dlopen
+rather than linking them, so it uses whatever the host exposes and falls back
+to CPU when there is nothing.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `BC3_WALLET` | — | Your BC3 address. Required. |
+| `BC3_WORKER` | — | Rig name, appended to the address. |
+| `BC3_MODE` | `pplns` | `pplns` or `solo`. Picks the pool port. |
+| `BC3_POOL` | from mode | `host:port`, overrides `BC3_MODE`. |
+| `BC3_BACKEND` | `auto` | `auto`, `cuda`, `opencl` or `cpu`. |
+| `BC3_THREADS` | none in GPU mode | CPU threads. |
+| `BC3_INTENSITY` | `100` | 1–100. Below 100 the machine stays usable. |
+
+Casing does not matter: `BC3_WALLET` and `bc3_wallet` both work. Environment
+variables *are* case-sensitive on Linux and Docker passes them through
+verbatim, so the miner promotes any casing of its own `BC3_*` names to the
+canonical one before reading them.
+
+**GPU access is a host-side decision** — no image can request a GPU by itself:
+
+- **NVIDIA:** install the NVIDIA Container Toolkit and pass `--gpus all`. If
+  your daemon already defaults to the nvidia runtime, the image sets
+  `NVIDIA_VISIBLE_DEVICES` and works without the flag.
+- **AMD or Intel:** pass `--device /dev/kfd --device /dev/dri`. The image ships
+  the OpenCL loader; the driver comes from the host.
+- **CPU only:** pass nothing. It just works, slowly.
+
+Without GPU access the miner does not fail — it mines on CPU. Check
+`docker logs bc3-miner` to see which backend it picked.
+
+`docker-compose.yml` in this repository is a working example, including the
+GPU reservation block.
+
 ## Architecture
 
 - SHA3-256t = three sequential rounds of NIST SHA3-256 over the 80-byte block header. The header fits in a single SHA3-256 rate block, so each hash is exactly 3 keccak-f[1600] permutations.

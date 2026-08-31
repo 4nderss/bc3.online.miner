@@ -22,31 +22,45 @@ use std::sync::Arc;
 #[derive(Parser)]
 #[command(name = "bc3-miner", version, about = "BC3 (SHA3-256t) miner — bc3.online")]
 struct Args {
-    /// Pool address (host:port). PPLNS: bc3.online:3111, solo: bc3.online:3112.
-    #[arg(long, default_value = "bc3.online:3111")]
-    pool: String,
+    /// Payout mode. Picks the pool port: pplns 3111, solo 3112.
+    #[arg(long, value_enum, default_value_t = Mode::Pplns, env = "BC3_MODE")]
+    mode: Mode,
+
+    /// Pool address (host:port). Overrides --mode when given.
+    #[arg(long, env = "BC3_POOL")]
+    pool: Option<String>,
 
     /// Your BC3 address, optionally with a rig name: address.rigname.
     /// Required for mining, but not for `--probe`.
-    #[arg(long)]
+    #[arg(long, env = "BC3_USER")]
     user: Option<String>,
 
+    /// Your BC3 address, without a rig name. Use with --rig instead of --user
+    /// when the two come from separate places - a container environment, say.
+    #[arg(long, env = "BC3_WALLET")]
+    wallet: Option<String>,
+
+    /// Rig name, combined with --wallet. Ignored when --user is given.
+    #[arg(long, env = "BC3_WORKER")]
+    rig: Option<String>,
+
     /// Backend: auto = CUDA if possible, else OpenCL, else CPU.
-    #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
+    #[arg(long, value_enum, default_value_t = BackendKind::Auto, env = "BC3_BACKEND")]
     backend: BackendKind,
 
     /// Use only one specific GPU (index into the detected list).
-    #[arg(long)]
+    #[arg(long, env = "BC3_GPU_ID")]
     gpu_id: Option<usize>,
 
     /// Number of CPU threads (0 = all cores). With a GPU backend the default
     /// is to start no CPU threads - pass the flag to mine with both.
-    #[arg(long)]
+    #[arg(long, env = "BC3_THREADS")]
     threads: Option<usize>,
 
     /// Intensity 1-100 %. Below 100 the workers idle between passes, which
     /// lowers heat/power draw and keeps the machine usable while mining.
-    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=100))]
+    #[arg(long, default_value_t = 100, env = "BC3_INTENSITY",
+          value_parser = clap::value_parser!(u32).range(1..=100))]
     intensity: u32,
 
     /// Seconds between statistics lines.
@@ -62,7 +76,50 @@ struct Args {
     probe: bool,
 }
 
+/// Payout mode. Only the port differs, but nobody should have to remember
+/// which port is which.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum Mode {
+    Pplns,
+    Solo,
+}
+
+impl Mode {
+    fn default_pool(self) -> &'static str {
+        match self {
+            Mode::Pplns => "bc3.online:3111",
+            Mode::Solo => "bc3.online:3112",
+        }
+    }
+}
+
+/// Promote any casing of our environment variables to the canonical name.
+///
+/// Environment variables are case-sensitive on Linux, and Docker passes them
+/// through verbatim, so `-e bc3_wallet=...` silently does nothing while
+/// `BC3_WALLET` works. That failure looks like the miner ignoring you. Accept
+/// either, and let clap read the canonical name.
+///
+/// Only our own BC3_* names are touched, and only when the canonical one is
+/// unset, so nothing else in the environment can be shadowed.
+fn normalise_env() {
+    const VARS: [&str; 9] = [
+        "BC3_WALLET", "BC3_WORKER", "BC3_USER", "BC3_MODE", "BC3_POOL",
+        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID",
+    ];
+    let present: Vec<(String, String)> = std::env::vars().collect();
+    for want in VARS {
+        if std::env::var_os(want).is_some() {
+            continue;
+        }
+        if let Some((_, v)) = present.iter().find(|(k, _)| k.eq_ignore_ascii_case(want)) {
+            std::env::set_var(want, v);
+        }
+    }
+}
+
 fn main() {
+    normalise_env();
     let args = Args::parse();
     ipc::set_json_mode(args.json);
 
@@ -89,10 +146,21 @@ fn main() {
         return;
     }
 
-    let Some(user) = args.user else {
-        eprintln!("bc3-miner: --user <BC3-address[.rig]> is required for mining");
+    // --user wins; otherwise build it from --wallet and --rig, which is the
+    // shape a container environment hands us.
+    let user = args.user.or_else(|| {
+        args.wallet.as_ref().map(|w| match args.rig.as_deref() {
+            Some(r) if !r.is_empty() => format!("{w}.{r}"),
+            _ => w.clone(),
+        })
+    });
+    let Some(user) = user else {
+        eprintln!(
+            "bc3-miner: --user <BC3-address[.rig]> is required for mining              (or --wallet, optionally with --rig)"
+        );
         std::process::exit(2);
     };
+    let pool = args.pool.clone().unwrap_or_else(|| args.mode.default_pool().to_string());
 
     let gpus = if matches!(args.backend, BackendKind::Cpu) {
         vec![]
@@ -176,7 +244,7 @@ fn main() {
         shared,
         submit_rx,
         stratum::StratumConfig {
-            pool: args.pool,
+            pool,
             user,
         },
     );
