@@ -275,3 +275,32 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
   .block-card { animation: pop .4s cubic-bezier(.2, .9, .3, 1.2); }
   @keyframes pop { from { opacity: 0; transform: scale(.9); } to { opacity: 1; } }
 }
+
+/* Uppdateringsavisering. Accentfargad men inte larmande: det ar information,
+   inte ett fel. Ligger over innehallet i stallet for att knuffa layouten. */
+.update-banner {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0 16px 12px; padding: 10px 12px;
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  border-radius: var(--radius);
+  color: var(--text); font-size: 13px;
+}
+.update-banner[hidden] { display: none; }
+.update-banner svg { color: var(--accent); flex: 0 0 auto; }
+.update-banner b { color: var(--accent); }
+.update-banner > span { flex: 1 1 auto; min-width: 0; }
+#update-current { color: var(--faint); }
+.update-open {
+  flex: 0 0 auto; cursor: pointer;
+  background: var(--accent); color: var(--accent-ink);
+  border: 0; border-radius: 6px; padding: 6px 12px;
+  font: inherit; font-weight: 600;
+}
+.update-open:hover { filter: brightness(1.08); }
+.update-close {
+  flex: 0 0 auto; cursor: pointer;
+  background: none; border: 0; color: var(--faint);
+  font-size: 20px; line-height: 1; padding: 0 4px;
+}
+.update-close:hover { color: var(--text); }

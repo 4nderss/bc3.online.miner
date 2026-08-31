@@ -1,11 +1,13 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "GUI:t behöver bara starta sidecar-binären och lyssna på dess utdata.",
+  "description": "GUI:t startar sidecar-binären och lyssnar på dess utdata. Därutöver bara två saker för uppdateringsaviseringen: läsa appens egen version, och öppna releasesidan i systemets webbläsare.",
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:app:allow-version",
     "shell:allow-execute",
+    "shell:allow-open",
     {
       "identifier": "shell:allow-spawn",
       "allow": [{ "name": "binaries/bc3-miner", "sidecar": true, "args": true }]

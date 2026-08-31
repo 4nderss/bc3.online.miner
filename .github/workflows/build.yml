@@ -1,0 +1,60 @@
+# Builds the Windows binaries and uploads them as a zip artifact.
+#
+# No CUDA toolkit is installed on purpose: build.rs falls back to the PTX
+# checked into src/kernels/, and cudarc loads the driver dynamically, so one
+# binary runs with CUDA, with OpenCL, or on CPU alone. Installing the toolkit
+# would only slow the build down and risk shipping a kernel nobody reviewed.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            gui/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build miner (CLI)
+        run: cargo build --release
+
+      # The GUI embeds the CLI as a Tauri sidecar, so it has to be in place
+      # before the GUI is built - not copied into the zip afterwards.
+      - name: Stage sidecar
+        run: copy target\release\bc3-miner.exe gui\src-tauri\binaries\bc3-miner-x86_64-pc-windows-msvc.exe
+
+      - name: Build GUI
+        run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml
+
+      - name: Assemble package
+        shell: pwsh
+        run: |
+          $out = "bc3-miner-windows-x64"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Copy-Item target\release\bc3-miner.exe $out\
+          Copy-Item gui\src-tauri\target\release\bc3-miner-gui.exe "$out\bc3.online miner.exe"
+          Copy-Item README.md, LICENSE $out\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$out\*" -DestinationPath "$out.zip"
+          Get-ChildItem $out, "$out.zip" | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bc3-miner-windows-x64
+          path: bc3-miner-windows-x64.zip
+          retention-days: 14

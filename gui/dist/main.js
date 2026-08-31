@@ -397,9 +397,93 @@ async function probeHardware() {
   }
 }
 
+
+// ---------- Update check ----------
+// We only ASK GitHub whether a newer release exists and show a link. The miner
+// never updates itself: it holds the user's payout address, so a binary that
+// downloads and executes code would let anyone who compromised the release key
+// silently redirect everyone's rewards. Antivirus heuristics flag that shape of
+// behaviour too, which would cost us false positives on top of the risk.
+const RELEASES_API =
+  "https://api.github.com/repos/4nderss/bc3.online.miner/releases/latest";
+const RELEASES_PAGE = "https://github.com/4nderss/bc3.online.miner/releases/latest";
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const UPDATE_DISMISSED_KEY = "bc3-miner-update-dismissed";
+
+// "v1.10.2" -> [1, 10, 2]. Any pre-release suffix is dropped, so 1.2.0-rc1 and
+// 1.2.0 compare equal and we never nag someone running a release candidate.
+function parseVersion(v) {
+  const m = String(v || "").trim().replace(/^v/i, "").match(/^(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
+  return m ? [+m[1], +(m[2] || 0), +(m[3] || 0)] : null;
+}
+
+function isNewer(candidate, current) {
+  const a = parseVersion(candidate), b = parseVersion(current);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] > b[i];
+  }
+  return false;
+}
+
+function showUpdateBanner(latest, current) {
+  el("update-version").textContent = latest;
+  el("update-current").textContent = current;
+  el("update-banner").hidden = false;
+}
+
+async function checkForUpdate() {
+  try {
+    const current = await tauri.app.getVersion();
+    const res = await fetch(RELEASES_API, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!res.ok) return;                     // rate limit, outage - stay quiet
+    const rel = await res.json();
+    const latest = String(rel.tag_name || "").replace(/^v/i, "");
+    if (!isNewer(latest, current)) return;
+
+    // Dismissing hides THIS version only; a later release speaks up again.
+    let dismissed = null;
+    try {
+      dismissed = localStorage.getItem(UPDATE_DISMISSED_KEY);
+    } catch (e) { /* private mode - just show it */ }
+    if (dismissed === latest) return;
+
+    showUpdateBanner(latest, current);
+  } catch (e) {
+    // Offline rigs are normal. An update check must never be able to disrupt
+    // mining, so every failure here is silent by design.
+  }
+}
+
+function initUpdateCheck() {
+  el("update-close").addEventListener("click", () => {
+    try {
+      localStorage.setItem(UPDATE_DISMISSED_KEY, el("update-version").textContent);
+    } catch (e) { /* nothing to remember it with - fine */ }
+    el("update-banner").hidden = true;
+  });
+
+  // Open in the system browser, never in the webview: navigating the webview
+  // away would take the running miner's UI with it.
+  el("update-open").addEventListener("click", async () => {
+    try {
+      if (tauri.shell && tauri.shell.open) await tauri.shell.open(RELEASES_PAGE);
+      else if (tauri.opener && tauri.opener.openUrl) await tauri.opener.openUrl(RELEASES_PAGE);
+    } catch (e) {
+      log("could not open the release page: " + e, "l-bad");
+    }
+  });
+
+  checkForUpdate();
+  setInterval(checkForUpdate, UPDATE_INTERVAL_MS);
+}
+
 // ---------- Init ----------
 loadSettings();
 setStatus(null, "Idle");
 updateStartEnabled();
 probeHardware();
 invoke("is_mining").then((on) => on && setRunning(true)).catch(() => {});
+initUpdateCheck();

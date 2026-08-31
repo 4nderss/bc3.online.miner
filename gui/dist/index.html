@@ -24,6 +24,17 @@
   </div>
 </header>
 
+<!-- Uppdateringsavisering. Doljs tills GitHub svarat att en nyare release
+     finns; misslyckas kollen rors den aldrig. -->
+<div class="update-banner" id="update-banner" hidden>
+  <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+    <path d="M8 1.5 14 12H2z" fill="currentColor"/>
+  </svg>
+  <span>Version <b id="update-version"></b> is available &mdash; you are on <span id="update-current"></span></span>
+  <button type="button" class="update-open" id="update-open">Open release page</button>
+  <button type="button" class="update-close" id="update-close" aria-label="Dismiss">&times;</button>
+</div>
+
 <main>
   <!-- Inställningar -->
   <section class="card" id="setup">
