@@ -1,4 +1,4 @@
-# Builds the Windows binaries and uploads them as a zip artifact.
+# Builds the Windows binaries on every push and uploads them as an artifact.
 #
 # No CUDA toolkit is installed on purpose: build.rs falls back to the PTX
 # checked into src/kernels/, and cudarc loads the driver dynamically, so one
@@ -23,13 +23,19 @@ jobs:
       - name: Cache cargo
         uses: actions/cache@v4
         with:
-          path: bc3-miner-windows-x64/
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            gui/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build miner (CLI)
         run: cargo build --release
 
       # The GUI embeds the CLI as a Tauri sidecar, so it has to be in place
-      # before the GUI is built - not copied into the zip afterwards.
+      # before the GUI is built, not copied into the package afterwards.
       - name: Stage sidecar
         shell: pwsh
         run: |
@@ -40,6 +46,8 @@ jobs:
       - name: Build GUI
         run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml
 
+      # Loose files, not a zip: Actions wraps every artifact in a zip on
+      # download, so uploading a zip would hand the user a zip inside a zip.
       - name: Assemble package
         shell: pwsh
         run: |
@@ -47,7 +55,7 @@ jobs:
           New-Item -ItemType Directory -Path $out | Out-Null
           Copy-Item target/release/bc3-miner.exe $out/
           Copy-Item gui/src-tauri/target/release/bc3-miner-gui.exe $out/
-          Copy-Item README.md, LICENSE $out/ -ErrorAction SilentlyContinue
+          Copy-Item README.md, LICENSE $out/
           Get-ChildItem $out | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
