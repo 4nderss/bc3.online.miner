@@ -19,7 +19,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Build miner (CLI)
         run: cargo build --release
@@ -41,7 +41,7 @@ jobs:
           Copy-Item gui/src-tauri/target/release/bc3-miner-gui.exe $out/
           Copy-Item README.md, LICENSE $out/
           Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: "*.zip"
@@ -49,7 +49,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --no-self-update
       # CLI only. The GUI needs webkit2gtk and has never shipped for Linux;
       # earlier releases were CLI-only here too.
@@ -63,7 +63,7 @@ jobs:
           mkdir "$out"
           cp target/release/bc3-miner README.md LICENSE "$out/"
           tar czf "$out.tar.gz" "$out"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: "*.tar.gz"
@@ -74,7 +74,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
       # One SHA256SUMS covering every artifact, in the format sha256sum -c reads.
