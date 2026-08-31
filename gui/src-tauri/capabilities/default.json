@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "GUI:t startar sidecar-binären och lyssnar på dess utdata. Därutöver bara två saker för uppdateringsaviseringen: läsa appens egen version, och öppna releasesidan i systemets webbläsare.",
+  "description": "The GUI starts the sidecar binary and listens to its output. Beyond that only two things for the update notification: read the app's own version, and open the release page in the system browser.",
   "windows": ["main"],
   "permissions": [
     "core:default",

@@ -1,12 +1,12 @@
-/* bc3.online miner — samma formspråk som webben (Ember på varm grafit).
-   GUI:t är mörkt-först: miners lever i mörka rum. */
+/* bc3.online miner - same design language as the web (Ember on warm graphite).
+   The GUI is dark-first: miners live in dark rooms. */
 
 :root {
   --bg: #14110F;
   --surface: #201B18;
   --surface2: #2C2521;
-  /* Ljusare kantlinje och sekundärtext än webben: GUI:t läses på nära håll
-     och ofta i ljusa rum, så kontrasterna behöver ligga högre. */
+  /* Lighter border and secondary text than the web: the GUI is read close up
+     and often in bright rooms, so the contrasts need to be higher. */
   --line: #4A403A;
   --text: #F5F1EB;
   --muted: #C4B8AC;
@@ -31,8 +31,8 @@ body {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   user-select: none;
-  /* Fönstret ska aldrig scrolla i sin helhet — bara loggen gör det.
-     Vid små fönster får main scrolla hellre än att krossa loggen. */
+  /* The window must never scroll as a whole - only the log does that.
+     On small windows main may scroll rather than crush the log. */
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -49,8 +49,8 @@ input { user-select: text; }
 .brand { display: flex; align-items: center; gap: 10px; color: var(--text); }
 .wordmark { font-family: 'Chakra Petch', sans-serif; font-weight: 700; font-size: 19px; }
 .wordmark span { font-weight: 500; opacity: .45; }
-/* Blocket vi malar på — accentfärgat medan ett jobb är aktivt, så man ser
-   direkt att klienten är i synk med poolen. */
+/* The block we are grinding on - accent-colored while a job is active, so you
+   see at once that the client is in sync with the pool. */
 #job-height-card.live { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
 #job-height-card.live #job-height { color: var(--accent); }
 .status {
@@ -73,9 +73,9 @@ input { user-select: text; }
 main {
   padding: 14px 18px; display: flex; flex-direction: column; gap: 12px;
   flex: 1 1 auto; min-height: 0; min-width: 0;
-  overflow-y: auto; /* sista utvägen om fönstret görs riktigt litet */
-  /* OBS: sätts bara overflow-y till auto blir overflow-x automatiskt auto
-     (CSS-regel), vilket gav en horisontell scrollbar av minsta överskjutning. */
+  overflow-y: auto; /* last resort if the window is made really small */
+  /* NOTE: setting only overflow-y to auto makes overflow-x auto as well
+     (a CSS rule), which gave a horizontal scrollbar on the least overflow. */
   overflow-x: hidden;
 }
 main::-webkit-scrollbar { width: 10px; }
@@ -90,7 +90,7 @@ main::-webkit-scrollbar-thumb {
   display: flex; flex-direction: column; gap: 10px;
 }
 
-/* Formulär */
+/* Form */
 .field { display: flex; flex-direction: column; gap: 6px; }
 .label {
   font-family: 'Chakra Petch', sans-serif; font-size: 11.5px; font-weight: 600;
@@ -113,7 +113,7 @@ input.invalid { border-color: var(--bad); }
 .row { display: flex; gap: 14px; flex-wrap: wrap; }
 .row .field { flex: 1 1 220px; }
 
-/* Intensitetsreglage */
+/* Intensity slider */
 .slider-row { display: flex; align-items: center; gap: 12px; }
 .slider-value {
   font-family: 'Spline Sans Mono', monospace; font-size: 14px;
@@ -123,7 +123,7 @@ input.invalid { border-color: var(--bad); }
 input[type="range"] {
   flex: 1; appearance: none; -webkit-appearance: none;
   background: transparent; padding: 0; border: none; height: 20px;
-  outline: none; /* egen fokusstil på tummen nedan */
+  outline: none; /* custom focus style on the thumb below */
 }
 input[type="range"]::-webkit-slider-runnable-track {
   height: 5px; border-radius: 3px; background: var(--surface2);
@@ -139,13 +139,13 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 }
 input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); cursor: default; }
 
-/* Lägesval (hårdvara + payout) */
+/* Mode selection (hardware + payout) */
 .modes { display: flex; gap: 10px; }
 .mode {
   flex: 1 1 0; min-width: 0; text-align: left; cursor: pointer;
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
   padding: 10px 12px; color: var(--muted);
-  /* Tydligare skillnad mellan vald/ovald än en enbart färgad ram. */
+  /* Clearer difference between selected/unselected than a colored frame alone. */
   display: flex; flex-direction: column; gap: 2px;
   font-family: 'Figtree', system-ui, sans-serif;
 }
@@ -167,7 +167,7 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
 .mode.active strong { color: var(--accent); }
 .mode:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* Knappar */
+/* Buttons */
 .btn {
   font-family: 'Chakra Petch', sans-serif; font-weight: 600; font-size: 15px;
   letter-spacing: .04em; border: none; border-radius: 8px; cursor: pointer;
@@ -190,9 +190,9 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
   .mode { transition: border-color .15s ease, background-color .15s ease; }
 }
 
-/* Statistik */
-/* Åtta paneler i ett jämnt 4+4-rutnät — auto-fit gav 5+3 på breda fönster
-   och lämnade ett tomt hål på andra raden. */
+/* Statistics */
+/* Eight panels in an even 4+4 grid - auto-fit gave 5+3 on wide windows
+   and left an empty hole on the second row. */
 .stats-grid {
   display: grid; gap: 10px; flex: 0 0 auto;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -225,8 +225,8 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
   @keyframes bump { from { opacity: .4; transform: translateY(3px); } to { opacity: 1; } }
 }
 
-/* Logg — enda ytan som scrollar; krymper med fönstret men aldrig till
-   en enda rad: minst ~6 rader ska alltid synas. */
+/* Log - the only surface that scrolls; shrinks with the window but never
+   down to a single line: at least ~6 lines must always be visible. */
 .log-card { flex: 1 1 auto; min-height: 260px; }
 .log-head { display: flex; align-items: center; justify-content: space-between; }
 .log {
@@ -238,7 +238,7 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
   display: flex; flex-direction: column; gap: 3px; user-select: text;
   line-height: 1.6;
 }
-/* Egen scrollbar — Windows standardscrollbar syns knappt mot mörk botten. */
+/* Custom scrollbar - the Windows default one is barely visible on a dark base. */
 .log::-webkit-scrollbar { width: 10px; }
 .log::-webkit-scrollbar-track { background: transparent; }
 .log::-webkit-scrollbar-thumb {
@@ -251,7 +251,7 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
 .log .l-bad { color: var(--bad); }
 .log .l-accent { color: var(--accent); }
 
-/* Blockfynd */
+/* Block found */
 .block-overlay {
   position: fixed; inset: 0; background: rgba(20, 17, 15, .88);
   display: flex; align-items: center; justify-content: center; z-index: 10;
@@ -276,8 +276,8 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
   @keyframes pop { from { opacity: 0; transform: scale(.9); } to { opacity: 1; } }
 }
 
-/* Uppdateringsavisering. Accentfargad men inte larmande: det ar information,
-   inte ett fel. Ligger over innehallet i stallet for att knuffa layouten. */
+/* Update notification. Accent-colored but not alarming: it is information,
+   not an error. Sits above the content instead of shoving the layout around. */
 .update-banner {
   display: flex; align-items: center; gap: 10px;
   margin: 0 16px 12px; padding: 10px 12px;

@@ -1,9 +1,9 @@
-/* bc3.online miner GUI — styr mining-processen och visar dess JSON-ström.
-   All formatering följer användarens locale (Intl utan hårdkodad locale). */
+/* bc3.online miner GUI - drives the mining process and shows its JSON stream.
+   All formatting follows the user's locale (Intl with no hardcoded locale). */
 
-// Tauri-API:t når vi via window.__TAURI__ (kräver withGlobalTauri i
-// tauri.conf.json). Saknas det vill vi se det i UI:t — inte tyst dö och
-// lämna alla knappar döda.
+// We reach the Tauri API through window.__TAURI__ (which requires
+// withGlobalTauri in tauri.conf.json). If it is missing we want to see that in
+// the UI - not die silently and leave every button dead.
 const tauri = window.__TAURI__;
 if (!tauri) {
   document.addEventListener("DOMContentLoaded", () => {
@@ -18,7 +18,7 @@ if (!tauri) {
 const { invoke } = tauri.core;
 const { listen } = tauri.event;
 
-// Visa oväntade JS-fel i aktivitetsloggen i stället för att dö tyst.
+// Show unexpected JS errors in the activity log instead of dying silently.
 window.addEventListener("error", (e) => {
   const box = document.getElementById("log");
   if (box) {
@@ -36,10 +36,10 @@ const timeFmt = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2
 
 let mining = false;
 let mode = "pplns";   // payout: pplns | solo
-let hw = "gpu";       // hårdvara: gpu | cpu | dual
+let hw = "gpu";       // hardware: gpu | cpu | dual
 const spark = [];
 
-// ---------- Formattering ----------
+// ---------- Formatting ----------
 function fmtHashrate(h) {
   if (!isFinite(h) || h <= 0) return "0 H/s";
   const units = [["TH/s", 1e12], ["GH/s", 1e9], ["MH/s", 1e6], ["kH/s", 1e3]];
@@ -70,7 +70,7 @@ function setStat(id, value) {
   e.classList.add("bump");
 }
 
-// ---------- Logg ----------
+// ---------- Log ----------
 function log(text, cls) {
   const line = document.createElement("div");
   const t = document.createElement("span");
@@ -122,8 +122,8 @@ function drawSpark() {
 }
 window.addEventListener("resize", drawSpark);
 
-// ---------- Temperatur ----------
-// Färgen följer värmen: normalt → varmt (>75) → hett (>85).
+// ---------- Temperature ----------
+// The color follows the heat: normal -> warm (>75) -> hot (>85).
 function tempClass(c) {
   if (c == null) return "";
   if (c >= 85) return "bad";
@@ -152,7 +152,7 @@ function setStatus(state, text) {
   el("status-text").textContent = text;
 }
 
-// ---------- Inställningar (sparas mellan körningar) ----------
+// ---------- Settings (persisted between runs) ----------
 const SETTINGS_KEY = "bc3-miner-settings";
 function loadSettings() {
   try {
@@ -183,26 +183,26 @@ function updateIntensityLabel() {
 el("intensity").addEventListener("input", updateIntensityLabel);
 el("intensity").addEventListener("change", saveSettings);
 
-/// Grovkoll så Start inte kan tryckas i onödan — poolen gör den slutgiltiga
-/// valideringen vid authorize.
+/// Rough check so Start cannot be pressed pointlessly - the pool does the
+/// final validation at authorize.
 ///
-/// BC3 använder Bitcoins alla adressformat. Den här funktionen krävde
-/// tidigare prefixet "bc1" och stängde därmed av Start helt för alla med en
-/// legacy-adress (1… eller 3…), trots att poolen accepterar dem. Att vara
-/// för strikt här är just vad som bröt det — hellre släppa igenom något
-/// tveksamt och låta poolen säga ifrån.
+/// BC3 uses all of Bitcoin's address formats. This function used to require
+/// the "bc1" prefix and thereby disabled Start entirely for everyone with a
+/// legacy address (1... or 3...), even though the pool accepts them. Being
+/// too strict here is exactly what broke it - better to let something
+/// doubtful through and let the pool be the one to object.
 function addressLooksValid(addr) {
   const a = (addr || "").trim();
   if (!a) return false;
-  // bech32/bech32m (segwit v0 och taproot). BIP173 tillåter en helt versal
-  // adress, så prefixet måste matchas skiftlägesokänsligt.
+  // bech32/bech32m (segwit v0 and taproot). BIP173 allows an all-uppercase
+  // address, so the prefix has to be matched case-insensitively.
   if (/^bc1[a-z0-9]{20,87}$/i.test(a)) return true;
-  // Legacy base58check: P2PKH (1…) och P2SH (3…). Base58 saknar 0, O, I och l.
+  // Legacy base58check: P2PKH (1...) and P2SH (3...). Base58 has no 0, O, I or l.
   if (/^[13][1-9A-HJ-NP-Za-km-z]{25,39}$/.test(a)) return true;
   return false;
 }
 
-/// Start är avstängd tills adressen ser rimlig ut (och alltid aktiv för Stop).
+/// Start is disabled until the address looks sane (and always enabled for Stop).
 function updateStartEnabled() {
   const ok = addressLooksValid(el("address").value);
   el("toggle").disabled = !mining && !ok;
@@ -219,7 +219,7 @@ function updateStartEnabled() {
 el("address").addEventListener("input", updateStartEnabled);
 el("address").addEventListener("change", saveSettings);
 
-/// Markera en knapp i en radiogrupp (attribut `key` = "mode" eller "hw").
+/// Mark a button in a radio group as selected (attribute `key` = "mode" or "hw").
 function selectIn(key, value) {
   document.querySelectorAll(`.mode[data-${key}]`).forEach((b) => {
     const on = b.dataset[key] === value;
@@ -232,21 +232,21 @@ function selectMode(m) {
   selectIn("mode", m);
 }
 function selectHw(h) {
-  // "dual" fanns i en tidigare version — sparade inställningar kan ha kvar
-  // det, och mätning visade att det gav lägre hashrate än enbart GPU.
+  // "dual" existed in an earlier version - saved settings may still carry
+  // it, and measurements showed it gave a lower hashrate than GPU alone.
   hw = h === "gpu" || h === "cpu" ? h : "gpu";
   selectIn("hw", hw);
 }
 document.querySelectorAll(".mode").forEach((b) => {
   b.addEventListener("click", () => {
-    if (mining) return; // valen byts inte mitt i en körning
+    if (mining) return; // the choices are not switched mid-run
     if (b.dataset.mode) selectMode(b.dataset.mode);
     else if (b.dataset.hw) selectHw(b.dataset.hw);
     saveSettings();
   });
 });
 
-// ---------- Start/stopp ----------
+// ---------- Start/stop ----------
 function setRunning(on) {
   mining = on;
   const btn = el("toggle");
@@ -292,7 +292,7 @@ el("block-close").addEventListener("click", () =>
   el("block-overlay").classList.add("hidden")
 );
 
-// ---------- Händelser från minern ----------
+// ---------- Events from the miner ----------
 listen("miner-event", ({ payload: ev }) => {
   switch (ev.type) {
     case "startup":
@@ -310,7 +310,7 @@ listen("miner-event", ({ payload: ev }) => {
       break;
     case "stats":
       setStat("hashrate", fmtHashrate(ev.hashrate));
-      // Visa uppdelningen bara när båda backends faktiskt bidrar.
+      // Show the split only when both backends actually contribute.
       if (ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0) {
         el("hashrate-sub").textContent =
           `GPU ${fmtHashrate(ev.hashrate_gpu)} · CPU ${fmtHashrate(ev.hashrate_cpu)}`;
@@ -320,14 +320,14 @@ listen("miner-event", ({ payload: ev }) => {
       setStat("eta", ev.eta_secs ? fmtDuration(ev.eta_secs) : "—");
       setStat("best-share", ev.best_share > 0 ? fmtDiff(ev.best_share) : "—");
       setStat("blocks", numInt.format(ev.blocks || 0));
-      // Hur nära ett block bästa sharen var (nätverkssvårigheten = 100 %).
+      // How close to a block the best share was (network difficulty = 100%).
       if (ev.best_share > 0 && ev.network_difficulty > 0) {
         const pct = (ev.best_share / ev.network_difficulty) * 100;
         el("best-share-sub").textContent =
           (pct >= 1 ? num2.format(pct) : pct.toPrecision(2)) + "% of a block";
       }
       el("netdiff").textContent = "network difficulty " + fmtDiff(ev.network_difficulty);
-      // Höjden poolen jobbar på — kvitto på att vi är i synk.
+      // The height the pool is working on - proof that we are in sync.
       if (ev.job_height > 0) {
         setStat("job-height", "#" + numInt.format(ev.job_height));
         el("job-height-sub").textContent = "in sync with the pool";
@@ -370,15 +370,15 @@ listen("miner-stopped", ({ payload: code }) => {
       code ? "l-bad" : null);
 });
 
-// ---------- Hårdvarudetektering ----------
-// Fråga minern vad som finns, så knapparna visar kortnamn/kärnor direkt.
+// ---------- Hardware detection ----------
+// Ask the miner what exists, so the buttons show card name/cores right away.
 async function probeHardware() {
   try {
     const p = await invoke("probe_hardware");
     const gpuBtn = document.querySelector('.mode[data-hw="gpu"]');
     const dualBtn = document.querySelector('.mode[data-hw="dual"]');
     if (p.gpus && p.gpus.length) {
-      // "CUDA #0: NVIDIA GeForce RTX 3050 Ti Laptop GPU" → kortnamnet.
+      // "CUDA #0: NVIDIA GeForce RTX 3050 Ti Laptop GPU" -> the card name.
       const short = p.gpus[0].replace(/^[A-Z]+ #\d+:\s*/, "");
       el("hw-gpu-sub").textContent = short;
       gpuBtn.title = p.gpus.join("\n");
