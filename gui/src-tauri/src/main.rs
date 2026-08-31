@@ -1,9 +1,9 @@
-//! bc3.online miner — GUI-skalet.
+//! bc3.online miner - the GUI shell.
 //!
-//! GUI:t kör INTE mining-koden själv: det startar CLI-binären (`bc3-miner`)
-//! som barnprocess med `--json` och strömmar dess JSON-rader vidare till
-//! frontend som Tauri-events. Fördelen är isolering — en GPU-krasch fäller
-//! aldrig fönstret — och att mining-kärnan förblir testbar för sig.
+//! The GUI does NOT run the mining code itself: it starts the CLI binary
+//! (`bc3-miner`) as a child process with `--json` and streams its JSON lines
+//! on to the frontend as Tauri events. The benefit is isolation - a GPU crash
+//! never fells the window - and the mining core stays testable on its own.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -13,32 +13,32 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
-/// Inställningar från GUI:t när användaren trycker Start.
+/// Settings from the GUI when the user presses Start.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartOptions {
-    /// BC3-adress (bc1...).
+    /// BC3 address (bc1...).
     address: String,
-    /// Riggnamn; tomt ⇒ "gui".
+    /// Rig name; empty => "gui".
     rig: String,
-    /// "pplns" eller "solo".
+    /// "pplns" or "solo".
     mode: String,
-    /// Valfri pool-override (host:port); tomt ⇒ bc3.online med lägets port.
+    /// Optional pool override (host:port); empty => bc3.online with the mode's port.
     pool: String,
-    /// "gpu", "cpu" eller "dual".
+    /// "gpu", "cpu" or "dual".
     hardware: String,
-    /// Intensitet 1–100 %.
+    /// Intensity 1-100 %.
     intensity: Option<u32>,
 }
 
-/// Översätt hårdvaruvalet till CLI-flaggor.
+/// Translate the hardware choice into CLI flags.
 ///
-/// - gpu: `--backend auto` (CLI:n startar inga CPU-trådar när en GPU finns)
-/// - cpu: `--backend cpu` + alla kärnor
+/// - gpu: `--backend auto` (the CLI starts no CPU threads when a GPU exists)
+/// - cpu: `--backend cpu` + all cores
 ///
-/// Obs: kombinerad GPU+CPU-mining ("dual") finns medvetet inte i GUI:t —
-/// mätning visade lägre total hashrate än enbart GPU, eftersom CPU-trådarna
-/// konkurrerar ut GPU:ns matartråd och delar effekt/värmebudget med kortet.
-/// Den som ändå vill prova når det via CLI:n med `--threads N`.
+/// Note: combined GPU+CPU mining ("dual") is deliberately absent from the GUI -
+/// measurement showed a lower total hashrate than GPU alone, since CPU threads
+/// crowd out the GPU's feeder thread and share the power/heat budget with the
+/// card. Anyone who still wants to try reaches it via the CLI's `--threads N`.
 fn hardware_args(hardware: &str) -> Vec<String> {
     match hardware {
         "cpu" => vec!["--backend".into(), "cpu".into(), "--threads".into(), "0".into()],
@@ -46,7 +46,7 @@ fn hardware_args(hardware: &str) -> Vec<String> {
     }
 }
 
-/// Den körande minerprocessen (None när stoppad).
+/// The running miner process (None when stopped).
 #[derive(Default)]
 pub struct MinerState(Mutex<Option<CommandChild>>);
 
@@ -65,20 +65,37 @@ fn endpoint(opts: &StartOptions) -> String {
     }
 }
 
-/// Enkel klientvalidering — poolen är den slutgiltiga auktoriteten.
+/// Simple client-side validation - the pool is the final authority.
+///
+/// Both address families are accepted, because the pool pays either: bech32 and
+/// bech32m (bc1..., segwit v0 and taproot) and legacy base58check (1... P2PKH,
+/// 3... P2SH).
+///
+/// Requiring the bc1 prefix here was the bug behind the report that the miner
+/// "doesn't let address other than bc1 to mine". v1.1.1 fixed the JavaScript
+/// check and missed this one, so a legacy address passed the form, lit up the
+/// Start button, and only then failed - which reads as a broken miner rather
+/// than a rejected address.
 fn validate_address(addr: &str) -> Result<(), String> {
+    let incomplete = || Err("That doesn't look like a complete BC3 address".into());
     let a = addr.trim();
     if a.is_empty() {
         return Err("Enter your BC3 address".into());
     }
+    // BIP173 permits an all-uppercase bech32 address, so match the prefix
+    // case-insensitively. Length only: the pool decides the rest.
     let lower = a.to_lowercase();
-    if !lower.starts_with("bc1") {
-        return Err("A BC3 address starts with bc1…".into());
+    if lower.starts_with("bc1") {
+        return if (23..=90).contains(&lower.len()) { Ok(()) } else { incomplete() };
     }
-    if lower.len() < 26 || lower.len() > 90 {
-        return Err("That doesn't look like a complete BC3 address".into());
+    // Base58 IS case-sensitive, so this one checks the original string. The
+    // alphabet omits 0, O, I and l precisely because they are easy to confuse.
+    if a.starts_with('1') || a.starts_with('3') {
+        const B58: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        let ok = (26..=40).contains(&a.len()) && a.chars().all(|c| B58.contains(c));
+        return if ok { Ok(()) } else { incomplete() };
     }
-    Ok(())
+    Err("A BC3 address starts with bc1, 1 or 3".into())
 }
 
 #[tauri::command]
@@ -122,7 +139,7 @@ fn start_mining(
 
     *state.0.lock().map_err(|_| "state poisoned")? = Some(child);
 
-    // Strömma barnets utdata vidare till frontend.
+    // Stream the child's output on to the frontend.
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -132,8 +149,8 @@ fn start_mining(
                     if line.is_empty() {
                         continue;
                     }
-                    // JSON-rader vidarebefordras som "miner-event"; allt annat
-                    // (t.ex. panics) hamnar i loggpanelen.
+                    // JSON lines are forwarded as "miner-event"; everything
+                    // else (e.g. panics) ends up in the log panel.
                     match serde_json::from_str::<serde_json::Value>(&line) {
                         Ok(v) => {
                             let _ = handle.emit("miner-event", v);
@@ -180,8 +197,8 @@ fn is_mining(state: State<'_, MinerState>) -> bool {
     state.0.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
-/// Fråga CLI:n vilka GPU:er som finns (kort körning med `--probe`), så att
-/// hårdvaruknapparna kan visa kortets namn innan man startar.
+/// Ask the CLI which GPUs exist (a short run with `--probe`), so that the
+/// hardware buttons can show the card's name before you start.
 #[tauri::command]
 async fn probe_hardware(app: AppHandle) -> Result<serde_json::Value, String> {
     let output = app
@@ -240,7 +257,7 @@ mod tests {
             hardware_args("cpu"),
             vec!["--backend", "cpu", "--threads", "0"]
         );
-        // Okänt värde (inkl. gammalt sparat "dual") ⇒ GPU-beteendet.
+        // Unknown value (incl. an old saved "dual") => the GPU behavior.
         assert_eq!(hardware_args("dual"), vec!["--backend", "auto"]);
         assert_eq!(hardware_args("nonsense"), vec!["--backend", "auto"]);
     }
@@ -249,17 +266,24 @@ mod tests {
     fn endpoint_defaults_per_mode() {
         assert_eq!(endpoint(&opts("solo", "")), "bc3.online:3112");
         assert_eq!(endpoint(&opts("pplns", "")), "bc3.online:3111");
-        // Override vinner alltid.
+        // The override always wins.
         assert_eq!(endpoint(&opts("solo", "127.0.0.1:13112")), "127.0.0.1:13112");
     }
 
     #[test]
     fn address_validation() {
         assert!(validate_address("bc1qerclmenj87gc2r3hfeyd0v0rxze32pnxygnt6p").is_ok());
-        // Versaler är giltiga i bech32.
+        // Uppercase is valid in bech32.
         assert!(validate_address("BC1QERCLMENJ87GC2R3HFEYD0V0RXZE32PNXYGNT6P").is_ok());
+        // Legacy base58check. Rejecting these was the v1.1.1 bug: the pool pays
+        // them, and the CLI has never refused them.
+        assert!(validate_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").is_ok());
+        assert!(validate_address("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").is_ok());
+        // Base58 is case-sensitive and has no 0, O, I or l.
+        assert!(validate_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfN0").is_err());
         assert!(validate_address("").is_err());
-        assert!(validate_address("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa").is_err());
         assert!(validate_address("bc1short").is_err());
+        assert!(validate_address("1short").is_err());
+        assert!(validate_address("xyz1qerclmenj87gc2r3hfeyd0v0rxze32pnxygnt6p").is_err());
     }
 }
