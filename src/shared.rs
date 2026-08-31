@@ -23,6 +23,20 @@ pub struct MinerJob {
     pub share_target: Target,
 }
 
+/// How many found shares may wait for the stratum thread.
+///
+/// The queue used to be unbounded. The pool starts every connection at
+/// difficulty 0.1 and only retargets after a dozen shares, so a fast rig
+/// produces shares far quicker than one socket write per share can drain
+/// them - at 1 PH/s that is 2.3 million per second against a writer doing
+/// tens of thousands. The queue grew by hundreds of MB per second and the
+/// miner died before vardiff ever caught up.
+///
+/// Bounded, and never blocking: a worker that stalls waiting for the socket
+/// stops hashing, which is worse than losing a share. Shares are cheap and
+/// replaceable; hashing time is not.
+pub const SUBMIT_QUEUE: usize = 4096;
+
 impl MinerJob {
     /// Do two jobs cover the same header space?
     ///
@@ -76,6 +90,9 @@ pub struct Stats {
     /// Height of the block we are mining on right now (from the job's
     /// coinbase, BIP34). 0 = unknown (no job yet).
     pub job_height: AtomicU32,
+    /// Shares dropped because the submit queue was full. Non-zero means the
+    /// pool difficulty is too low for this hashrate - see `Shared::submit`.
+    pub dropped_submits: AtomicU64,
 }
 
 pub struct Shared {
@@ -88,11 +105,12 @@ pub struct Shared {
     /// Bumped on every new job - the worker threads poll it cheaply.
     pub generation: AtomicU64,
     pub stats: Stats,
-    pub submit_tx: std::sync::mpsc::Sender<FoundShare>,
+    /// Bounded on purpose - see `Shared::submit`.
+    pub submit_tx: std::sync::mpsc::SyncSender<FoundShare>,
 }
 
 impl Shared {
-    pub fn new(submit_tx: std::sync::mpsc::Sender<FoundShare>) -> Self {
+    pub fn new(submit_tx: std::sync::mpsc::SyncSender<FoundShare>) -> Self {
         Self {
             job: Mutex::new(None),
             job_cv: Condvar::new(),
@@ -173,6 +191,20 @@ impl Shared {
         self.job_cv.notify_all();
     }
 
+    /// Queue a share for the pool. Never blocks; counts what it drops.
+    pub fn submit(&self, share: FoundShare) {
+        if self.submit_tx.try_send(share).is_err() {
+            let n = self.stats.dropped_submits.fetch_add(1, Ordering::Relaxed) + 1;
+            // Only shout the first one: if the queue is full it is full for a
+            // while, and a line per share would make it worse.
+            if n == 1 {
+                eprintln!(
+                    "[miner] submit queue full - dropping shares. The pool difficulty is                      too low for this hashrate; it should retarget shortly."
+                );
+            }
+        }
+    }
+
     pub fn clear_job(&self) {
         *self.job.lock().unwrap() = None;
         self.generation.fetch_add(1, Ordering::Release);
@@ -249,7 +281,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn shared() -> Shared {
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
         Shared::new(tx)
     }
 

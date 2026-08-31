@@ -27,6 +27,18 @@ pub fn run_client(shared: Arc<Shared>, submit_rx: Receiver<FoundShare>, cfg: Str
                     message: format!("connection lost, retrying in {backoff}s"),
                 });
                 shared.clear_job();
+                // Drop shares that were queued but never sent.
+                //
+                // They were found under the old connection's extranonce1,
+                // which goes into the coinbase. After reconnecting we get a
+                // new one, so the pool rebuilds a different coinbase, gets a
+                // different hash, and rejects them as below target - a
+                // handful of confusing rejections per reconnect, for work
+                // that can no longer be claimed under any job.
+                let dropped = submit_rx.try_iter().count();
+                if dropped > 0 {
+                    crate::human!("[pool] dropped {dropped} queued share(s) from the previous connection");
+                }
                 std::thread::sleep(Duration::from_secs(backoff));
                 backoff = (backoff * 2).min(60);
             }

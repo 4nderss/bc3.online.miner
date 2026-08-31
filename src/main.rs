@@ -224,7 +224,8 @@ fn main() {
         cpu_threads: threads,
     });
 
-    let (submit_tx, submit_rx) = std::sync::mpsc::channel();
+    // Bunden kö: se Shared::submit.
+    let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(shared::SUBMIT_QUEUE);
     let shared = Arc::new(shared::Shared::new(submit_tx));
     shared.set_intensity(args.intensity);
     if args.intensity < 100 {
