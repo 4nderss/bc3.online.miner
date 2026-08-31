@@ -12,8 +12,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Autotune-gränser för batchstorlek (noncer per kernel-launch).
+///
+/// Taket måste ligga högt nog att autotunen faktiskt når TARGET_LAUNCH även på
+/// ett snabbt kort. Med det gamla taket 1 << 24 blev en launch bara ~12 ms på
+/// ett RTX 4090 — autotunen slog i taket och varje launch betalade full
+/// synk-overhead (två H2D, en D2H, cuCtxSynchronize) mot alldeles för lite
+/// arbete. Det syntes som ~96 % GPU-användning i stället för ~99 %.
+///
+/// 1 << 29 ger utrymme upp till ~5 GH/s innan taket biter igen. Autotunen
+/// stannar ändå kring TARGET_LAUNCH, så långsamma kort påverkas inte — och
+/// ingen launch blir lång nog att närma sig Windows TDR-vakthund (2 s).
 const MIN_BATCH: u32 = 1 << 18;
-const MAX_BATCH: u32 = 1 << 24;
+const MAX_BATCH: u32 = 1 << 29;
 const START_BATCH: u32 = 1 << 20;
 /// Måltid per launch — lagom för snabb jobbväxling utan launch-overhead.
 const TARGET_LAUNCH: Duration = Duration::from_millis(100);

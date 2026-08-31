@@ -35,6 +35,24 @@
   #define ROTL64(x, n) (((u64)(x) << (n)) | ((u64)(x) >> (64 - (n))))
 #endif
 
+// Trevags-XOR. Ampere/Ada har LOP3, som raknar ut en GODTYCKLIG funktion av
+// tre indata i EN instruktion (immLut 0x96 = a^b^c). ptxas hittar en del av
+// dessa monster sjalv, men inte alla — att skriva dem explicit tar theta fran
+// 50 till 35 logikoperationer per varv. Pa AMD (RDNA2+) monstermatchar
+// kompilatorn `a^b^c` till v_xor3_b32, sa OpenCL-grenen behover ingen asm.
+#if defined(__OPENCL_VERSION__)
+  #define XOR3(a, b, c) ((a) ^ (b) ^ (c))
+#else
+DEVICE_FN u64 xor3_lop3(u64 a, u64 b, u64 c) {
+  u64 r;
+  // En rad: PTX-satser avslutas med semikolon, sa inga radbrytningar
+  // behovs — och da finns inga escape-sekvenser som kan ga sonder.
+  asm("{ .reg .b32 al, ah, bl, bh, cl, ch, rl, rh; mov.b64 {al,ah}, %1; mov.b64 {bl,bh}, %2; mov.b64 {cl,ch}, %3; lop3.b32 rl, al, bl, cl, 0x96; lop3.b32 rh, ah, bh, ch, 0x96; mov.b64 %0, {rl,rh}; }" : "=l"(r) : "l"(a), "l"(b), "l"(c));
+  return r;
+}
+  #define XOR3(a, b, c) xor3_lop3((a), (b), (c))
+#endif
+
 CONST_ARR u64 KECCAK_RC[24] = {
   0x0000000000000001UL, 0x0000000000008082UL, 0x800000000000808aUL,
   0x8000000080008000UL, 0x000000000000808bUL, 0x0000000080000001UL,
@@ -53,22 +71,30 @@ CONST_ARR u64 KECCAK_RC[24] = {
 DEVICE_FN void keccakf(u64 st[25]) {
   u64 bc0, bc1, bc2, bc3, bc4, t, tmp;
   for (int round = 0; round < 24; round++) {
-    // Theta
-    bc0 = st[0] ^ st[5] ^ st[10] ^ st[15] ^ st[20];
-    bc1 = st[1] ^ st[6] ^ st[11] ^ st[16] ^ st[21];
-    bc2 = st[2] ^ st[7] ^ st[12] ^ st[17] ^ st[22];
-    bc3 = st[3] ^ st[8] ^ st[13] ^ st[18] ^ st[23];
-    bc4 = st[4] ^ st[9] ^ st[14] ^ st[19] ^ st[24];
-    t = bc4 ^ ROTL64(bc1, 1);
-    st[0] ^= t; st[5] ^= t; st[10] ^= t; st[15] ^= t; st[20] ^= t;
-    t = bc0 ^ ROTL64(bc2, 1);
-    st[1] ^= t; st[6] ^= t; st[11] ^= t; st[16] ^= t; st[21] ^= t;
-    t = bc1 ^ ROTL64(bc3, 1);
-    st[2] ^= t; st[7] ^= t; st[12] ^= t; st[17] ^= t; st[22] ^= t;
-    t = bc2 ^ ROTL64(bc4, 1);
-    st[3] ^= t; st[8] ^= t; st[13] ^= t; st[18] ^= t; st[23] ^= t;
-    t = bc3 ^ ROTL64(bc0, 1);
-    st[4] ^= t; st[9] ^= t; st[14] ^= t; st[19] ^= t; st[24] ^= t;
+    // Theta. Kolumnsummorna som XOR3-par; appliceringen vager in bade
+    // C[x-1] och ROTL(C[x+1],1) i samma instruktion, sa D[x] aldrig
+    // materialiseras. `t` haller bara rotationen — en levande vardet i
+    // taget, precis som forr, sa registertrycket ar oforandrat.
+    bc0 = XOR3(st[0], st[5], st[10]);  bc0 = XOR3(bc0, st[15], st[20]);
+    bc1 = XOR3(st[1], st[6], st[11]);  bc1 = XOR3(bc1, st[16], st[21]);
+    bc2 = XOR3(st[2], st[7], st[12]);  bc2 = XOR3(bc2, st[17], st[22]);
+    bc3 = XOR3(st[3], st[8], st[13]);  bc3 = XOR3(bc3, st[18], st[23]);
+    bc4 = XOR3(st[4], st[9], st[14]);  bc4 = XOR3(bc4, st[19], st[24]);
+    t = ROTL64(bc1, 1);
+    st[0] = XOR3(st[0], bc4, t); st[5] = XOR3(st[5], bc4, t); st[10] = XOR3(st[10], bc4, t);
+    st[15] = XOR3(st[15], bc4, t); st[20] = XOR3(st[20], bc4, t);
+    t = ROTL64(bc2, 1);
+    st[1] = XOR3(st[1], bc0, t); st[6] = XOR3(st[6], bc0, t); st[11] = XOR3(st[11], bc0, t);
+    st[16] = XOR3(st[16], bc0, t); st[21] = XOR3(st[21], bc0, t);
+    t = ROTL64(bc3, 1);
+    st[2] = XOR3(st[2], bc1, t); st[7] = XOR3(st[7], bc1, t); st[12] = XOR3(st[12], bc1, t);
+    st[17] = XOR3(st[17], bc1, t); st[22] = XOR3(st[22], bc1, t);
+    t = ROTL64(bc4, 1);
+    st[3] = XOR3(st[3], bc2, t); st[8] = XOR3(st[8], bc2, t); st[13] = XOR3(st[13], bc2, t);
+    st[18] = XOR3(st[18], bc2, t); st[23] = XOR3(st[23], bc2, t);
+    t = ROTL64(bc0, 1);
+    st[4] = XOR3(st[4], bc3, t); st[9] = XOR3(st[9], bc3, t); st[14] = XOR3(st[14], bc3, t);
+    st[19] = XOR3(st[19], bc3, t); st[24] = XOR3(st[24], bc3, t);
 
     // Rho + Pi (Saarinens ordning, utrullad: (lane, rot) per steg)
     t = st[1];
