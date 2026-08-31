@@ -19,6 +19,13 @@ on:
         description: "Version to build, without the leading v (e.g. 1.2.0)"
         required: true
 
+# Two runs for the same tag must not race to create the release. Queue rather
+# than cancel: a half-finished release job leaves artifacts uploaded and no
+# release to attach them to.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   windows:
     runs-on: windows-latest
@@ -155,7 +162,7 @@ jobs:
           push-to-registry: true
 
   release:
-    needs: [windows, linux]
+    needs: [windows, linux, image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
