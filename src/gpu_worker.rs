@@ -179,7 +179,14 @@ fn mine_job(
             if shared.generation.load(Ordering::Acquire) != generation {
                 // Remember where we stopped: if the next job covers the same
                 // space we continue here instead of re-hashing it.
-                *nonce_start = if wrapped { 0 } else { next };
+                let (e, n) = crate::worker::resume_point(
+                    *en2_counter,
+                    next,
+                    wrapped,
+                    total_workers as u64,
+                );
+                *en2_counter = e;
+                *nonce_start = n;
                 return;
             }
             if wrapped {

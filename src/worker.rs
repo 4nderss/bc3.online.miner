@@ -107,8 +107,11 @@ fn mine_job(
             shared.throttle(batch_start.elapsed());
             if shared.generation.load(Ordering::Acquire) != generation {
                 // Remember where we stopped: if the next job covers the same
-                // space we continue here instead of re-hashing it.
-                *nonce_start = nonce;
+                // space we continue here instead of re-hashing it. `nonce == 0`
+                // here means the space wrapped in this very batch.
+                let (e, n) = resume_point(*en2_counter, nonce, nonce == 0, num_threads as u64);
+                *en2_counter = e;
+                *nonce_start = n;
                 return;
             }
             if nonce == 0 {
@@ -118,6 +121,22 @@ fn mine_job(
         // Done with this extranonce2 - next one, from the top of its nonces.
         *en2_counter += num_threads as u64;
         *nonce_start = 0;
+    }
+}
+
+/// Where to pick up again when a job change interrupts a worker mid-sweep:
+/// the point just past the work that was actually finished.
+///
+/// `wrapped` means the nonce space of the current extranonce2 ran out in that
+/// same step. Then the resume point is not nonce 0 of the SAME extranonce2 —
+/// that whole space is already hashed — but nonce 0 of the next one this
+/// worker owns. Getting that wrong re-hashed a full 2^32 nonces on the next
+/// job, and every share found in them came back from the pool as a duplicate.
+pub fn resume_point(en2: u64, next_nonce: u32, wrapped: bool, stride: u64) -> (u64, u32) {
+    if wrapped {
+        (en2.saturating_add(stride), 0)
+    } else {
+        (en2, next_nonce)
     }
 }
 
@@ -135,6 +154,36 @@ pub fn encode_extranonce2(counter: u64, size: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::resume_point;
+
+    /// The point saved on a job change must be past the work already done.
+    ///
+    /// Saving the START of the finished batch re-hashed up to 2^29 nonces on
+    /// every job change, and the pool answered the resulting shares with
+    /// "duplicate share".
+    #[test]
+    fn a_job_change_resumes_after_the_finished_batch() {
+        // Worker 2 of 8, halfway through extranonce2 number 2.
+        assert_eq!(resume_point(2, 1_000_000, false, 8), (2, 1_000_000));
+    }
+
+    /// And when the nonce space ran out in the very same step, nonce 0 of the
+    /// SAME extranonce2 is the one place we must not resume: it is fully
+    /// hashed. Resuming there re-mined all 2^32 of them.
+    #[test]
+    fn a_wrap_moves_on_to_the_next_extranonce2() {
+        assert_eq!(resume_point(2, 0, true, 8), (10, 0));
+        // The stride is the worker count, so workers never collide.
+        assert_eq!(resume_point(7, 0, true, 8), (15, 0));
+        assert_eq!(resume_point(0, 0, true, 1), (1, 0));
+    }
+
+    /// A counter at the top must not wrap around onto another worker's ground.
+    #[test]
+    fn the_extranonce2_counter_saturates() {
+        assert_eq!(resume_point(u64::MAX, 0, true, 8), (u64::MAX, 0));
+    }
+
     /// The nonce loop must get past u32::MAX instead of livelocking.
     ///
     /// With `batch_end = nonce.saturating_add(CHECK_INTERVAL)` the condition
