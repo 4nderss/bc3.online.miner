@@ -1,0 +1,95 @@
+# Cuts a release from a version tag: builds Windows and Linux, checksums both,
+# and opens a DRAFT release for review.
+#
+# Draft on purpose. Publishing is irreversible in practice - people and mirrors
+# pick releases up within minutes - so the last step stays a human click. Change
+# `--draft` below only if you are prepared for that.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build, without the leading v (e.g. 1.2.0)"
+        required: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Build miner (CLI)
+        run: cargo build --release
+      - name: Stage sidecar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path gui/src-tauri/binaries | Out-Null
+          Copy-Item target/release/bc3-miner.exe gui/src-tauri/binaries/bc3-miner-x86_64-pc-windows-msvc.exe
+      - name: Build GUI
+        run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ github.event.inputs.version }}"
+          if (-not $v) { $v = "${{ github.ref_name }}" -replace '^v', '' }
+          $out = "bc3-miner-$v-windows-x86_64"
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Copy-Item target/release/bc3-miner.exe $out/
+          Copy-Item gui/src-tauri/target/release/bc3-miner-gui.exe $out/
+          Copy-Item README.md, LICENSE $out/
+          Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: "*.zip"
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      # CLI only. The GUI needs webkit2gtk and has never shipped for Linux;
+      # earlier releases were CLI-only here too.
+      - name: Build miner (CLI)
+        run: cargo build --release
+      - name: Package
+        run: |
+          v="${{ github.event.inputs.version }}"
+          [ -n "$v" ] || v="${GITHUB_REF_NAME#v}"
+          out="bc3-miner-$v-linux-x86_64"
+          mkdir "$out"
+          cp target/release/bc3-miner README.md LICENSE "$out/"
+          tar czf "$out.tar.gz" "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: "*.tar.gz"
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      # One SHA256SUMS covering every artifact, in the format sha256sum -c reads.
+      # The README tells people to verify their download; this is what they
+      # verify against.
+      - name: Checksums
+        run: |
+          sha256sum bc3-miner-*.zip bc3-miner-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ github.event.inputs.version }}"
+          [ -n "$v" ] || v="${GITHUB_REF_NAME#v}"
+          gh release create "v$v" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "v$v" --generate-notes \
+            bc3-miner-*.zip bc3-miner-*.tar.gz SHA256SUMS

@@ -23,13 +23,7 @@ jobs:
       - name: Cache cargo
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            gui/src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          path: bc3-miner-windows-x64/
 
       - name: Build miner (CLI)
         run: cargo build --release
@@ -54,18 +48,10 @@ jobs:
           Copy-Item target/release/bc3-miner.exe $out/
           Copy-Item gui/src-tauri/target/release/bc3-miner-gui.exe $out/
           Copy-Item README.md, LICENSE $out/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
-          # The README tells people to verify their download, so the checksums
-          # have to travel with the package, not be produced by hand afterwards.
-          Get-FileHash "$out.zip" -Algorithm SHA256 |
-            ForEach-Object { "$($_.Hash.ToLower())  $out.zip" } |
-            Out-File SHA256SUMS -Encoding ascii
-          Get-Content SHA256SUMS
+          Get-ChildItem $out | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: bc3-miner-windows-x64
-          path: |
-            bc3-miner-windows-x64.zip
-            SHA256SUMS
+          path: bc3-miner-windows-x64/
           retention-days: 14
