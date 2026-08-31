@@ -155,9 +155,7 @@ fn main() {
         })
     });
     let Some(user) = user else {
-        eprintln!(
-            "bc3-miner: --user <BC3-address[.rig]> is required for mining              (or --wallet, optionally with --rig)"
-        );
+        eprintln!("bc3-miner: set --user <address[.rig]>, or --wallet with an optional --rig");
         std::process::exit(2);
     };
     let pool = args.pool.clone().unwrap_or_else(|| args.mode.default_pool().to_string());
