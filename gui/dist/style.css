@@ -304,3 +304,9 @@ input[type="range"]:disabled::-webkit-slider-thumb { background: var(--faint); c
   font-size: 20px; line-height: 1; padding: 0 4px;
 }
 .update-close:hover { color: var(--text); }
+.update-url {
+  flex: 0 1 320px; min-width: 0;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 10px; font: inherit; font-size: 12px;
+}

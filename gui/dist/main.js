@@ -432,6 +432,20 @@ function showUpdateBanner(latest, current) {
   el("update-banner").hidden = false;
 }
 
+// Reachable only if the webview has no way to hand a URL to the system
+// browser. Replaces the button with the address itself, pre-selected.
+function showUpdateUrlFallback() {
+  const btn = el("update-open");
+  const box = document.createElement("input");
+  box.type = "text";
+  box.readOnly = true;
+  box.className = "update-url";
+  box.value = RELEASES_PAGE;
+  btn.replaceWith(box);
+  box.focus();
+  box.select();
+}
+
 async function checkForUpdate() {
   try {
     const current = await tauri.app.getVersion();
@@ -469,10 +483,14 @@ function initUpdateCheck() {
   // away would take the running miner's UI with it.
   el("update-open").addEventListener("click", async () => {
     try {
-      if (tauri.shell && tauri.shell.open) await tauri.shell.open(RELEASES_PAGE);
-      else if (tauri.opener && tauri.opener.openUrl) await tauri.opener.openUrl(RELEASES_PAGE);
+      if (tauri.shell && tauri.shell.open) return void (await tauri.shell.open(RELEASES_PAGE));
+      if (tauri.opener && tauri.opener.openUrl) return void (await tauri.opener.openUrl(RELEASES_PAGE));
+      throw new Error("no opener API");
     } catch (e) {
-      log("could not open the release page: " + e, "l-bad");
+      // Never leave the button doing nothing visible: if the host cannot open
+      // a browser for us, put the URL on screen so it can be copied by hand.
+      showUpdateUrlFallback();
+      log("open the release page manually: " + RELEASES_PAGE, "l-accent");
     }
   });
 
