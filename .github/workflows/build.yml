@@ -51,14 +51,21 @@ jobs:
         run: |
           $out = "bc3-miner-windows-x64"
           New-Item -ItemType Directory -Path $out | Out-Null
-          Copy-Item target\release\bc3-miner.exe $out\
-          Copy-Item gui\src-tauri\target\release\bc3-miner-gui.exe "$out\bc3.online miner.exe"
-          Copy-Item README.md, LICENSE $out\ -ErrorAction SilentlyContinue
-          Compress-Archive -Path "$out\*" -DestinationPath "$out.zip"
-          Get-ChildItem $out, "$out.zip" | Format-Table Name, Length
+          Copy-Item target/release/bc3-miner.exe $out/
+          Copy-Item gui/src-tauri/target/release/bc3-miner-gui.exe $out/
+          Copy-Item README.md, LICENSE $out/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
+          # The README tells people to verify their download, so the checksums
+          # have to travel with the package, not be produced by hand afterwards.
+          Get-FileHash "$out.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $out.zip" } |
+            Out-File SHA256SUMS -Encoding ascii
+          Get-Content SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
           name: bc3-miner-windows-x64
-          path: bc3-miner-windows-x64.zip
+          path: |
+            bc3-miner-windows-x64.zip
+            SHA256SUMS
           retention-days: 14

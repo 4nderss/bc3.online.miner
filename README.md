@@ -11,7 +11,7 @@ GPU/CPU miner for BC3 (BitcoinIII, SHA3-256t). Connects to the [bc3.online](http
 
 Release binaries are published as zip packages under [Releases](../../releases), with SHA256 checksums.
 
-> **Note:** mining software is often flagged by antivirus heuristics (false positive). Verify the checksum of your download against the release notes.
+> **Note:** mining software is often flagged by antivirus heuristics (false positive). Verify the checksum of your download against the `SHA256SUMS` file published with it.
 
 ## Quick start — GUI
 
@@ -20,6 +20,12 @@ Solo, press *Start mining*. The window shows live hashrate with a sparkline,
 accepted/rejected shares, estimated time to block, which backend is running,
 and a full-screen celebration when you find a block. Settings are remembered
 between runs.
+
+If a newer release exists on GitHub, a banner says so and links to it. The
+miner never updates itself: it holds your payout address, and a binary that
+downloads and runs code is exactly the thing you should not trust with that.
+The check asks GitHub and nothing else, runs in the window rather than in the
+mining process, and stays silent if it fails.
 
 The GUI runs the mining core (`bc3-miner.exe`) as a child process and reads its
 JSON event stream — a GPU crash can never take the window down, and the core
@@ -53,19 +59,40 @@ Solo rewards are paid directly to your address in the block you find.
 ## Architecture
 
 - SHA3-256t = three sequential rounds of NIST SHA3-256 over the 80-byte block header. The header fits in a single SHA3-256 rate block, so each hash is exactly 3 keccak-f[1600] permutations.
-- One shared kernel source (`src/kernels/sha3t.cl`) is compiled both to CUDA PTX (at build time) and by the OpenCL runtime — the keccak core is byte-for-byte identical for both backends.
+- One shared kernel source (`src/kernels/sha3t.cl`) is compiled both to CUDA PTX (at build time) and by the OpenCL runtime. The keccak core is the same code for both; the two backends differ only in how the three-input XOR is expressed and in whether the rounds are unrolled, both isolated in macros at the top of the file. Both are verified bit-exact against the same reference.
 - The CPU builds coinbase/merkle root per extranonce2; the GPU grinds the 2³² nonce space in auto-tuned batches (~100 ms per launch). Every GPU hit is re-verified on the CPU against the consensus reference before submission.
 - **The CUDA kernel is precompiled to PTX at build time** (see `build.rs`) and embedded in the binary. NVRTC ships with the CUDA *Toolkit*, not with the graphics driver, so runtime compilation would fail on end-user machines. The driver JITs the embedded PTX for whatever card is installed — the binary only needs `nvcuda.dll`.
 - **Both GPU runtimes are loaded dynamically** — CUDA via cudarc's fallback loader, OpenCL via `src/backend/cl_sys.rs`. Neither `nvcuda.dll` nor `OpenCL.dll` appears in the binary's import table, so one build runs everywhere: CUDA on NVIDIA, OpenCL on AMD/Intel, CPU if neither is present. Linking against `OpenCL.lib` instead would make the binary refuse to start on machines without an OpenCL runtime.
 
 ## Performance
 
-| Device | Backend | Hashrate |
-|--------|---------|----------|
-| NVIDIA RTX 3050 Ti Laptop GPU | CUDA | ~140 MH/s |
-| NVIDIA RTX 3050 Ti Laptop GPU + Intel Iris Xe | OpenCL, both devices | ~140–142 MH/s |
+| Device | Backend | Hashrate | How measured |
+|--------|---------|----------|--------------|
+| NVIDIA RTX 4090 | CUDA | ~1.60 GH/s | in the miner, sustained |
+| NVIDIA RTX 3050 Ti Laptop GPU | CUDA | ~163 MH/s | kernel benchmark |
+| NVIDIA RTX 3050 Ti Laptop GPU + Intel Iris Xe | OpenCL, both devices | ~140–142 MH/s | in the miner, before the kernel work below |
 
-Measured with the fully unrolled keccak-f[1600] kernel (release build, 2²⁴ nonces per launch). The kernel is ALU-bound: SHA3-256t is three full keccak permutations of 64-bit arithmetic per nonce, which GPUs emulate with 32-bit ops.
+The kernel is ALU-bound and close to the hardware ceiling. SHA3-256t is three
+full keccak-f[1600] permutations per nonce, and a GPU emulates its 64-bit
+arithmetic with 32-bit ops, so throughput is set by how many integer
+instructions the SM can issue - not by memory, occupancy or batch size.
+
+One keccak round compiles to 185 SASS instructions on sm_89: 122 `LOP3` and 58
+`SHF`, plus loop overhead. That is the floor for this formulation, and every
+instruction is accounted for - 70 three-input XORs, 50 chi, 2 iota, 29 rotations
+at two funnel shifts each. Three things get it there:
+
+- **Theta as three-input XOR.** Ampere and Ada compute an arbitrary function of
+  three inputs in one `LOP3`. Writing theta's column sums and application that
+  way, instead of chains of two-input XORs, folds `C[x-1]` and `ROTL(C[x+1],1)`
+  into the same instruction and drops 14 instructions per round.
+- **Full unroll of the 24 rounds** (CUDA only). Removes the per-round overhead
+  and lets ptxas fit the kernel in 64 registers instead of 80, lifting occupancy
+  from 25 to 32 warps per SM. Partial unrolling is *worse* than none.
+- **Batches large enough to matter.** Nonces per launch are auto-tuned toward
+  ~100 ms of work. On a 4090 a launch that is too small pays full
+  synchronisation overhead against very little work, which shows up directly as
+  lost GPU utilisation.
 
 OpenCL on the same NVIDIA card performs on par with CUDA. Adding the integrated
 Iris Xe on top gained nothing measurable on this laptop: the discrete and
