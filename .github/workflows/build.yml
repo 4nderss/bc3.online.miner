@@ -48,20 +48,23 @@ jobs:
         run: cargo test --release
       - name: Test (wasm crate, host target)
         run: cargo test --release --manifest-path wasm/Cargo.toml
-      - name: Test (GUI)
-        run: cargo test --release --manifest-path gui/src-tauri/Cargo.toml
 
       - name: Build miner (CLI)
         run: cargo build --release
 
       # The GUI embeds the CLI as a Tauri sidecar, so it has to be in place
-      # before the GUI is built, not copied into the package afterwards.
+      # before anything touches the GUI crate - including its tests. tauri-build
+      # resolves externalBin in a build script, so a missing sidecar fails the
+      # crate before a single test runs.
       - name: Stage sidecar
         shell: pwsh
         run: |
           # binaries/ is gitignored, so on a fresh checkout it does not exist.
           New-Item -ItemType Directory -Force -Path gui/src-tauri/binaries | Out-Null
           Copy-Item target/release/bc3-miner.exe gui/src-tauri/binaries/bc3-miner-x86_64-pc-windows-msvc.exe
+
+      - name: Test (GUI)
+        run: cargo test --release --manifest-path gui/src-tauri/Cargo.toml
 
       - name: Build GUI
         run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml

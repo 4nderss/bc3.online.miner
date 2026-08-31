@@ -36,18 +36,21 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # A release must not ship code that never ran its own tests.
-      - name: Test
-        run: |
-          cargo test --release
-          cargo test --release --manifest-path gui/src-tauri/Cargo.toml
+      - name: Test (core)
+        run: cargo test --release
 
       - name: Build miner (CLI)
         run: cargo build --release
+      # Must precede anything that touches the GUI crate, tests included:
+      # tauri-build resolves externalBin in a build script, so a missing
+      # sidecar fails the crate before a single test runs.
       - name: Stage sidecar
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path gui/src-tauri/binaries | Out-Null
           Copy-Item target/release/bc3-miner.exe gui/src-tauri/binaries/bc3-miner-x86_64-pc-windows-msvc.exe
+      - name: Test (GUI)
+        run: cargo test --release --manifest-path gui/src-tauri/Cargo.toml
       - name: Build GUI
         run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml
       - name: Package
