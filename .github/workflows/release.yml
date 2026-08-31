@@ -1,9 +1,13 @@
-# Cuts a release from a version tag: builds Windows and Linux, checksums both,
-# and opens a DRAFT release for review.
+# Cuts a release from a version tag: tests, builds Windows and Linux,
+# checksums and attests both, and opens a DRAFT release for review.
 #
 # Draft on purpose. Publishing is irreversible in practice - people and mirrors
 # pick releases up within minutes - so the last step stays a human click. Change
 # `--draft` below only if you are prepared for that.
+#
+# Actions are pinned by commit SHA, not by tag. Tags move; a compromised or
+# retagged action would otherwise run inside the job that produces the binaries
+# people download. The version each SHA corresponds to is in the comment.
 name: release
 
 on:
@@ -19,8 +23,24 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            gui/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # A release must not ship code that never ran its own tests.
+      - name: Test
+        run: |
+          cargo test --release
+          cargo test --release --manifest-path gui/src-tauri/Cargo.toml
+
       - name: Build miner (CLI)
         run: cargo build --release
       - name: Stage sidecar
@@ -41,7 +61,7 @@ jobs:
           Copy-Item gui/src-tauri/target/release/bc3-miner-gui.exe $out/
           Copy-Item README.md, LICENSE $out/
           Compress-Archive -Path "$out/*" -DestinationPath "$out.zip"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows
           path: "*.zip"
@@ -49,8 +69,20 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install stable --profile minimal --no-self-update
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Test
+        run: cargo test --release
+
       # CLI only. The GUI needs webkit2gtk and has never shipped for Linux;
       # earlier releases were CLI-only here too.
       - name: Build miner (CLI)
@@ -63,7 +95,7 @@ jobs:
           mkdir "$out"
           cp target/release/bc3-miner README.md LICENSE "$out/"
           tar czf "$out.tar.gz" "$out"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux
           path: "*.tar.gz"
@@ -73,10 +105,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           merge-multiple: true
+
       # One SHA256SUMS covering every artifact, in the format sha256sum -c reads.
       # The README tells people to verify their download; this is what they
       # verify against.
@@ -84,6 +119,15 @@ jobs:
         run: |
           sha256sum bc3-miner-*.zip bc3-miner-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
+
+      # A checksum only proves the download matches what was uploaded. This
+      # signs a statement binding each artifact to the commit and workflow that
+      # produced it, which is the part a checksum can never establish. Verified
+      # with: gh attestation verify <file> --repo 4nderss/bc3.online.miner
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "bc3-miner-*.zip,bc3-miner-*.tar.gz"
+
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}

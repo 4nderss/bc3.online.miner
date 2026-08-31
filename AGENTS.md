@@ -102,8 +102,18 @@ so it runs in plain Docker. Both Docker recipes are in the README.
 
 ## Releasing
 
-Tag, let CI build, attach the zip and `SHA256SUMS`. The README tells users to
-verify their download, so the checksums must ship with the package.
+Tag; CI does the rest. `release.yml` runs the tests, builds Windows and Linux,
+writes one `SHA256SUMS` over both, attaches a build provenance attestation, and
+opens a **draft** release. Publishing stays a human click.
+
+The checksum and the attestation answer different questions and both have to
+ship: the checksum says the download is intact, the attestation says it came
+from this repository's workflow at a named commit. The README tells users to
+check both.
+
+Actions in both workflows are pinned by commit SHA rather than tag. Tags move,
+and these jobs produce the binaries people download. When you bump one, check
+the inputs you rely on still exist - a major bump is not free.
 
 Antivirus flags mining binaries as a matter of course. That is one more reason
 the checksums matter, and it is why the miner does not download or execute

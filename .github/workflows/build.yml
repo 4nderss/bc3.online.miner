@@ -1,9 +1,13 @@
-# Builds the Windows binaries on every push and uploads them as an artifact.
+# Builds and tests on every push, and uploads the Windows binaries.
 #
 # No CUDA toolkit is installed on purpose: build.rs falls back to the PTX
 # checked into src/kernels/, and cudarc loads the driver dynamically, so one
 # binary runs with CUDA, with OpenCL, or on CPU alone. Installing the toolkit
 # would only slow the build down and risk shipping a kernel nobody reviewed.
+#
+# Actions are pinned by commit SHA, not by tag. Tags move; a compromised or
+# retagged action would otherwise run inside the job that produces the binaries
+# people download. The version each SHA corresponds to is in the comment.
 name: build
 
 on:
@@ -11,25 +15,41 @@ on:
   push:
     branches: [main]
 
+# A newer push makes an in-flight build irrelevant. Cancel it rather than pay
+# for two Windows runners racing to tell us about different commits.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - name: Cache cargo
-        uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
             gui/src-tauri/target
+            wasm/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
+      # The GPU tests are #[ignore]d and stay that way: no runner has a GPU.
+      # What runs here is the CPU half - the consensus vectors, the Rust mirror
+      # of the kernel algorithm, address validation, and the throttle.
+      - name: Test (core)
+        run: cargo test --release
+      - name: Test (wasm crate, host target)
+        run: cargo test --release --manifest-path wasm/Cargo.toml
+      - name: Test (GUI)
+        run: cargo test --release --manifest-path gui/src-tauri/Cargo.toml
 
       - name: Build miner (CLI)
         run: cargo build --release
@@ -58,7 +78,7 @@ jobs:
           Copy-Item README.md, LICENSE $out/
           Get-ChildItem $out | Format-Table Name, Length
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bc3-miner-windows-x64
           path: bc3-miner-windows-x64/

@@ -13,6 +13,15 @@ Release binaries are published as zip packages under [Releases](../../releases),
 
 > **Note:** mining software is often flagged by antivirus heuristics (false positive). Verify the checksum of your download against the `SHA256SUMS` file published with it.
 
+Releases also carry a build provenance attestation. A checksum only proves the
+file matches what was uploaded; the attestation is a signed statement binding
+the file to the commit and the workflow that built it, which is the part a
+checksum cannot establish:
+
+```
+gh attestation verify bc3-miner-1.2.0-windows-x86_64.zip --repo 4nderss/bc3.online.miner
+```
+
 ## Quick start — GUI
 
 Run **bc3-miner-gui.exe**. Paste your BC3 address, name your rig, pick PPLNS or
