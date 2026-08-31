@@ -21,7 +21,7 @@ pub fn run_client(shared: Arc<Shared>, submit_rx: Receiver<FoundShare>, cfg: Str
         match session(&shared, &submit_rx, &cfg) {
             Ok(()) => backoff = 1,
             Err(e) => {
-                eprintln!("[pool] connection error: {e} — reconnecting in {backoff}s");
+                eprintln!("[pool] connection error: {e} - reconnecting in {backoff}s");
                 crate::ipc::emit(&crate::ipc::Event::Status {
                     state: crate::ipc::StatusState::Connecting,
                     message: format!("connection lost, retrying in {backoff}s"),
@@ -68,7 +68,7 @@ fn session(
         // 1) Submit pending shares.
         while let Ok(share) = submit_rx.try_recv() {
             if share.is_block_candidate {
-                crate::human!("[miner] ★ BLOCK CANDIDATE {} ★", share.hash_display);
+                crate::human!("[miner] * BLOCK CANDIDATE {} *", share.hash_display);
                 crate::ipc::emit(&crate::ipc::Event::Block {
                     hash: share.hash_display.clone(),
                 });
@@ -121,7 +121,7 @@ fn session(
             crate::human!("[pool] authorized");
             crate::ipc::emit(&crate::ipc::Event::Status {
                 state: crate::ipc::StatusState::Mining,
-                message: "authorized — mining".into(),
+                message: "authorized - mining".into(),
             });
             continue;
         }

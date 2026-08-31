@@ -121,7 +121,7 @@ fn mine_job(
                 let hash = header.hash();
                 if !hash_meets_target(&hash, &job.share_target) {
                     eprintln!(
-                        "[gpu] VARNING: {} rapporterade falsk träff nonce={nonce:08x} — ignorerad",
+                        "[gpu] WARNING: {} reported a false hit, nonce={nonce:08x} - ignored",
                         backend.name()
                     );
                     continue;

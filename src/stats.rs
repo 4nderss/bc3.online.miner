@@ -51,18 +51,18 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
             telemetry: temps,
         });
         let temp_text = match (temps.gpu_temp_c, temps.cpu_temp_c) {
-            (Some(g), Some(c)) => format!(" | GPU {g}°C CPU {c}°C"),
-            (Some(g), None) => format!(" | GPU {g}°C"),
-            (None, Some(c)) => format!(" | CPU {c}°C"),
+            (Some(g), Some(c)) => format!(" | GPU {g}C CPU {c}C"),
+            (Some(g), None) => format!(" | GPU {g}C"),
+            (None, Some(c)) => format!(" | CPU {c}C"),
             (None, None) => String::new(),
         };
         let best = shared.best_share();
         let blocks = shared.stats.blocks.load(Ordering::Relaxed);
         crate::human!(
-            "[miner] {} | shares {accepted}✓ {rejected}✗ | best {:.3} | blocks {blocks} | est. block: {}{}",
+            "[miner] {} | shares {accepted} ok, {rejected} rejected | best {:.3} | blocks {blocks} | est. block: {}{}",
             format_hashrate(rate),
             best,
-            eta_secs.map(format_duration).unwrap_or_else(|| "—".into()),
+            eta_secs.map(format_duration).unwrap_or_else(|| "unknown".into()),
             temp_text
         );
     }
@@ -85,7 +85,7 @@ pub fn format_hashrate(rate: f64) -> String {
 
 pub fn format_duration(secs: f64) -> String {
     if !secs.is_finite() {
-        return "∞".into();
+        return "never".into();
     }
     let s = secs as u64;
     match s {
@@ -98,6 +98,31 @@ pub fn format_duration(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Log output must be pure ASCII.
+    ///
+    /// Not style: a container host truncated the startup line at an em dash
+    /// and then dropped every line after it, so the miner looked dead while it
+    /// was mining normally. Every line we emit passes through log pipelines we
+    /// do not control, and some of them are not UTF-8 clean.
+    #[test]
+    fn log_formatters_are_ascii() {
+        let mut samples = vec![
+            format_duration(f64::INFINITY),
+            format_duration(f64::NAN),
+            format_duration(0.0),
+            format_duration(42.0),
+            format_duration(4242.0),
+            format_duration(424242.0),
+            format_duration(4.2e9),
+        ];
+        for r in [0.0, 1.0, 1.5e3, 1.5e6, 1.5e9, 1.5e12] {
+            samples.push(format_hashrate(r));
+        }
+        for s in samples {
+            assert!(s.is_ascii(), "non-ASCII in log output: {s:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

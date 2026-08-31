@@ -20,7 +20,7 @@ use clap::Parser;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "bc3-miner", version, about = "BC3 (SHA3-256t) miner — bc3.online")]
+#[command(name = "bc3-miner", version, about = "BC3 (SHA3-256t) miner - bc3.online")]
 struct Args {
     /// Payout mode. Picks the pool port: pplns 3111, solo 3112.
     #[arg(long, value_enum, default_value_t = Mode::Pplns, env = "BC3_MODE")]
@@ -190,7 +190,7 @@ fn main() {
                 eprintln!("  is not in use, so no device ever reached the container.");
                 std::process::exit(1);
             }
-            BackendKind::Auto => human!("[gpu] no GPU found — mining on CPU"),
+            BackendKind::Auto => human!("[gpu] no GPU found - mining on CPU"),
             BackendKind::Cpu => {}
         }
     }
@@ -209,7 +209,7 @@ fn main() {
     };
 
     human!(
-        "bc3-miner {} — {} GPU(s), {} CPU thread(s)",
+        "bc3-miner {} - {} GPU(s), {} CPU thread(s)",
         env!("CARGO_PKG_VERSION"),
         gpus.len(),
         threads
@@ -238,14 +238,14 @@ fn main() {
         std::thread::Builder::new()
             .name(format!("worker-{i}"))
             .spawn(move || worker::run_worker(s, i, total_workers))
-            .expect("kunde inte starta arbetstråd");
+            .expect("could not start a worker thread");
     }
     for (g, gpu) in gpus.into_iter().enumerate() {
         let s = shared.clone();
         std::thread::Builder::new()
             .name(format!("gpu-{g}"))
             .spawn(move || gpu_worker::run_gpu_worker(s, gpu, threads + g, total_workers))
-            .expect("kunde inte starta GPU-tråd");
+            .expect("could not start a GPU thread");
     }
     {
         let s = shared.clone();

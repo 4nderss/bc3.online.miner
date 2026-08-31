@@ -217,7 +217,7 @@ mod tests {
         s.throttle(Duration::from_millis(40));
         let waited = t0.elapsed();
         assert!(waited >= Duration::from_millis(25), "vilade bara {waited:?}");
-        assert!(waited < Duration::from_millis(120), "vilade för länge: {waited:?}");
+        assert!(waited < Duration::from_millis(120), "idled too long: {waited:?}");
     }
 
     #[test]
@@ -231,6 +231,6 @@ mod tests {
         });
         let t0 = Instant::now();
         s.throttle(Duration::from_millis(100)); // would otherwise idle ~900 ms
-        assert!(t0.elapsed() < Duration::from_millis(300), "vilan avbröts inte");
+        assert!(t0.elapsed() < Duration::from_millis(300), "the idle was not interrupted");
     }
 }
