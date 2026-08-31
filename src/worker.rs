@@ -50,15 +50,15 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
         let mut nonce: u32 = 0;
         loop {
             let batch_start = std::time::Instant::now();
-            // Räkna varv i stället för att jämföra mot ett slutvärde.
+            // Count iterations rather than compare against an end value.
             //
-            // `nonce.saturating_add(CHECK_INTERVAL)` mättar vid u32::MAX, och
-            // då blir `nonce < batch_end` falskt direkt: inre loopen kör noll
-            // varv, noncen wrappar aldrig till 0, och den yttre snurrar för
-            // evigt i en tight spin - med stats uppräknade 4096 per varv fast
-            // ingenting hashades. En bränd kärna och en påhittad hashrate.
-            // Nonce 0xFFFFFFFF hashades dessutom aldrig. GPU-vägen hanterar
-            // samma gräns korrekt med overflowing_add; nu gör den här det med.
+            // `nonce.saturating_add(CHECK_INTERVAL)` saturates at u32::MAX, so
+            // `nonce < batch_end` is false there: the inner loop runs zero
+            // times, the nonce never wraps to 0, and the outer loop spins
+            // forever - while adding 4096 to stats every turn without hashing
+            // anything. A burned core and an invented hashrate. Nonce
+            // 0xFFFFFFFF was never hashed either. The GPU path already handled
+            // this boundary with overflowing_add; now this one does too.
             let mut done: u32 = 0;
             while done < CHECK_INTERVAL {
                 header.nonce = nonce;
@@ -84,8 +84,8 @@ fn mine_job(shared: &Shared, job: &MinerJob, generation: u64, thread_id: usize, 
                     break; // nonce space exhausted for this extranonce2
                 }
             }
-            // `done`, inte CHECK_INTERVAL: den sista batchen före wrappen är
-            // kortare, och att räkna hela ändå blåste upp hashraten.
+            // `done`, not CHECK_INTERVAL: the last batch before the wrap is
+            // shorter, and counting the whole thing inflated the hashrate.
             shared.stats.hashes.fetch_add(done as u64, Ordering::Relaxed);
             shared.stats.cpu_hashes.fetch_add(done as u64, Ordering::Relaxed);
             shared.throttle(batch_start.elapsed());
@@ -114,12 +114,12 @@ pub fn encode_extranonce2(counter: u64, size: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    /// Nonce-loopen måste ta sig förbi u32::MAX i stället för att livelocka.
+    /// The nonce loop must get past u32::MAX instead of livelocking.
     ///
-    /// Med `batch_end = nonce.saturating_add(CHECK_INTERVAL)` blev villkoret
-    /// `nonce < batch_end` falskt vid MAX: noll varv, ingen wrap, och den
-    /// yttre loopen snurrade för evigt. Här körs samma räkning som i
-    /// mine_job, men bara aritmetiken.
+    /// With `batch_end = nonce.saturating_add(CHECK_INTERVAL)` the condition
+    /// `nonce < batch_end` was false at MAX: zero iterations, no wrap, and the
+    /// outer loop span forever. This runs the same arithmetic as mine_job,
+    /// without the hashing.
     #[test]
     fn the_nonce_loop_terminates_at_the_boundary() {
         let mut nonce: u32 = u32::MAX - 2;
@@ -140,14 +140,14 @@ mod tests {
                     break;
                 }
             }
-            // Batchen före wrappen är kortare än CHECK_INTERVAL.
+            // The batch before the wrap is shorter than CHECK_INTERVAL.
             assert!(done <= CHECK_INTERVAL);
             if wrapped_out {
                 assert_eq!(nonce, 0);
                 break;
             }
         }
-        // Alla tre kvarvarande noncer hashades, inklusive själva MAX.
+        // All three remaining nonces were hashed, MAX included.
         assert_eq!(hashed, vec![u32::MAX - 2, u32::MAX - 1, u32::MAX]);
     }
 
