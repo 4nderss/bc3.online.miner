@@ -70,8 +70,18 @@ change there is a consensus change. The workflow that catches mistakes:
 
 1. Edit `sha3t.cl`. Backend-specific differences belong in the macro block at
    the top of the file, not scattered through the round function.
-2. Regenerate the PTX with `nvcc --ptx -arch compute_52 -O3 -x cu` (or NVRTC).
-   Commit the regenerated `sha3t.ptx` - the build embeds it.
+2. Regenerate the PTX with `nvcc --ptx -arch compute_52 -O3 -x cu`, **using the
+   CUDA 12.0 toolkit**. The toolkit version decides the PTX ISA version, and a
+   driver can only JIT the versions it knows: ISA 8.0 needs driver R525, ISA
+   8.8 (CUDA 12.9) needs R575. Build it too new and the card is detected but
+   the kernel never loads. `build.rs` fails the build above ISA 8.0 for exactly
+   that reason. Commit the regenerated `sha3t.ptx` - the build embeds it.
+
+   ```
+   docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.0.1-devel-ubuntu22.04 \
+     /usr/local/cuda/bin/nvcc --ptx -arch compute_52 -O3 -x cu \
+     src/kernels/sha3t.cl -o src/kernels/sha3t.ptx
+   ```
 3. **Verify bit-exactness against an independent reference**, not against the
    previous kernel. `cargo test` compares the GPU hit set to `consensus.rs` on
    random headers; `sha3_256` from any standard library works as a second

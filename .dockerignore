@@ -1,0 +1,31 @@
+# The Dockerfile does `COPY . .`, so without this file the build context is
+# the whole working tree - several GB of target directories, the unpacked
+# test-build binaries, and any local .env. All of it is uploaded to the
+# daemon, and whatever the COPY takes ends up in a layer that ships.
+#
+# Secrets first: .env is gitignored, so it exists locally and only locally.
+.env
+.env.*
+!.env.example
+
+# Build output. `**/` is required, NOT decoration: Docker anchors ignore
+# patterns at the context root, so a bare `target/` matches only the top one
+# and leaves wasm/target and gui/src-tauri/target in the context - together
+# well over a gigabyte, uploaded to the daemon and copied into a layer on
+# every build. This is the one place the syntax differs from .gitignore.
+**/target/
+/target-win
+/target-linux
+/target-msvc
+/target-gui
+/target-cuda
+/dist
+/test-build
+
+# Generated Tauri artifacts and the embedded sidecar binary.
+gui/src-tauri/gen/
+gui/src-tauri/binaries/
+
+.git
+.github
+node_modules/

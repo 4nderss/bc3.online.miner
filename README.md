@@ -130,12 +130,44 @@ host's restart policy or alerting has something to notice.
 
 `docker-compose.yml` in this repository has both patterns as a working example.
 
+## Upgrading: check a pinned `--gpu-id` first
+
+**If you pin a card with `--gpu-id` or `BC3_GPU_ID`, verify the number before
+you upgrade.** Two things changed about how devices are numbered and selected.
+
+The detected list is now de-duplicated. The same physical card can be exposed
+by two OpenCL platforms — Mesa's rusticl beside ROCm, or two Intel runtimes —
+and the miner used to treat those as two cards, start two workers on one GPU,
+and report a full hashrate for each while they split one card's throughput
+between them. They now collapse to one entry, so **positions after a removed
+duplicate shift down**.
+
+And an out-of-range id is now an error instead of a silent fall-through. It
+used to produce an empty device list, which under the default `auto` backend
+means "no GPU found — mining on CPU": a typo in `BC3_GPU_ID` looked exactly
+like a card that had fallen off the bus, and on a host rented by the hour it
+was billed at GPU prices the whole time. The miner now exits with a message
+naming the valid range. That is deliberate, but note the consequence under
+`Restart=always` or `restart: unless-stopped`: a stale id becomes a restart
+loop rather than a quiet CPU run. Loud is the point; knowing about it first is
+the courtesy.
+
+Run `bc3-miner --probe` to see what each runtime exposes — but read it
+carefully, because it is not the list `--gpu-id` indexes. The probe
+deliberately shows **both** backends so you can tell whether each one works;
+`--gpu-id` indexes only the backend actually in use, and under the default
+`auto` that is CUDA whenever any CUDA device is found, and OpenCL only when
+none is. On an NVIDIA machine the same card therefore appears twice in the
+probe, once as `CUDA #n` and once as `OpenCL p.d` — and only the `CUDA #n`
+numbering is the one `--gpu-id` means.
+
 ## Architecture
 
 - SHA3-256t = three sequential rounds of NIST SHA3-256 over the 80-byte block header. The header fits in a single SHA3-256 rate block, so each hash is exactly 3 keccak-f[1600] permutations.
 - One shared kernel source (`src/kernels/sha3t.cl`) is compiled both to CUDA PTX (at build time) and by the OpenCL runtime. The keccak core is the same code for both; the two backends differ only in how the three-input XOR is expressed and in whether the rounds are unrolled, both isolated in macros at the top of the file. Both are verified bit-exact against the same reference.
 - The CPU builds coinbase/merkle root per extranonce2; the GPU grinds the 2³² nonce space in auto-tuned batches (~100 ms per launch). Every GPU hit is re-verified on the CPU against the consensus reference before submission.
 - **The CUDA kernel is precompiled to PTX at build time** (see `build.rs`) and embedded in the binary. NVRTC ships with the CUDA *Toolkit*, not with the graphics driver, so runtime compilation would fail on end-user machines. The driver JITs the embedded PTX for whatever card is installed — the binary only needs `nvcuda.dll`.
+- **The PTX is built with the CUDA 12.0 toolkit, and `build.rs` refuses anything newer.** A driver can only JIT the PTX ISA versions it knows: the embedded kernel declares ISA 8.0, which needs driver **R525 or newer**. Building it with a newer toolkit raises that requirement — ISA 8.8 from CUDA 12.9 needs R575 — and on an older driver `cuModuleLoadData` fails, the card is found but no backend opens, and the miner hashes nothing while looking connected. That shipped once; the version check in `build.rs` is there so it cannot ship again. If the CUDA load fails anyway, the miner now falls back to the same card through OpenCL, and exits with an error if no GPU worker survives and no CPU threads are running.
 - **Both GPU runtimes are loaded dynamically** — CUDA via cudarc's fallback loader, OpenCL via `src/backend/cl_sys.rs`. Neither `nvcuda.dll` nor `OpenCL.dll` appears in the binary's import table, so one build runs everywhere: CUDA on NVIDIA, OpenCL on AMD/Intel, CPU if neither is present. Linking against `OpenCL.lib` instead would make the binary refuse to start on machines without an OpenCL runtime.
 
 ## Performance

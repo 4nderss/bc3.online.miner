@@ -3,14 +3,24 @@
   "identifier": "default",
   "description": "The GUI starts the sidecar binary and listens to its output. Beyond that only two things for the update notification: read the app's own version, and open the release page in the system browser.",
   "windows": ["main"],
+  "_comment": [
+    "Capabilities gate what the WEBVIEW may invoke over IPC - nothing else.",
+    "The sidecar is started from Rust (app.shell().sidecar() in src/main.rs),",
+    "which is a direct API call and not ACL-checked, so shell:allow-execute",
+    "and shell:allow-spawn were granting the frontend a power it never used:",
+    "the ability to run programs with arguments of its choosing. The frontend",
+    "calls invoke() on our own four commands and shell.open on one constant",
+    "URL, and builds every DOM node with textContent, so there is no known way",
+    "to reach them today - which is the point. A permission that is not needed",
+    "is one that cannot be misused later.",
+    "If Start ever stops working after a Tauri upgrade, this is the first",
+    "place to look: add shell:allow-spawn back with the allowlist below.",
+    "  { \"identifier\": \"shell:allow-spawn\",",
+    "    \"allow\": [{ \"name\": \"binaries/bc3-miner\", \"sidecar\": true, \"args\": true }] }"
+  ],
   "permissions": [
     "core:default",
     "core:app:allow-version",
-    "shell:allow-execute",
-    "shell:allow-open",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [{ "name": "binaries/bc3-miner", "sidecar": true, "args": true }]
-    }
+    "shell:allow-open"
   ]
 }

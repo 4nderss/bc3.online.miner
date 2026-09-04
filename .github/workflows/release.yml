@@ -18,6 +18,9 @@ on:
       version:
         description: "Version to build, without the leading v (e.g. 1.2.0)"
         required: true
+  # Publishing the draft is what moves :latest - see the `promote` job.
+  release:
+    types: [published]
 
 # Two runs for the same tag must not race to create the release. Queue rather
 # than cancel: a half-finished release job leaves artifacts uploaded and no
@@ -26,8 +29,13 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+# Least privilege by default; the two jobs that need more grant it themselves.
+permissions:
+  contents: read
+
 jobs:
   windows:
+    if: github.event_name != 'release'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -60,11 +68,18 @@ jobs:
         run: cargo test --release --manifest-path gui/src-tauri/Cargo.toml
       - name: Build GUI
         run: cargo build --release --manifest-path gui/src-tauri/Cargo.toml
+      # The version reaches the script through the environment, never through
+      # ${{ }} interpolation. Interpolation splices the value into the script
+      # BEFORE the shell sees it, so a version string containing shell syntax
+      # runs as code - inside the job that signs and publishes the binaries.
       - name: Package
         shell: pwsh
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          $v = "${{ github.event.inputs.version }}"
-          if (-not $v) { $v = "${{ github.ref_name }}" -replace '^v', '' }
+          $v = $env:INPUT_VERSION
+          if (-not $v) { $v = $env:REF_NAME -replace '^v', '' }
           $out = "bc3-miner-$v-windows-x86_64"
           New-Item -ItemType Directory -Path $out | Out-Null
           Copy-Item target/release/bc3-miner.exe $out/
@@ -77,6 +92,7 @@ jobs:
           path: "*.zip"
 
   linux:
+    if: github.event_name != 'release'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -97,9 +113,12 @@ jobs:
       # earlier releases were CLI-only here too.
       - name: Build miner (CLI)
         run: cargo build --release
+      # Via the environment, not ${{ }} - see the Windows job.
       - name: Package
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          v="${{ github.event.inputs.version }}"
+          v="$INPUT_VERSION"
           [ -n "$v" ] || v="${GITHUB_REF_NAME#v}"
           out="bc3-miner-$v-linux-x86_64"
           mkdir "$out"
@@ -113,6 +132,7 @@ jobs:
   # The container image. Built from the same tag as the binaries, so pulling
   # ghcr.io/OWNER/bc3-miner:1.2.0 gets you exactly what the zip contains.
   image:
+    if: github.event_name != 'release'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -126,11 +146,21 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository_owner }}/bc3-miner
-          # :1.2.0, :1.2, :latest - so people can pin as loosely as they like.
+          # :1.2.0 and :1.2 only. NOT :latest - see the `promote` job: the
+          # release this image belongs to is still a draft at this point, and
+          # :latest is what every unpinned `docker run` and the compose file
+          # resolve to. Moving it here would put a build nobody has reviewed
+          # in front of everyone, minutes after a tag was pushed, and the draft
+          # step exists precisely so that cannot happen.
+          # `value` is required for workflow_dispatch: without it the
+          # metadata-action derives the version from the git tag, and on a
+          # dispatch run the ref is `refs/heads/main`. That produced ZERO tags,
+          # and build-push-action with push:true then fails the whole image job
+          # - which takes `release` with it, since release needs it. An empty
+          # `value` falls back to the ref, so the tag path is unchanged.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=semver,pattern={{version}},value=${{ github.event.inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ github.event.inputs.version }}
 
       # The runner's default buildx driver is "docker", which cannot export a
       # cache - that is what killed the first attempt at this job. This sets up
@@ -162,6 +192,7 @@ jobs:
           push-to-registry: true
 
   release:
+    if: github.event_name != 'release'
     needs: [windows, linux, image]
     runs-on: ubuntu-latest
     permissions:
@@ -185,16 +216,50 @@ jobs:
       # signs a statement binding each artifact to the commit and workflow that
       # produced it, which is the part a checksum can never establish. Verified
       # with: gh attestation verify <file> --repo 4nderss/bc3.online.miner
+      # SHA256SUMS is attested TOO, and that is not redundant. The README tells
+      # people to check the checksums; if only the archives are attested, the
+      # file listing their hashes is the one unsigned link in that chain, and
+      # swapping it swaps what "verified" means.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: "bc3-miner-*.zip,bc3-miner-*.tar.gz"
+          subject-path: "bc3-miner-*.zip,bc3-miner-*.tar.gz,SHA256SUMS"
 
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          v="${{ github.event.inputs.version }}"
+          v="$INPUT_VERSION"
           [ -n "$v" ] || v="${GITHUB_REF_NAME#v}"
           gh release create "v$v" --repo "$GITHUB_REPOSITORY" --draft \
             --title "v$v" --generate-notes \
             bc3-miner-*.zip bc3-miner-*.tar.gz SHA256SUMS
+
+  # Move :latest, once a human has published the draft.
+  #
+  # This is the only step that changes what an unpinned `docker run` or the
+  # compose file gets. Everything before it is reviewable in a draft; this
+  # follows the same human decision, so the tag can never run ahead of it.
+  #
+  # It re-tags the image that was already built and attested - no rebuild, so
+  # :latest and :1.2.0 are the same digest, and the attestation still applies.
+  promote:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Point :latest at this release's image
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/bc3-miner
+        run: |
+          v="${TAG_NAME#v}"
+          docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$v"
+          docker buildx imagetools inspect "$IMAGE:latest" | head -5

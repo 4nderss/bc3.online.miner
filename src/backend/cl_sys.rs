@@ -32,9 +32,14 @@ pub const CL_DEVICE_TYPE_GPU: cl_bitfield = 1 << 2;
 /// All device types - for tests only (pocl exposes a CPU device).
 pub const CL_DEVICE_TYPE_ALL: cl_bitfield = 0xFFFF_FFFF;
 pub const CL_DEVICE_NAME: cl_uint = 0x102B;
+pub const CL_DEVICE_VENDOR: cl_uint = 0x102C;
 pub const CL_MEM_READ_WRITE: cl_bitfield = 1 << 0;
 pub const CL_MEM_READ_ONLY: cl_bitfield = 1 << 2;
 pub const CL_PROGRAM_BUILD_LOG: cl_uint = 0x1183;
+/// Largest work-group size this device can run THIS kernel with. It is a
+/// per-kernel limit, not a device one: register pressure decides it, and
+/// keccak is register-heavy.
+pub const CL_KERNEL_WORK_GROUP_SIZE: cl_uint = 0x11B0;
 
 type FnGetPlatformIDs = unsafe extern "C" fn(cl_uint, *mut cl_handle, *mut cl_uint) -> cl_int;
 type FnGetDeviceIDs =
@@ -71,6 +76,8 @@ type FnBuildProgram = unsafe extern "C" fn(
 type FnGetProgramBuildInfo =
     unsafe extern "C" fn(cl_handle, cl_handle, cl_uint, usize, *mut c_void, *mut usize) -> cl_int;
 type FnCreateKernel = unsafe extern "C" fn(cl_handle, *const c_char, *mut cl_int) -> cl_handle;
+type FnGetKernelWorkGroupInfo =
+    unsafe extern "C" fn(cl_handle, cl_handle, cl_uint, usize, *mut c_void, *mut usize) -> cl_int;
 type FnCreateBuffer =
     unsafe extern "C" fn(cl_handle, cl_bitfield, usize, *mut c_void, *mut cl_int) -> cl_handle;
 type FnSetKernelArg = unsafe extern "C" fn(cl_handle, cl_uint, usize, *const c_void) -> cl_int;
@@ -112,6 +119,7 @@ pub struct Cl {
     pub build_program: FnBuildProgram,
     pub get_program_build_info: FnGetProgramBuildInfo,
     pub create_kernel: FnCreateKernel,
+    pub get_kernel_work_group_info: FnGetKernelWorkGroupInfo,
     pub create_buffer: FnCreateBuffer,
     pub set_kernel_arg: FnSetKernelArg,
     pub enqueue_write_buffer: FnEnqueueBuffer,
@@ -188,6 +196,7 @@ fn build(lib: Library) -> Result<Cl, String> {
             build_program: sym(&lib, b"clBuildProgram\0")?,
             get_program_build_info: sym(&lib, b"clGetProgramBuildInfo\0")?,
             create_kernel: sym(&lib, b"clCreateKernel\0")?,
+            get_kernel_work_group_info: sym(&lib, b"clGetKernelWorkGroupInfo\0")?,
             create_buffer: sym(&lib, b"clCreateBuffer\0")?,
             set_kernel_arg: sym(&lib, b"clSetKernelArg\0")?,
             enqueue_write_buffer: sym(&lib, b"clEnqueueWriteBuffer\0")?,
@@ -283,9 +292,11 @@ mod tests {
     fn constants_match_the_spec() {
         assert_eq!(CL_DEVICE_TYPE_GPU, 4);
         assert_eq!(CL_DEVICE_NAME, 0x102B);
+        assert_eq!(CL_DEVICE_VENDOR, 0x102C);
         assert_eq!(CL_MEM_READ_WRITE, 1);
         assert_eq!(CL_MEM_READ_ONLY, 4);
         assert_eq!(CL_PROGRAM_BUILD_LOG, 0x1183);
+        assert_eq!(CL_KERNEL_WORK_GROUP_SIZE, 0x11B0);
         assert_eq!(CL_SUCCESS, 0);
     }
 

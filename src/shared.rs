@@ -93,6 +93,38 @@ pub struct Stats {
     /// Shares dropped because the submit queue was full. Non-zero means the
     /// pool difficulty is too low for this hashrate - see `Shared::submit`.
     pub dropped_submits: AtomicU64,
+    /// GPU worker threads that are still able to hash. Counted so the
+    /// watchdog in main can tell "mining" from "connected but idle" - see
+    /// [`GpuWorkerAlive`].
+    pub gpu_workers_alive: AtomicU32,
+}
+
+/// Holds one live GPU worker in the count for as long as the worker can hash.
+///
+/// A GPU worker can stop for reasons that leave the process perfectly
+/// healthy: the driver refused the kernel, the card fell off the bus, a TDR
+/// killed the context. When that happened the miner stayed connected to the
+/// pool, kept saying "Mining" in the GUI, and hashed nothing - which on a
+/// rented GPU host is billed at GPU prices, and at home just looks like bad
+/// luck. Drop runs on every exit path, panics included, so the count cannot
+/// drift.
+///
+/// The workers are counted UP by main before the threads start, never here:
+/// a thread that has not been scheduled yet must not look the same as one
+/// that has died.
+pub struct GpuWorkerAlive(std::sync::Arc<Shared>);
+
+impl GpuWorkerAlive {
+    /// The caller must already be counted in `gpu_workers_alive`.
+    pub fn claim(shared: &std::sync::Arc<Shared>) -> Self {
+        Self(shared.clone())
+    }
+}
+
+impl Drop for GpuWorkerAlive {
+    fn drop(&mut self) {
+        self.0.stats.gpu_workers_alive.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 pub struct Shared {

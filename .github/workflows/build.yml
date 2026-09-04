@@ -14,6 +14,17 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+  # Without this a pull request got no check at all - a PR that changed only
+  # the committed PTX, the one file nobody can review by reading, ran nothing.
+  pull_request:
+    branches: [main]
+
+# Least privilege by default. Without a workflow-level block every job gets
+# whatever the repository default is, which for older repositories is
+# read/write on contents - far more than a build needs, inside the job that
+# produces the binaries people download.
+permissions:
+  contents: read
 
 # A newer push makes an in-flight build irrelevant. Cancel it rather than pay
 # for two Windows runners racing to tell us about different commits.
@@ -22,6 +33,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The committed PTX is the one file in the repository nobody can review by
+  # reading it - 39,000 lines of generated assembly. Without this job a pull
+  # request could change it alone, leaving the kernel source saying one thing
+  # and the binary doing another, and every human reviewer would see a diff
+  # they have no way to check.
+  #
+  # The toolkit version is pinned to 12.0 for the same reason build.rs caps the
+  # ISA version: it decides which drivers can load the result. See AGENTS.md.
+  ptx:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.0.1-devel-ubuntu22.04
+    steps:
+      # The image has no git, so actions/checkout silently falls back to the
+      # REST tarball. That works for a public repo today, but it breaks the
+      # moment anyone adds fetch-depth or a submodule - and it would break
+      # confusingly.
+      - name: git, which the CUDA image does not ship
+        run: apt-get update && apt-get install -y --no-install-recommends git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Regenerate the PTX from the kernel source
+        run: |
+          /usr/local/cuda/bin/nvcc --ptx -arch compute_52 -O3 -x cu \
+            src/kernels/sha3t.cl -o /tmp/sha3t.ptx
+      - name: It must match what is committed
+        run: |
+          # nvcc stamps its own version into a banner comment; that line is
+          # about the compiler, not the kernel, so it is not part of the check.
+          #
+          # POSIX sh, not bash: this job runs in a container, where the step
+          # shell is /bin/sh - dash on Ubuntu. Process substitution here was a
+          # syntax error, so the check exited 2 without ever comparing anything.
+          # A check that cannot fail for the right reason is worse than none.
+          grep -v '^//' src/kernels/sha3t.ptx > /tmp/committed.ptx
+          grep -v '^//' /tmp/sha3t.ptx > /tmp/regenerated.ptx
+          if ! diff -u /tmp/committed.ptx /tmp/regenerated.ptx; then
+            echo
+            echo "The committed PTX does not match src/kernels/sha3t.cl."
+            echo "Regenerate it with the command in AGENTS.md and commit the result."
+            exit 1
+          fi
+
   windows:
     runs-on: windows-latest
     steps:

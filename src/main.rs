@@ -64,7 +64,11 @@ struct Args {
     intensity: u32,
 
     /// Seconds between statistics lines.
-    #[arg(long, default_value_t = 5)]
+    ///
+    /// Bounded below at 1: 0 made the reporter `sleep(0)`, i.e. a tight loop
+    /// that spins a core and re-reads telemetry as fast as it can - which on
+    /// Windows meant starting a PowerShell process per iteration.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
     stats_interval: u64,
 
     /// Print machine-readable JSON lines on stdout instead of text (the GUI).
@@ -127,7 +131,36 @@ fn normalise_env() {
     }
 }
 
+/// Take the current directory and PATH out of the DLL search order.
+///
+/// Everything GPU-related is loaded by name at run time: `OpenCL.dll` by our
+/// own loader, and `nvcuda.dll` by cudarc - which first tries `cuda.dll`,
+/// `cuda64.dll`, `cuda64_12.dll` and a handful more that exist on no machine
+/// at all, so every start walks the whole search order looking for them. With
+/// the legacy order that walk includes the current directory and every PATH
+/// entry, and the CLI is typically unpacked and run straight from Downloads.
+/// A `cuda.dll` dropped there would be loaded and executed as the user.
+///
+/// `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` keeps the application directory and
+/// System32 - where the drivers install all three libraries - and drops the
+/// rest. Linux is unaffected: dlopen never searched the working directory.
+#[cfg(windows)]
+fn harden_dll_search_path() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetDefaultDllDirectories(directory_flags: u32) -> i32;
+    }
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    // Fails only on a Windows too old to have the flag; then the loader keeps
+    // the legacy order and there is nothing more we can do about it here.
+    unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) };
+}
+
+#[cfg(not(windows))]
+fn harden_dll_search_path() {}
+
 fn main() {
+    harden_dll_search_path();
     normalise_env();
     let args = Args::parse();
     ipc::set_json_mode(args.json);
@@ -241,6 +274,12 @@ fn main() {
             .spawn(move || worker::run_worker(s, i, total_workers))
             .expect("could not start a worker thread");
     }
+    // Counted here, before the threads start: a worker that has not been
+    // scheduled yet must not look the same to the watchdog as one that died.
+    shared
+        .stats
+        .gpu_workers_alive
+        .store(gpus.len() as u32, std::sync::atomic::Ordering::Relaxed);
     for (g, gpu) in gpus.into_iter().enumerate() {
         let s = shared.clone();
         std::thread::Builder::new()
@@ -252,6 +291,26 @@ fn main() {
         let s = shared.clone();
         let interval = args.stats_interval;
         std::thread::spawn(move || stats::run_reporter(s, interval));
+    }
+
+    // Watchdog: a GPU-only run where every GPU worker has stopped is not
+    // mining, however healthy the process looks. It stays connected to the
+    // pool, the GUI keeps saying "Mining", and the hashrate is zero - on a
+    // rented GPU host that is billed at GPU prices. Exit instead, so a restart
+    // policy or an alert has something to react to.
+    if threads == 0 && total_workers > 0 {
+        let s = shared.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if s.stats.gpu_workers_alive.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "bc3-miner: every GPU worker has stopped and no CPU threads are running - \n\
+                     nothing is being mined. Exiting with an error so this is noticed.\n\
+                     Common causes: a driver too old for the kernel, or a GPU that fell off the bus."
+                );
+                std::process::exit(1);
+            }
+        });
     }
 
     stratum::run_client(

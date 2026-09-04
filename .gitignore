@@ -6,6 +6,9 @@ target/
 /target-linux
 /target-msvc
 /target-gui
+# GPU-testerna byggs i CUDA-imagen (ubuntu 24.04), inte i rust:1-trixie -
+# glibc skiljer sig, så de behöver ett eget target.
+/target-cuda
 /test-build
 
 # Färdiga releasepaket — OBS: mönstret måste vara rotankrat, annars

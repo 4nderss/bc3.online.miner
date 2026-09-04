@@ -3,7 +3,7 @@
 //! the CPU per extranonce2 (cheap), and every GPU hit is verified on the CPU
 //! before submit.
 
-use crate::backend::{open_backend, GpuDevice, MiningBackend};
+use crate::backend::{open_backend_with_fallback, GpuDevice, MiningBackend};
 use crate::consensus::{
     compact_to_target, hash_meets_target, root_from_steps, sha256d, BlockHeader,
 };
@@ -32,13 +32,32 @@ const TARGET_LAUNCH: Duration = Duration::from_millis(100);
 
 /// `worker_index`/`total_workers` partition the extranonce2 space disjointly
 /// across all workers (CPU threads + GPUs), exactly as in worker.rs.
+/// How long to wait before trying to re-open a device that stopped answering.
+/// A driver reset (TDR) or a hung card usually clears in seconds.
+const REOPEN_DELAY: Duration = Duration::from_secs(5);
+
+/// How many times a device may be reopened before the worker gives up.
+///
+/// The reopen is only a cure for a context that died once. A card that keeps
+/// accepting new contexts and then failing every launch on them - a TDR loop, a
+/// wedged OpenCL runtime, an ECC fault - would otherwise cycle for ever: five
+/// failed launches, sleep, reopen, five more. The worker never exits, so the
+/// watchdog in main never sees the count reach zero, and the miner reports
+/// itself healthy while hashing nothing. That is the exact symptom the reopen
+/// was written to fix, just with a fresh handle each time round.
+const MAX_REOPENS: u32 = 5;
+
 pub fn run_gpu_worker(
     shared: Arc<Shared>,
     device: GpuDevice,
     worker_index: usize,
     total_workers: usize,
 ) {
-    let mut backend = match open_backend(&device) {
+    // Counted up by main before the thread started; this counts it back down
+    // on EVERY exit, so the watchdog there can tell that nothing is mining.
+    let _alive = crate::shared::GpuWorkerAlive::claim(&shared);
+
+    let mut backend = match open_backend_with_fallback(&device) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("[gpu] could not open {}: {e}", device.describe());
@@ -53,20 +72,68 @@ pub fn run_gpu_worker(
     let mut prev: Option<MinerJob> = None;
     let mut en2 = worker_index as u64;
     let mut nonce: u32 = 0;
+    let mut reopens: u32 = 0;
     loop {
         let (generation, job) = shared.wait_for_job();
         if prev.as_ref().is_none_or(|p| !p.same_search_space(&job)) {
             en2 = worker_index as u64;
             nonce = 0;
         }
-        mine_job(
+        let alive = mine_job(
             &shared, &job, generation, total_workers, &mut backend, &mut batch, &mut en2,
             &mut nonce,
         );
+        if !alive {
+            // The device stopped answering. Re-open it - after a driver reset
+            // the old context is dead for good, and every later launch on it
+            // fails the same way. The old loop slept and retried on that dead
+            // handle for ever: no hashrate, no exit, and nothing in the logs
+            // after the first few lines.
+            reopens += 1;
+            if reopens > MAX_REOPENS {
+                eprintln!(
+                    "[gpu] {} has failed {reopens} times after reopening - giving up on it. \
+                     The card or its driver needs attention.",
+                    device.describe()
+                );
+                return;
+            }
+            eprintln!(
+                "[gpu] {} stopped answering - reopening in {} s ({reopens}/{MAX_REOPENS})",
+                device.describe(),
+                REOPEN_DELAY.as_secs()
+            );
+            std::thread::sleep(REOPEN_DELAY);
+            match open_backend_with_fallback(&device) {
+                Ok(b) => {
+                    backend = b;
+                    crate::human!("[gpu] reopened: {}", backend.name());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[gpu] {} could not be reopened: {e} - this worker stops",
+                        device.describe()
+                    );
+                    return;
+                }
+            }
+            // A new context means a new search space position is fine, and the
+            // job may well have moved on while we waited.
+            prev = None;
+            continue;
+        }
+        // `mine_job` returning true means at least one scan came back, so the
+        // card is working again and the budget above is spent, not consumed.
+        reopens = 0;
         prev = Some(job);
     }
 }
 
+/// How many launches in a row may fail before the device counts as gone.
+const MAX_SCAN_ERRORS: u32 = 5;
+
+/// Grind until the job changes. `false` = the device stopped answering and the
+/// caller must re-open it; `true` = ordinary job change.
 #[allow(clippy::too_many_arguments)]
 fn mine_job(
     shared: &Shared,
@@ -77,7 +144,7 @@ fn mine_job(
     batch: &mut u32,
     en2_counter: &mut u64,
     nonce_start: &mut u32,
-) {
+) -> bool {
     let block_target = compact_to_target(job.bits);
     // Starting point comes from the caller so it can survive a job that
     // covers the same space.
@@ -119,9 +186,12 @@ fn mine_job(
                 Err(e) => {
                     errors += 1;
                     eprintln!("[gpu] {}: scan error: {e}", backend.name());
-                    if errors >= 5 {
-                        eprintln!("[gpu] {}: giving up after {errors} errors", backend.name());
-                        std::thread::sleep(Duration::from_secs(30));
+                    if errors >= MAX_SCAN_ERRORS {
+                        eprintln!(
+                            "[gpu] {}: {errors} launches in a row failed - treating the device as gone",
+                            backend.name()
+                        );
+                        return false;
                     }
                     std::thread::sleep(Duration::from_secs(1));
                     continue;
@@ -187,7 +257,7 @@ fn mine_job(
                 );
                 *en2_counter = e;
                 *nonce_start = n;
-                return;
+                return true;
             }
             if wrapped {
                 break; // nonce space exhausted for this extranonce2
