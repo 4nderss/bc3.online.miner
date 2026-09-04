@@ -1,6 +1,6 @@
 [package]
 name = "bc3-miner-gui"
-version = "1.2.5"
+version = "1.2.6"
 edition = "2021"
 license = "MIT"
 description = "bc3.online miner - desktop GUI"
