@@ -53,6 +53,10 @@ pub enum Event {
         /// client is in sync with the pool and mining on the right block.
         /// 0 = no job yet.
         job_height: u32,
+        /// Latest round trip of a request to the pool in milliseconds - a
+        /// share submit, or the handshake before the first share. `null`
+        /// until the pool has answered anything.
+        pool_rtt_ms: Option<f64>,
         /// Temperature/power where the platform exposes it (else null).
         #[serde(flatten)]
         telemetry: crate::telemetry::Reading,
@@ -127,6 +131,7 @@ mod tests {
             eta_secs: None,
             network_difficulty: 42.0,
             job_height: 59_342,
+            pool_rtt_ms: Some(34.5),
             telemetry: crate::telemetry::Reading {
                 gpu_temp_c: Some(64),
                 ..Default::default()
@@ -135,6 +140,7 @@ mod tests {
         .unwrap();
         assert!(s.starts_with(r#"{"type":"stats","hashrate":1.5"#));
         assert!(s.contains(r#""eta_secs":null"#));
+        assert!(s.contains(r#""pool_rtt_ms":34.5"#));
         // The telemetry is flattened into the same object.
         assert!(s.contains(r#""gpu_temp_c":64"#));
         assert!(s.contains(r#""cpu_temp_c":null"#));

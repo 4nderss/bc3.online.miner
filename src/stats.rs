@@ -37,6 +37,7 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
             .then(|| network_difficulty * 4_294_967_296.0 / rate);
 
         let temps = telemetry.read(0);
+        let pool_rtt_ms = shared.pool_rtt_ms();
         crate::ipc::emit(&crate::ipc::Event::Stats {
             hashrate: rate,
             hashrate_gpu: gpu_rate,
@@ -48,6 +49,7 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
             eta_secs,
             network_difficulty,
             job_height: shared.stats.job_height.load(Ordering::Relaxed),
+            pool_rtt_ms,
             telemetry: temps,
         });
         let temp_text = match (temps.gpu_temp_c, temps.cpu_temp_c) {
@@ -59,12 +61,22 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
         let best = shared.best_share();
         let blocks = shared.stats.blocks.load(Ordering::Relaxed);
         crate::human!(
-            "[miner] {} | shares {accepted} ok, {rejected} rejected | best {:.3} | blocks {blocks} | est. block: {}{}",
+            "[miner] {} | shares {accepted} ok, {rejected} rejected | {} | best {:.3} | blocks {blocks} | est. block: {}{}",
             format_hashrate(rate),
+            format_pool_rtt(pool_rtt_ms),
             best,
             eta_secs.map(format_duration).unwrap_or_else(|| "unknown".into()),
             temp_text
         );
+    }
+}
+
+/// "pool 34 ms": the latest round trip to the pool, "pool -" before one.
+pub fn format_pool_rtt(ms: Option<f64>) -> String {
+    match ms {
+        Some(ms) if ms >= 10.0 => format!("pool {ms:.0} ms"),
+        Some(ms) => format!("pool {ms:.1} ms"),
+        None => "pool -".into(),
     }
 }
 
@@ -118,6 +130,9 @@ mod tests {
         for r in [0.0, 1.0, 1.5e3, 1.5e6, 1.5e9, 1.5e12] {
             samples.push(format_hashrate(r));
         }
+        for ms in [None, Some(0.4), Some(34.4), Some(1234.5)] {
+            samples.push(format_pool_rtt(ms));
+        }
         for s in samples {
             assert!(s.is_ascii(), "non-ASCII in log output: {s:?}");
         }
@@ -133,5 +148,8 @@ mod tests {
         assert_eq!(format_duration(45.0), "45s");
         assert_eq!(format_duration(3900.0), "1h 5m");
         assert_eq!(format_duration(200_000.0), "2d 7h");
+        assert_eq!(format_pool_rtt(None), "pool -");
+        assert_eq!(format_pool_rtt(Some(2.34)), "pool 2.3 ms");
+        assert_eq!(format_pool_rtt(Some(34.4)), "pool 34 ms");
     }
 }

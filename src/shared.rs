@@ -97,6 +97,9 @@ pub struct Stats {
     /// watchdog in main can tell "mining" from "connected but idle" - see
     /// [`GpuWorkerAlive`].
     pub gpu_workers_alive: AtomicU32,
+    /// Latest round trip of a request to the pool, in microseconds. 0 until
+    /// the pool has answered something - see `Shared::record_pool_rtt`.
+    pub pool_rtt_us: AtomicU64,
 }
 
 /// Holds one live GPU worker in the count for as long as the worker can hash.
@@ -176,6 +179,23 @@ impl Shared {
 
     pub fn best_share(&self) -> f64 {
         f64::from_bits(self.stats.best_share_bits.load(Ordering::Relaxed))
+    }
+
+    /// The pool answered a request `rtt` after it was sent. Only the latest
+    /// value is kept: it is a "ping", not a statistic, and the next share
+    /// replaces it within seconds anyway.
+    pub fn record_pool_rtt(&self, rtt: std::time::Duration) {
+        // Floored at 1 us so a measured round trip can never read as "none".
+        let us = rtt.as_micros().clamp(1, u64::MAX as u128) as u64;
+        self.stats.pool_rtt_us.store(us, Ordering::Relaxed);
+    }
+
+    /// Latest pool round trip in milliseconds; None before the first answer.
+    pub fn pool_rtt_ms(&self) -> Option<f64> {
+        match self.stats.pool_rtt_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(us as f64 / 1000.0),
+        }
     }
 
     pub fn set_intensity(&self, percent: u32) {

@@ -40,10 +40,14 @@ let hw = "gpu";       // hardware: gpu | cpu | dual
 const spark = [];
 
 // ---------- Formatting ----------
+const num1 = new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+// MH/s with one decimal from 1 MH/s up, never GH/s: "1 698,4 MH/s" rather
+// than "1,70 GH/s". The rounding to two decimals of a GH hid the last
+// percent or two, which is exactly the range people tune in.
 function fmtHashrate(h) {
   if (!isFinite(h) || h <= 0) return "0 H/s";
-  const units = [["TH/s", 1e12], ["GH/s", 1e9], ["MH/s", 1e6], ["kH/s", 1e3]];
-  for (const [u, f] of units) if (h >= f) return num2.format(h / f) + " " + u;
+  if (h >= 1e6) return num1.format(h / 1e6) + " MH/s";
+  if (h >= 1e3) return num2.format(h / 1e3) + " kH/s";
   return numInt.format(Math.round(h)) + " H/s";
 }
 function fmtDuration(s) {
@@ -317,6 +321,11 @@ listen("miner-event", ({ payload: ev }) => {
       }
       setStat("accepted", numInt.format(ev.accepted));
       setStat("rejected", numInt.format(ev.rejected));
+      // The pool's answer time: the last submit, or the handshake before
+      // the first share. Absent until the pool has answered anything.
+      setStat("shares-sub", ev.pool_rtt_ms != null
+        ? `accepted / rejected · pool ${numInt.format(Math.round(ev.pool_rtt_ms))} ms`
+        : "accepted / rejected");
       setStat("eta", ev.eta_secs ? fmtDuration(ev.eta_secs) : "—");
       setStat("best-share", ev.best_share > 0 ? fmtDiff(ev.best_share) : "—");
       setStat("blocks", numInt.format(ev.blocks || 0));

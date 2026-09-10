@@ -43,7 +43,7 @@
       <input id="address" type="text" spellcheck="false" autocomplete="off"
              placeholder="bc1…" aria-describedby="address-error">
       <span class="error" id="address-error"></span>
-      <span class="hint">Solo rewards are paid directly to this address in the block you find.</span>
+      <span class="hint">All rewards are paid directly to this address.</span>
     </label>
 
     <label class="field">
@@ -103,7 +103,7 @@
     <div class="card stat">
       <span class="stat-title">Shares</span>
       <span class="stat-value"><span id="accepted" class="ok">0</span> <span class="sep">/</span> <span id="rejected" class="bad">0</span></span>
-      <span class="stat-sub">accepted / rejected</span>
+      <span class="stat-sub" id="shares-sub">accepted / rejected</span>
     </div>
     <div class="card stat">
       <span class="stat-title">Best share</span>

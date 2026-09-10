@@ -75,6 +75,45 @@ pub struct StratumConfig {
     pub user: String,
 }
 
+/// Requests the pool has not answered yet, so that its answer can be timed.
+///
+/// The round trip of a share submit is the one latency a miner operator
+/// cares about - it is the time a share is exposed to going stale - so that
+/// is what the "pool" figure in the stats shows. Subscribe and authorize are
+/// timed too, so the figure is there from the first second rather than after
+/// the first share. Requests the pool never answers are forgotten after a
+/// while; a pool that silently drops submits must not grow this for ever.
+struct Outstanding {
+    sent: std::collections::VecDeque<(u64, Instant)>,
+}
+
+const OUTSTANDING_MAX_AGE: Duration = Duration::from_secs(120);
+
+impl Outstanding {
+    fn new() -> Self {
+        Self { sent: std::collections::VecDeque::new() }
+    }
+
+    fn sent(&mut self, id: u64, now: Instant) {
+        while let Some((_, t)) = self.sent.front() {
+            if now.duration_since(*t) > OUTSTANDING_MAX_AGE {
+                self.sent.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.sent.push_back((id, now));
+    }
+
+    /// The round trip for `id`, or None if it was never sent (or already
+    /// answered, or forgotten).
+    fn answered(&mut self, id: u64, now: Instant) -> Option<Duration> {
+        let pos = self.sent.iter().position(|(i, _)| *i == id)?;
+        let (_, t) = self.sent.remove(pos)?;
+        Some(now.duration_since(t))
+    }
+}
+
 pub fn run_client(shared: Arc<Shared>, submit_rx: Receiver<FoundShare>, cfg: StratumConfig) {
     let mut backoff = 1u64;
     loop {
@@ -125,10 +164,13 @@ fn session(
     let send = |w: &mut TcpStream, v: Value| -> std::io::Result<()> {
         w.write_all((v.to_string() + "\n").as_bytes())
     };
+    let mut outstanding = Outstanding::new();
     send(&mut writer, json!({"id": 1, "method": "mining.subscribe",
         "params": [format!("bc3-miner/{}", env!("CARGO_PKG_VERSION"))]}))?;
+    outstanding.sent(1, Instant::now());
     send(&mut writer, json!({"id": 2, "method": "mining.authorize",
         "params": [cfg.user, "x"]}))?;
+    outstanding.sent(2, Instant::now());
 
     let mut extranonce1: Vec<u8> = vec![];
     let mut extranonce2_size = 4usize;
@@ -151,6 +193,7 @@ fn session(
                 cfg.user, share.job_id, hex::encode(&share.extranonce2),
                 format!("{:08x}", share.ntime), format!("{:08x}", share.nonce),
             ]}))?;
+            outstanding.sent(next_submit_id, Instant::now());
             next_submit_id += 1;
         }
 
@@ -177,6 +220,14 @@ fn session(
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+
+        // Any answer to something we sent is a round-trip measurement,
+        // whatever it says.
+        if let Some(id) = msg["id"].as_u64() {
+            if let Some(rtt) = outstanding.answered(id, Instant::now()) {
+                shared.record_pool_rtt(rtt);
+            }
+        }
 
         if msg["id"] == json!(1) {
             let r = &msg["result"];
@@ -365,6 +416,39 @@ mod tests {
     }
 
     /// A closed socket is an error, not an endless stream of empty lines.
+    /// A reply is timed against the request it answers, once.
+    #[test]
+    fn an_answer_yields_its_round_trip() {
+        let t0 = Instant::now();
+        let mut o = Outstanding::new();
+        o.sent(100, t0);
+        o.sent(101, t0 + Duration::from_millis(10));
+        assert_eq!(o.answered(7, t0 + Duration::from_millis(20)), None, "never sent");
+        assert_eq!(
+            o.answered(101, t0 + Duration::from_millis(45)),
+            Some(Duration::from_millis(35))
+        );
+        assert_eq!(o.answered(101, t0 + Duration::from_millis(50)), None, "already answered");
+        assert_eq!(
+            o.answered(100, t0 + Duration::from_millis(60)),
+            Some(Duration::from_millis(60))
+        );
+    }
+
+    /// A pool that never answers must not make the list grow without bound.
+    #[test]
+    fn unanswered_requests_are_forgotten() {
+        let t0 = Instant::now();
+        let mut o = Outstanding::new();
+        for id in 0..1000u64 {
+            o.sent(id, t0);
+        }
+        o.sent(1000, t0 + OUTSTANDING_MAX_AGE + Duration::from_secs(1));
+        assert_eq!(o.sent.len(), 1, "the stale ones are gone");
+        assert_eq!(o.answered(5, t0 + OUTSTANDING_MAX_AGE + Duration::from_secs(2)), None);
+        assert!(o.answered(1000, t0 + OUTSTANDING_MAX_AGE + Duration::from_secs(2)).is_some());
+    }
+
     #[test]
     fn eof_ends_the_session() {
         let mut r = Chunks(vec![]);
