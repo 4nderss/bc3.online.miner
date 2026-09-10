@@ -164,7 +164,8 @@ numbering is the one `--gpu-id` means.
 ## Architecture
 
 - SHA3-256t = three sequential rounds of NIST SHA3-256 over the 80-byte block header. The header fits in a single SHA3-256 rate block, so each hash is exactly 3 keccak-f[1600] permutations.
-- One shared kernel source (`src/kernels/sha3t.cl`) is compiled both to CUDA PTX (at build time) and by the OpenCL runtime. The keccak core is the same code for both; the two backends differ only in how the three-input XOR is expressed and in whether the rounds are unrolled, both isolated in macros at the top of the file. Both are verified bit-exact against the same reference.
+- One shared kernel source (`src/kernels/sha3t.cl`) is compiled both to CUDA PTX (at build time) and by the OpenCL runtime. The keccak core is the same code for both; the two backends differ only in the intrinsics for the three-input XOR, the 32-bit rotate and the leading-zero count, and in whether the rounds are unrolled, all isolated in macros at the top of the file. Both are verified bit-exact against the same reference.
+- The kernel keeps every 64-bit keccak lane **bit-interleaved**: one 32-bit word of the even bits and one of the odd bits. The host does the interleaving of the header and the target (`backend::kernel_lanes`, `backend::kernel_target`), the kernel interleaves the nonce, and only the most significant limb of the final hash leaves the GPU. See the note at the top of the kernel source for why.
 - The CPU builds coinbase/merkle root per extranonce2; the GPU grinds the 2³² nonce space in auto-tuned batches (~100 ms per launch). Every GPU hit is re-verified on the CPU against the consensus reference before submission.
 - **The CUDA kernel is precompiled to PTX at build time** (see `build.rs`) and embedded in the binary. NVRTC ships with the CUDA *Toolkit*, not with the graphics driver, so runtime compilation would fail on end-user machines. The driver JITs the embedded PTX for whatever card is installed — the binary only needs `nvcuda.dll`.
 - **The PTX is built with the CUDA 12.0 toolkit, and `build.rs` refuses anything newer.** A driver can only JIT the PTX ISA versions it knows: the embedded kernel declares ISA 8.0, which needs driver **R525 or newer**. Building it with a newer toolkit raises that requirement — ISA 8.8 from CUDA 12.9 needs R575 — and on an older driver `cuModuleLoadData` fails, the card is found but no backend opens, and the miner hashes nothing while looking connected. That shipped once; the version check in `build.rs` is there so it cannot ship again. If the CUDA load fails anyway, the miner now falls back to the same card through OpenCL, and exits with an error if no GPU worker survives and no CPU threads are running.
@@ -174,31 +175,51 @@ numbering is the one `--gpu-id` means.
 
 | Device | Backend | Hashrate | How measured |
 |--------|---------|----------|--------------|
-| NVIDIA RTX 4090 | CUDA | ~1.60 GH/s | in the miner, sustained |
-| NVIDIA RTX 3050 Ti Laptop GPU | CUDA | ~163 MH/s | kernel benchmark |
+| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, interleaved kernel (1.3.0) | ~165 MH/s | kernel benchmark, alternated A/B against the 1.2.x kernel: +4.6 % |
+| NVIDIA RTX 4090 | CUDA, 1.2.x kernel | ~1.60 GH/s | in the miner, sustained |
+| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, 1.2.x kernel | ~158 MH/s | kernel benchmark |
 | NVIDIA RTX 3050 Ti Laptop GPU + Intel Iris Xe | OpenCL, both devices | ~140–142 MH/s | in the miner, before the kernel work below |
 
-The kernel is ALU-bound and close to the hardware ceiling. SHA3-256t is three
-full keccak-f[1600] permutations per nonce, and a GPU emulates its 64-bit
+The kernel is ALU-bound and at the hardware ceiling. SHA3-256t is three full
+keccak-f[1600] permutations per nonce, and a GPU emulates its 64-bit
 arithmetic with 32-bit ops, so throughput is set by how many integer
-instructions the SM can issue - not by memory, occupancy or batch size.
+instructions the SM can issue - not by memory, occupancy or batch size. On the
+3050 Ti the measured rate is within 0.1 % of 64 ALU instructions per clock per
+SM at the clock sampled under load; the card is power-capped there, so cooling
+and power limits move the hashrate more than anything else on the machine.
 
-One keccak round compiles to 185 SASS instructions on sm_89: 122 `LOP3` and 58
-`SHF`, plus loop overhead. That is the floor for this formulation, and every
-instruction is accounted for - 70 three-input XORs, 50 chi, 2 iota, 29 rotations
-at two funnel shifts each. Three things get it there:
+One keccak round compiles to ~168 SASS instructions on sm_86: 117 `LOP3` and
+50 `SHF`. Every instruction is accounted for - 20 column parities, 50 theta,
+50 chi, one or two iota and 47 rotates - and that is the floor for a machine
+whose primitives are a three-input logic op and a funnel shift. Three things
+get it there:
 
+- **Bit-interleaved lanes.** Each 64-bit lane is one word of even bits and one
+  of odd bits. A rotate by 2k is then two independent 32-bit rotates, and a
+  rotate by 1 is a single one - the other word is a register rename. Keccak
+  rotates by 1 six times per round (five in theta, one in rho); the word-split
+  kernel this replaced spent two funnel shifts on each. Measured on the 3050
+  Ti with the two kernels alternated in one process: 165.5 vs 158.2 MH/s,
+  12 160 vs 12 592 SASS per hash, the same 64 registers.
 - **Theta as three-input XOR.** Ampere and Ada compute an arbitrary function of
   three inputs in one `LOP3`. Writing theta's column sums and application that
   way, instead of chains of two-input XORs, folds `C[x-1]` and `ROTL(C[x+1],1)`
-  into the same instruction and drops 14 instructions per round.
+  into the same instruction.
 - **Full unroll of the 24 rounds** (CUDA only). Removes the per-round overhead
-  and lets ptxas fit the kernel in 64 registers instead of 80, lifting occupancy
-  from 25 to 32 warps per SM. Partial unrolling is *worse* than none.
-- **Batches large enough to matter.** Nonces per launch are auto-tuned toward
-  ~100 ms of work. On a 4090 a launch that is too small pays full
-  synchronisation overhead against very little work, which shows up directly as
-  lost GPU utilisation.
+  and lets ptxas fit the kernel in 64 registers, which is 32 warps per SM.
+  Partial unrolling is *worse* than none.
+
+Batches are auto-tuned toward ~100 ms of work per launch; on a 4090 a launch
+that is too small pays full synchronisation overhead against very little work,
+which shows up directly as lost GPU utilisation.
+
+Measured and rejected, so nobody has to measure them again: moving the
+rotates to the multiplier pipe (`IMAD.HI` and `IMAD.WIDE` are half rate on
+Ampere and Ada, and five variants came out 22-33 % slower), two nonces per
+thread with the chains interleaved, `__launch_bounds__`, block sizes from 128
+to 1024, and pruning the last round by hand (ptxas already does it; 40
+instructions of 12 000). The compiled kernel from `nvcc` 12.0, `nvcc` 12.4 and
+the driver's own JIT are the same to within a handful of instructions.
 
 OpenCL on the same NVIDIA card performs on par with CUDA. Adding the integrated
 Iris Xe on top gained nothing measurable on this laptop: the discrete and

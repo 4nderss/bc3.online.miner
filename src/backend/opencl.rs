@@ -10,7 +10,7 @@ use super::cl_sys::{
     CL_DEVICE_TYPE_GPU, CL_DEVICE_VENDOR, CL_KERNEL_WORK_GROUP_SIZE, CL_MEM_READ_ONLY,
     CL_MEM_READ_WRITE, CL_PROGRAM_BUILD_LOG, CL_SUCCESS, CL_TRUE,
 };
-use super::{header_lanes, target_limbs, HitBudget, MiningBackend, KERNEL_SOURCE, MAX_HITS};
+use super::{kernel_lanes, kernel_target, HitBudget, MiningBackend, KERNEL_SOURCE, MAX_HITS};
 use crate::consensus::Target;
 use std::ffi::c_void;
 use std::ptr;
@@ -335,8 +335,8 @@ impl MiningBackend for OpenClBackend {
             return Ok(vec![]);
         }
         let cl = cl()?;
-        let lanes = header_lanes(header76);
-        let t = target_limbs(target);
+        let lanes = kernel_lanes(header76);
+        let t3 = kernel_target(target);
 
         // The header does not change across the chunks below, so it is written
         // once rather than per launch.
@@ -364,7 +364,7 @@ impl MiningBackend for OpenClBackend {
         while done < count {
             let chunk = self.budget.chunk(count - done);
             let (mut hits, reported) =
-                self.scan_chunk(&t, start_nonce.wrapping_add(done), chunk)?;
+                self.scan_chunk(t3, start_nonce.wrapping_add(done), chunk)?;
             out.append(&mut hits);
             done += chunk;
             if let Some(warning) = self.budget.overflowed(chunk, reported) {
@@ -381,7 +381,7 @@ impl OpenClBackend {
     /// needs in order to notice that hits were lost.
     fn scan_chunk(
         &self,
-        t: &[u64; 4],
+        t3: u64,
         start_nonce: u32,
         count: u32,
     ) -> Result<(Vec<u32>, usize), String> {
@@ -412,11 +412,9 @@ impl OpenClBackend {
             set(0, hsz, &self.d_lanes as *const _ as *const c_void)?;
             set(1, 4, &start_nonce as *const _ as *const c_void)?;
             set(2, 4, &count as *const _ as *const c_void)?;
-            for (k, limb) in t.iter().enumerate() {
-                set(3 + k as cl_uint, 8, limb as *const _ as *const c_void)?;
-            }
-            set(7, hsz, &self.d_hits as *const _ as *const c_void)?;
-            set(8, 4, &max_hits as *const _ as *const c_void)?;
+            set(3, 8, &t3 as *const _ as *const c_void)?;
+            set(4, hsz, &self.d_hits as *const _ as *const c_void)?;
+            set(5, 4, &max_hits as *const _ as *const c_void)?;
 
             // Global rounds up to a multiple of local; the kernel guards count.
             let local = self.local_size;

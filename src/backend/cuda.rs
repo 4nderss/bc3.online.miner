@@ -8,7 +8,7 @@
 //! starts even with no NVIDIA driver at all (detection then returns an empty
 //! list).
 
-use super::{header_lanes, target_limbs, MiningBackend, MAX_HITS};
+use super::{kernel_lanes, kernel_target, MiningBackend, MAX_HITS};
 use crate::consensus::Target;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
@@ -103,8 +103,8 @@ impl MiningBackend for CudaBackend {
         if count == 0 {
             return Ok(vec![]);
         }
-        let lanes = header_lanes(header76);
-        let t = target_limbs(target);
+        let lanes = kernel_lanes(header76);
+        let t3 = kernel_target(target);
 
         self.stream
             .memcpy_htod(&lanes, &mut self.d_lanes)
@@ -124,10 +124,7 @@ impl MiningBackend for CudaBackend {
             .arg(&self.d_lanes)
             .arg(&start_nonce)
             .arg(&count)
-            .arg(&t[0])
-            .arg(&t[1])
-            .arg(&t[2])
-            .arg(&t[3])
+            .arg(&t3)
             .arg(&mut self.d_hits)
             .arg(&max_hits);
         unsafe {

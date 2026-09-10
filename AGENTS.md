@@ -69,7 +69,11 @@ be compiled ahead of time and embedded.
 change there is a consensus change. The workflow that catches mistakes:
 
 1. Edit `sha3t.cl`. Backend-specific differences belong in the macro block at
-   the top of the file, not scattered through the round function.
+   the top of the file, not scattered through the round function. The lanes
+   are bit-interleaved (see the note at the top of the kernel); the host side
+   of that contract is `kernel_lanes` and `kernel_target` in
+   `src/backend/mod.rs`, and the Rust mirror of the kernel in the tests there
+   (`il_round` and friends) must follow every change to the kernel's math.
 2. Regenerate the PTX with `nvcc --ptx -arch compute_52 -O3 -x cu`, **using the
    CUDA 12.0 toolkit**. The toolkit version decides the PTX ISA version, and a
    driver can only JIT the versions it knows: ISA 8.0 needs driver R525, ISA
@@ -93,8 +97,12 @@ change there is a consensus change. The workflow that catches mistakes:
 
 The kernel is **ALU-bound and at the instruction-issue ceiling**. Occupancy,
 batch size and memory access are not the lever - instruction count is. One
-keccak round is 185 SASS instructions on sm_89, and every one is accounted for
-in the README. Before optimising, count; do not guess.
+keccak round is ~168 SASS instructions on sm_86 (117 `LOP3`, 50 `SHF`), and
+every one is accounted for in the README, which also lists what has been
+measured NOT to help - the multiplier pipe, two nonces per thread, launch
+bounds, block sizes, hand-pruning the last round. Before optimising, count;
+do not guess. And measure with the kernels alternated in one process: on a
+laptop the clock drifts more with heat than most changes are worth.
 
 Register spills are catastrophic here, not merely slow: dynamic indexing of the
 state array pushes it to local memory and costs roughly 100x. If `ptxas -v`
