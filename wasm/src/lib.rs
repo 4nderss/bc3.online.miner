@@ -14,7 +14,84 @@
 #[path = "../../src/consensus.rs"]
 mod consensus;
 
-use consensus::{hash_meets_target, sha3t, Target};
+use consensus::{hash_meets_target, sha3t, PowAlgo, PowSchedule, Target};
+
+/// PoW algorithms as the numbers JS passes across the wasm boundary. Part of
+/// the ABI: a number, once given out, keeps its meaning.
+fn algo_id(algo: PowAlgo) -> i32 {
+    match algo {
+        PowAlgo::Sha256d => 0,
+        PowAlgo::Sha3t => 1,
+        // NEW POW: give the new variant the next free number.
+    }
+}
+
+fn algo_from_id(id: u32) -> Option<PowAlgo> {
+    [PowAlgo::Sha256d, PowAlgo::Sha3t]
+        .into_iter()
+        .find(|a| algo_id(*a) == id as i32)
+}
+
+/// The PoW to mine a job with, from its coinb1 (BIP34 height) and version -
+/// the same decision the CLI makes at notify time. `next_pow_height` < 0
+/// means no fork scheduled (an f64, like `search`'s result, to keep BigInt
+/// out of JS).
+///
+/// Returns the algorithm id for `search_algo`, or -1 for a PoW this module
+/// does not implement: the page must stop hashing and tell the user, not
+/// grind the old PoW into rejected shares.
+///
+/// # Safety
+/// `coinb1_ptr` must point at `coinb1_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn job_pow_algo(
+    coinb1_ptr: *const u8,
+    coinb1_len: usize,
+    version: u32,
+    next_pow_height: f64,
+) -> i32 {
+    if coinb1_ptr.is_null() {
+        return -1;
+    }
+    let coinb1 = core::slice::from_raw_parts(coinb1_ptr, coinb1_len);
+    let schedule = PowSchedule {
+        next_pow_height: (next_pow_height >= 0.0).then_some(next_pow_height as u32),
+    };
+    match schedule.algo_for_job(consensus::bip34_height(coinb1), version) {
+        Some(algo) => algo_id(algo),
+        None => -1,
+    }
+}
+
+/// The search loop, generic over the hash so each algorithm gets its own
+/// monomorphized loop - no dispatch per nonce.
+fn search_with(
+    pow: impl Fn(&[u8; 80]) -> [u8; 32],
+    mut header: [u8; 80],
+    target: &Target,
+    nonce_start: u32,
+    nonce_count: u32,
+) -> f64 {
+    for i in 0..nonce_count {
+        // wrapping: the nonce space is circular, and a worker that gets a
+        // range close to u32::MAX must not panic.
+        let nonce = nonce_start.wrapping_add(i);
+        header[76..80].copy_from_slice(&nonce.to_le_bytes());
+        if hash_meets_target(&pow(&header), target) {
+            return nonce as f64;
+        }
+    }
+    -1.0
+}
+
+/// Copy the 80-byte header and 32-byte target out of wasm memory.
+unsafe fn read_header_target(header_ptr: *const u8, target_ptr: *const u8) -> ([u8; 80], Target) {
+    let mut header = [0u8; 80];
+    core::ptr::copy_nonoverlapping(header_ptr, header.as_mut_ptr(), 80);
+    let mut target: Target = [0u8; 32];
+    core::ptr::copy_nonoverlapping(target_ptr, target.as_mut_ptr(), 32);
+    (header, target)
+}
 
 /// Wasm has no allocator that JS can reach directly. These two exports let
 /// JS reserve memory for the header and the target.
@@ -38,7 +115,10 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Search a nonce range for a hash that meets the target.
+/// Search a nonce range for a SHA3-256t hash that meets the target.
+///
+/// The original export, kept with its signature for the deployed page; new
+/// code calls `search_algo` with the id from `job_pow_algo`.
 ///
 /// `header_ptr` points at 80 bytes of serialized block header; the nonce at
 /// offset 76 is overwritten for every attempt. `target_ptr` points at 32
@@ -57,28 +137,40 @@ pub unsafe extern "C" fn search(
     nonce_start: u32,
     nonce_count: u32,
 ) -> f64 {
+    search_algo(algo_id(PowAlgo::Sha3t) as u32, header_ptr, target_ptr, nonce_start, nonce_count)
+}
+
+/// `search` for the algorithm `algo` (an id from `job_pow_algo`). Returns
+/// `-2.0` for an id this module does not know, so a page newer than its wasm
+/// cannot mistake "cannot hash this" for "found nothing".
+///
+/// # Safety
+/// The buffers must be 80 and 32 bytes respectively and come from `alloc`.
+#[no_mangle]
+pub unsafe extern "C" fn search_algo(
+    algo: u32,
+    header_ptr: *const u8,
+    target_ptr: *const u8,
+    nonce_start: u32,
+    nonce_count: u32,
+) -> f64 {
     if header_ptr.is_null() || target_ptr.is_null() {
         return -1.0;
     }
+    let Some(algo) = algo_from_id(algo) else {
+        return -2.0;
+    };
     // Copy the header onto the stack: writing the nonce through a raw
     // pointer in the loop blocks optimizations and forces one read per
     // iteration.
-    let mut header = [0u8; 80];
-    core::ptr::copy_nonoverlapping(header_ptr, header.as_mut_ptr(), 80);
-    let mut target: Target = [0u8; 32];
-    core::ptr::copy_nonoverlapping(target_ptr, target.as_mut_ptr(), 32);
-
-    for i in 0..nonce_count {
-        // wrapping: the nonce space is circular, and a worker that gets a
-        // range close to u32::MAX must not panic.
-        let nonce = nonce_start.wrapping_add(i);
-        header[76..80].copy_from_slice(&nonce.to_le_bytes());
-        let hash = sha3t(&header);
-        if hash_meets_target(&hash, &target) {
-            return nonce as f64;
+    let (header, target) = read_header_target(header_ptr, target_ptr);
+    match algo {
+        PowAlgo::Sha256d => {
+            search_with(|h| consensus::sha256d(h), header, &target, nonce_start, nonce_count)
         }
+        PowAlgo::Sha3t => search_with(|h| sha3t(h), header, &target, nonce_start, nonce_count),
+        // NEW POW: one more arm with its hash.
     }
-    -1.0
 }
 
 /// Hash a header once and write the result to `out_ptr` (32 bytes). Used by
@@ -89,13 +181,28 @@ pub unsafe extern "C" fn search(
 /// `header_ptr` must point at 80 bytes, `out_ptr` at at least 32.
 #[no_mangle]
 pub unsafe extern "C" fn hash_header(header_ptr: *const u8, out_ptr: *mut u8) {
+    hash_header_algo(algo_id(PowAlgo::Sha3t) as u32, header_ptr, out_ptr);
+}
+
+/// `hash_header` for the algorithm `algo` (an id from `job_pow_algo`).
+/// Returns 1 when it hashed, 0 for an unknown id or a null pointer - then
+/// nothing is written.
+///
+/// # Safety
+/// `header_ptr` must point at 80 bytes, `out_ptr` at at least 32.
+#[no_mangle]
+pub unsafe extern "C" fn hash_header_algo(algo: u32, header_ptr: *const u8, out_ptr: *mut u8) -> u32 {
     if header_ptr.is_null() || out_ptr.is_null() {
-        return;
+        return 0;
     }
+    let Some(algo) = algo_from_id(algo) else {
+        return 0;
+    };
     let mut header = [0u8; 80];
     core::ptr::copy_nonoverlapping(header_ptr, header.as_mut_ptr(), 80);
-    let hash = sha3t(&header);
+    let hash = algo.hash(&header);
     core::ptr::copy_nonoverlapping(hash.as_ptr(), out_ptr, 32);
+    1
 }
 
 /// SHA256d over an arbitrary buffer (coinbase txid, merkle steps).
@@ -304,6 +411,53 @@ mod tests {
         let target = [0u8; 32]; // never hit
         let got = unsafe { search(header.as_ptr(), target.as_ptr(), u32::MAX - 2, 10) };
         assert_eq!(got, -1.0);
+    }
+
+    /// The page asks the module which PoW a job uses, the same way the CLI
+    /// decides it - and gets -1 past a fork this module cannot hash.
+    #[test]
+    fn job_pow_algo_follows_the_schedule() {
+        let mut cb = Vec::new();
+        cb.extend_from_slice(&2u32.to_le_bytes());
+        cb.push(0x01);
+        cb.extend_from_slice(&[0u8; 32]);
+        cb.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        cb.push(24);
+        cb.extend_from_slice(&[0x03, 0xce, 0xe7, 0x00]); // 59342
+        cb.extend_from_slice(b"/bc3.online/");
+        let algo = |version, fork| unsafe { job_pow_algo(cb.as_ptr(), cb.len(), version, fork) };
+        assert_eq!(algo(0x2000_1000, -1.0), 1);
+        assert_eq!(algo(0x2000_0000, -1.0), 0);
+        assert_eq!(algo(0x2000_1000, 59_343.0), 1);
+        assert_eq!(algo(0x2000_1000, 59_342.0), -1);
+        assert_eq!(algo(0x2000_1000, 1.0), -1);
+        assert_eq!(unsafe { job_pow_algo(core::ptr::null(), 0, 0x2000_1000, -1.0) }, -1);
+    }
+
+    /// The per-algorithm exports agree with the reference, and an unknown id
+    /// is refused rather than hashed with something else.
+    #[test]
+    fn algo_exports_dispatch_correctly() {
+        let mut header = [0u8; 80];
+        header[0..4].copy_from_slice(&0x2000_0000u32.to_le_bytes());
+        let mut out = [0u8; 32];
+        assert_eq!(unsafe { hash_header_algo(0, header.as_ptr(), out.as_mut_ptr()) }, 1);
+        assert_eq!(out, consensus::sha256d(&header));
+        assert_eq!(unsafe { hash_header_algo(1, header.as_ptr(), out.as_mut_ptr()) }, 1);
+        assert_eq!(out, sha3t(&header));
+        assert_eq!(unsafe { hash_header_algo(99, header.as_ptr(), out.as_mut_ptr()) }, 0);
+
+        let mut target = [0xffu8; 32];
+        target[0] = 0x0f;
+        let legacy = unsafe { search(header.as_ptr(), target.as_ptr(), 0, 100_000) };
+        let sha3t_id = unsafe { search_algo(1, header.as_ptr(), target.as_ptr(), 0, 100_000) };
+        assert_eq!(legacy, sha3t_id, "search is search_algo with SHA3-256t");
+        let d = unsafe { search_algo(0, header.as_ptr(), target.as_ptr(), 0, 100_000) };
+        assert!(d >= 0.0);
+        let mut h = header;
+        h[76..80].copy_from_slice(&(d as u32).to_le_bytes());
+        assert!(hash_meets_target(&consensus::sha256d(&h), &target));
+        assert_eq!(unsafe { search_algo(99, header.as_ptr(), target.as_ptr(), 0, 10) }, -2.0);
     }
 
     /// Locks down the expected value in `SELF_TEST_DIGEST`. If this test

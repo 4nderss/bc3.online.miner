@@ -2,9 +2,10 @@
 //! fallback).
 //!
 //! A backend grinds a nonce range for a fixed 76-byte header prefix and
-//! returns the nonces whose SHA3-256t hash is <= the share target. Every hit
-//! is re-checked on the CPU in gpu_worker before submit - a kernel bug can
-//! never produce a bad share, only a missed one.
+//! returns the nonces whose PoW hash is <= the share target. SHA3-256t is the
+//! only kernel; see `kernel_supports`. Every hit is re-checked on the CPU in
+//! gpu_worker before submit - a kernel bug can never produce a bad share, only
+//! a missed one.
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -13,7 +14,7 @@ pub mod cl_sys;
 #[cfg(feature = "opencl")]
 pub mod opencl;
 
-use crate::consensus::Target;
+use crate::consensus::{PowAlgo, Target};
 
 /// Shared kernel source (CUDA via NVRTC + OpenCL). See that file for the
 /// lane layout.
@@ -319,14 +320,38 @@ impl HitBudget {
     }
 }
 
+/// Which PoW algorithms the GPU kernels implement. Both backends compile the
+/// same `sha3t.cl`, so they answer the same.
+///
+/// The match is exhaustive on purpose: a new `PowAlgo` variant does not
+/// compile until someone decides here whether a kernel exists for it. Without
+/// one the GPU worker idles on those jobs, which is correct - the CPU
+/// reference in consensus.rs is enough to mine, just slowly.
+pub fn kernel_supports(algo: PowAlgo) -> bool {
+    match algo {
+        PowAlgo::Sha3t => true,
+        // The kernel always runs SHA3-256t; every hit would fail the CPU
+        // re-check.
+        PowAlgo::Sha256d => false,
+        // NEW POW: true once a kernel for it exists, and make scan_range in
+        // cuda.rs and opencl.rs launch that kernel for it.
+    }
+}
+
 pub trait MiningBackend {
     /// Human-readable name ("CUDA: NVIDIA GeForce RTX 3050 Ti ...").
     fn name(&self) -> String;
 
+    /// Can this backend hash `algo`? The GPU worker asks once per job and
+    /// sits out jobs it cannot do, so `scan_range` never sees them.
+    fn supports(&self, algo: PowAlgo) -> bool;
+
     /// Grind [start_nonce, start_nonce+count) for the header (nonce field
-    /// excluded) and return the nonces whose hash is <= target.
+    /// excluded) and return the nonces whose `algo` hash is <= target.
+    /// `algo` is per launch, not per nonce: it picks the kernel.
     fn scan_range(
         &mut self,
+        algo: PowAlgo,
         header76: &[u8; 76],
         start_nonce: u32,
         count: u32,

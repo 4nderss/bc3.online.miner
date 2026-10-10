@@ -87,6 +87,12 @@ struct Args {
     /// List available hardware and exit (the GUI asks before starting).
     #[arg(long)]
     probe: bool,
+
+    /// First block height of the next PoW hard fork. For testing on regtest
+    /// only: the mainnet height is built in. From this height on the miner
+    /// stops hashing, since this version does not implement that PoW.
+    #[arg(long, env = "BC3_NEXT_POW_HEIGHT")]
+    next_pow_height: Option<u32>,
 }
 
 /// Payout mode. Only the port differs, but nobody should have to remember
@@ -116,9 +122,9 @@ impl Mode {
 /// Only our own BC3_* names are touched, and only when the canonical one is
 /// unset, so nothing else in the environment can be shadowed.
 fn normalise_env() {
-    const VARS: [&str; 9] = [
+    const VARS: [&str; 10] = [
         "BC3_WALLET", "BC3_WORKER", "BC3_USER", "BC3_MODE", "BC3_POOL",
-        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID",
+        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID", "BC3_NEXT_POW_HEIGHT",
     ];
     let present: Vec<(String, String)> = std::env::vars().collect();
     for want in VARS {
@@ -201,6 +207,11 @@ fn main() {
         std::process::exit(2);
     };
     let pool = args.pool.clone().unwrap_or_else(|| args.mode.default_pool().to_string());
+    let mut pow_schedule = consensus::PowSchedule::MAINNET;
+    if let Some(h) = args.next_pow_height {
+        pow_schedule.next_pow_height = Some(h);
+        human!("[miner] next PoW fork at height {h} (override)");
+    }
 
     let gpus = if matches!(args.backend, BackendKind::Cpu) {
         vec![]
@@ -319,6 +330,7 @@ fn main() {
         stratum::StratumConfig {
             pool,
             user,
+            pow_schedule,
         },
     );
 }

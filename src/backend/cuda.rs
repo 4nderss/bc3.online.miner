@@ -8,8 +8,8 @@
 //! starts even with no NVIDIA driver at all (detection then returns an empty
 //! list).
 
-use super::{kernel_lanes, kernel_target, MiningBackend, MAX_HITS};
-use crate::consensus::Target;
+use super::{kernel_lanes, kernel_supports, kernel_target, MiningBackend, MAX_HITS};
+use crate::consensus::{PowAlgo, Target};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -93,13 +93,21 @@ impl MiningBackend for CudaBackend {
         format!("CUDA: {}", self.name)
     }
 
+    fn supports(&self, algo: PowAlgo) -> bool {
+        kernel_supports(algo)
+    }
+
     fn scan_range(
         &mut self,
+        algo: PowAlgo,
         header76: &[u8; 76],
         start_nonce: u32,
         count: u32,
         target: &Target,
     ) -> Result<Vec<u32>, String> {
+        if !kernel_supports(algo) {
+            return Err(format!("no kernel for {}", algo.name()));
+        }
         if count == 0 {
             return Ok(vec![]);
         }
@@ -206,7 +214,7 @@ mod tests {
         println!("backend: {}", backend.name());
         let count = MAX_HITS as u32;
         let start = genesis.nonce - count / 2;
-        let mut gpu = backend.scan_range(&header76, start, count, &target).unwrap();
+        let mut gpu = backend.scan_range(PowAlgo::Sha3t, &header76, start, count, &target).unwrap();
         let mut cpu = cpu_hits(&header76, start, count, &target);
         gpu.sort_unstable();
         cpu.sort_unstable();
@@ -245,7 +253,7 @@ mod tests {
                 .unwrap();
             let target: Target = min_hash; // targets are big-endian bytes
 
-            let mut gpu = backend.scan_range(&header76, start, count, &target).unwrap();
+            let mut gpu = backend.scan_range(PowAlgo::Sha3t, &header76, start, count, &target).unwrap();
             let mut cpu = cpu_hits(&header76, start, count, &target);
             gpu.sort_unstable();
             cpu.sort_unstable();
@@ -267,7 +275,7 @@ mod tests {
             *b = xorshift(&mut seed) as u8;
         }
         let count = 1u32 << 20;
-        let mut gpu = backend.scan_range(&header76, 0, count, &target).unwrap();
+        let mut gpu = backend.scan_range(PowAlgo::Sha3t, &header76, 0, count, &target).unwrap();
         let mut cpu = cpu_hits(&header76, 0, count, &target);
         gpu.sort_unstable();
         cpu.sort_unstable();
@@ -282,13 +290,13 @@ mod tests {
         let target = compact_to_target(0x1d00ffff).unwrap(); // few hits
         let header76 = [0x42u8; 76];
         // Warm-up.
-        backend.scan_range(&header76, 0, 1 << 20, &target).unwrap();
+        backend.scan_range(PowAlgo::Sha3t, &header76, 0, 1 << 20, &target).unwrap();
         let batch = 1u32 << 24;
         let rounds = 16u32;
         let t0 = std::time::Instant::now();
         for r in 0..rounds {
             backend
-                .scan_range(&header76, r.wrapping_mul(batch), batch, &target)
+                .scan_range(PowAlgo::Sha3t, &header76, r.wrapping_mul(batch), batch, &target)
                 .unwrap();
         }
         let dt = t0.elapsed().as_secs_f64();

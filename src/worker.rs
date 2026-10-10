@@ -1,15 +1,26 @@
 //! Worker threads: build the coinbase per extranonce2, grind the nonce space
-//! with SHA3-256t and report shares.
+//! with the job's PoW and report shares.
 
 use crate::consensus::{
-    compact_to_target, hash_meets_target, root_from_steps, sha256d, BlockHeader,
+    compact_to_target, hash_meets_target, hash_to_display, root_from_steps, sha256d,
+    BlockHeader, PowAlgo,
 };
-use crate::shared::{FoundShare, MinerJob, Shared};
+use crate::shared::{AlgoGate, FoundShare, MinerJob, Shared};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// How often the threads check for new jobs (counted in hashes).
 const CHECK_INTERVAL: u32 = 4096;
+
+/// Which PoW algorithms the CPU path can hash: every one consensus.rs
+/// implements, since `PowAlgo::hash` is the CPU reference by construction.
+/// The match is here anyway so a new variant is a decision, not an accident.
+pub fn cpu_supports(algo: PowAlgo) -> bool {
+    match algo {
+        PowAlgo::Sha256d | PowAlgo::Sha3t => true,
+        // NEW POW: true once PowAlgo::hash implements it.
+    }
+}
 
 pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize) {
     // Position in the search space, carried across jobs that cover the same
@@ -17,13 +28,25 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize) {
     let mut prev: Option<MinerJob> = None;
     let mut en2 = thread_id as u64;
     let mut nonce: u32 = 0;
+    let mut gate = AlgoGate::default();
+    // Generation of a job this thread sat out; wait for the next one instead
+    // of spinning on it.
+    let mut sat_out: Option<u64> = None;
     loop {
-        let (generation, job) = shared.wait_for_job();
+        let (generation, job) = match sat_out.take() {
+            Some(seen) => shared.wait_for_job_after(seen),
+            None => shared.wait_for_job(),
+        };
+        let Some(algo) = gate.check(&job, &format!("CPU thread {thread_id}"), cpu_supports)
+        else {
+            sat_out = Some(generation);
+            continue;
+        };
         if prev.as_ref().is_none_or(|p| !p.same_search_space(&job)) {
             en2 = thread_id as u64;
             nonce = 0;
         }
-        mine_job(&shared, &job, generation, num_threads, &mut en2, &mut nonce);
+        mine_job(&shared, &job, algo, generation, num_threads, &mut en2, &mut nonce);
         prev = Some(job);
     }
 }
@@ -31,12 +54,16 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize) {
 fn mine_job(
     shared: &Shared,
     job: &MinerJob,
+    algo: PowAlgo,
     generation: u64,
     num_threads: usize,
     en2_counter: &mut u64,
     nonce_start: &mut u32,
 ) {
     let block_target = compact_to_target(job.bits);
+    // Resolved once per job: the loop below calls a plain function, with no
+    // match per nonce. The indirect call is noise next to a triple keccak.
+    let pow = algo.hash_fn();
     // Each thread takes every Nth extranonce2 - disjoint search spaces with
     // no coordination. The starting point comes from the caller so it can
     // survive a job that covers the same space.
@@ -54,6 +81,7 @@ fn mine_job(
         let cb_txid = sha256d(&coinbase);
         let merkle_root = root_from_steps(&cb_txid, &job.merkle_steps);
 
+        // Serialized once per extranonce2; only the nonce bytes change below.
         let mut header = BlockHeader {
             version: job.version,
             prev_hash: job.prev_hash,
@@ -61,7 +89,8 @@ fn mine_job(
             time: job.ntime,
             bits: job.bits,
             nonce: 0,
-        };
+        }
+        .serialize();
 
         let mut nonce: u32 = *nonce_start;
         loop {
@@ -77,8 +106,8 @@ fn mine_job(
             // this boundary with overflowing_add; now this one does too.
             let mut done: u32 = 0;
             while done < CHECK_INTERVAL {
-                header.nonce = nonce;
-                let hash = header.hash();
+                header[76..80].copy_from_slice(&nonce.to_le_bytes());
+                let hash = pow(&header);
                 if hash_meets_target(&hash, &job.share_target) {
                     let is_block = block_target
                         .map(|t| hash_meets_target(&hash, &t))
@@ -89,7 +118,7 @@ fn mine_job(
                         extranonce2: extranonce2.clone(),
                         ntime: job.ntime,
                         nonce,
-                        hash_display: header.hash_display(),
+                        hash_display: hash_to_display(&hash),
                         is_block_candidate: is_block,
                     });
                 }
@@ -223,6 +252,90 @@ mod tests {
 
     use super::*;
     use std::collections::HashSet;
+    use std::time::Duration;
+
+    /// A job that yields a share about every 256 hashes, so a worker that
+    /// hashes it at all shows up on the submit channel within one batch.
+    fn easy_job(job_id: &str, algo: Option<PowAlgo>) -> MinerJob {
+        let mut share_target = [0xffu8; 32];
+        share_target[0] = 0;
+        MinerJob {
+            job_id: job_id.into(),
+            extranonce1: vec![1, 2, 3, 4],
+            extranonce2_size: 4,
+            coinb1: vec![9; 50],
+            coinb2: vec![8; 20],
+            merkle_steps: vec![],
+            version: 0x2000_1000,
+            prev_hash: [6u8; 32],
+            bits: 0x1d00_ffff,
+            ntime: 1_700_000_000,
+            share_target,
+            height: Some(100_000),
+            algo,
+        }
+    }
+
+    /// A job whose PoW this build does not implement is never hashed and
+    /// never produces a share - grinding it with the old PoW would only make
+    /// shares the pool rejects. The worker picks up again by itself when a
+    /// job it can hash arrives, and stops again when the next one cannot be.
+    #[test]
+    fn an_unsupported_pow_is_not_mined_and_mining_resumes() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(crate::shared::SUBMIT_QUEUE);
+        let shared = Arc::new(Shared::new(tx));
+        shared.publish_job(easy_job("new-pow", None));
+        let s = shared.clone();
+        std::thread::spawn(move || run_worker(s, 0, 1));
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_recv().is_err(), "a share was submitted for an unsupported PoW");
+        assert_eq!(shared.stats.hashes.load(Ordering::Relaxed), 0, "it hashed anyway");
+
+        shared.publish_job(easy_job("sha3t", Some(PowAlgo::Sha3t)));
+        let share = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the worker did not resume on a supported job");
+        assert_eq!(share.job_id, "sha3t");
+
+        // Back to an unsupported job: the worker leaves the old one at the end
+        // of its batch - a debug build takes a good part of a second for one -
+        // and then goes quiet for good.
+        shared.publish_job(easy_job("new-pow-2", None));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let before = shared.stats.hashes.load(Ordering::Relaxed);
+            std::thread::sleep(Duration::from_secs(1));
+            while rx.try_recv().is_ok() {}
+            if shared.stats.hashes.load(Ordering::Relaxed) == before {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "still hashing the unsupported job");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(rx.try_recv().is_err(), "a share was submitted after the switch");
+    }
+
+    /// The CPU path hashes exactly what the GPU re-check and consensus.rs
+    /// would: the serialized-once header with the nonce patched in.
+    #[test]
+    fn cpu_hash_matches_the_header_reference() {
+        let mut h = BlockHeader {
+            version: 0x2000_1000,
+            prev_hash: [1u8; 32],
+            merkle_root: [2u8; 32],
+            time: 1_700_000_000,
+            bits: 0x1d00_ffff,
+            nonce: 0,
+        };
+        let mut ser = h.serialize();
+        for nonce in [0u32, 1, 0xdead_beef, u32::MAX] {
+            ser[76..80].copy_from_slice(&nonce.to_le_bytes());
+            h.nonce = nonce;
+            assert_eq!((PowAlgo::Sha3t.hash_fn())(&ser), h.hash());
+        }
+        assert!(cpu_supports(PowAlgo::Sha3t) && cpu_supports(PowAlgo::Sha256d));
+    }
 
     /// The workers must NEVER grind on the same thing. Every worker starts at
     /// its own index and steps by the number of workers, so the extranonce2

@@ -10,8 +10,10 @@ use super::cl_sys::{
     CL_DEVICE_TYPE_GPU, CL_DEVICE_VENDOR, CL_KERNEL_WORK_GROUP_SIZE, CL_MEM_READ_ONLY,
     CL_MEM_READ_WRITE, CL_PROGRAM_BUILD_LOG, CL_SUCCESS, CL_TRUE,
 };
-use super::{kernel_lanes, kernel_target, HitBudget, MiningBackend, KERNEL_SOURCE, MAX_HITS};
-use crate::consensus::Target;
+use super::{
+    kernel_lanes, kernel_supports, kernel_target, HitBudget, MiningBackend, KERNEL_SOURCE, MAX_HITS,
+};
+use crate::consensus::{PowAlgo, Target};
 use std::ffi::c_void;
 use std::ptr;
 
@@ -324,13 +326,21 @@ impl MiningBackend for OpenClBackend {
         format!("OpenCL: {}", self.name)
     }
 
+    fn supports(&self, algo: PowAlgo) -> bool {
+        kernel_supports(algo)
+    }
+
     fn scan_range(
         &mut self,
+        algo: PowAlgo,
         header76: &[u8; 76],
         start_nonce: u32,
         count: u32,
         target: &Target,
     ) -> Result<Vec<u32>, String> {
+        if !kernel_supports(algo) {
+            return Err(format!("no kernel for {}", algo.name()));
+        }
         if count == 0 {
             return Ok(vec![]);
         }
@@ -512,7 +522,7 @@ mod tests {
                 .min_by(|a, b| a.1.cmp(&b.1))
                 .unwrap();
 
-            let mut gpu = backend.scan_range(&header76, start, count, &target).unwrap();
+            let mut gpu = backend.scan_range(PowAlgo::Sha3t, &header76, start, count, &target).unwrap();
             gpu.sort_unstable();
             let mut cpu: Vec<u32> = (0..count)
                 .filter_map(|i| {
@@ -533,7 +543,7 @@ mod tests {
     fn zero_count_is_a_no_op() {
         let mut backend = OpenClBackend::new_typed(0, 0, CL_DEVICE_TYPE_ALL)
             .expect("OpenCL backend");
-        let hits = backend.scan_range(&[0u8; 76], 0, 0, &[0xff; 32]).unwrap();
+        let hits = backend.scan_range(PowAlgo::Sha3t, &[0u8; 76], 0, 0, &[0xff; 32]).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -624,7 +634,7 @@ mod tests {
         assert!(cpu.len() >= 5, "the test target must give several hits, got {}", cpu.len());
 
         // Baseline: one launch over the whole range.
-        let mut whole = backend.scan_range(&header76, start, count, &target).unwrap();
+        let mut whole = backend.scan_range(PowAlgo::Sha3t, &header76, start, count, &target).unwrap();
         whole.sort_unstable();
         assert_eq!(whole, cpu, "the unsplit scan already disagrees with the CPU");
 
@@ -632,7 +642,7 @@ mod tests {
         backend.budget.overflowed(count, MAX_HITS + 1);
         assert!(backend.budget.chunk(count) < count, "the budget did not split");
 
-        let mut split = backend.scan_range(&header76, start, count, &target).unwrap();
+        let mut split = backend.scan_range(PowAlgo::Sha3t, &header76, start, count, &target).unwrap();
         split.sort_unstable();
         assert_eq!(split, cpu, "the split scan lost or duplicated part of the range");
     }

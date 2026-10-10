@@ -1,7 +1,7 @@
 //! Stratum v1 client: keeps the connection to the pool, receives jobs and
 //! submits found shares. Reconnects with backoff when the link drops.
 
-use crate::consensus::{swab32, target_for_difficulty};
+use crate::consensus::{bip34_height, swab32, target_for_difficulty, PowSchedule};
 use crate::shared::{FoundShare, MinerJob, Shared};
 use serde_json::{json, Value};
 use std::io::{BufReader, ErrorKind, Read, Write};
@@ -73,6 +73,8 @@ fn next_line<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Opti
 pub struct StratumConfig {
     pub pool: String,
     pub user: String,
+    /// Which PoW each job height uses - decided per job at notify time.
+    pub pow_schedule: PowSchedule,
 }
 
 /// Requests the pool has not answered yet, so that its answer can be timed.
@@ -291,7 +293,7 @@ fn session(
                 if p.len() < 9 || extranonce1.is_empty() {
                     continue;
                 }
-                match parse_notify(&p, &extranonce1, extranonce2_size, difficulty) {
+                match parse_notify(&p, &extranonce1, extranonce2_size, difficulty, &cfg.pow_schedule) {
                     Some(job) => shared.publish_job(job),
                     None => eprintln!("[pool] invalid notify message"),
                 }
@@ -309,8 +311,15 @@ fn parse_notify(
     extranonce1: &[u8],
     extranonce2_size: usize,
     difficulty: f64,
+    pow_schedule: &PowSchedule,
 ) -> Option<MinerJob> {
     let prev_swab: [u8; 32] = hex::decode(p[1].as_str()?).ok()?.try_into().ok()?;
+    let coinb1 = hex::decode(p[2].as_str()?).ok()?;
+    let version = u32::from_str_radix(p[5].as_str()?, 16).ok()?;
+    // The height in the coinbase is the height of the block being mined, and
+    // with it the PoW. Decided here, once, so no worker ever has to guess.
+    let height = bip34_height(&coinb1);
+    let algo = pow_schedule.algo_for_job(height, version);
     let steps = p[4]
         .as_array()?
         .iter()
@@ -324,14 +333,16 @@ fn parse_notify(
         job_id: p[0].as_str()?.to_string(),
         extranonce1: extranonce1.to_vec(),
         extranonce2_size,
-        coinb1: hex::decode(p[2].as_str()?).ok()?,
+        coinb1,
         coinb2: hex::decode(p[3].as_str()?).ok()?,
         merkle_steps: steps,
-        version: u32::from_str_radix(p[5].as_str()?, 16).ok()?,
+        version,
         prev_hash: swab32(&prev_swab),
         bits: u32::from_str_radix(p[6].as_str()?, 16).ok()?,
         ntime: u32::from_str_radix(p[7].as_str()?, 16).ok()?,
         share_target: target_for_difficulty(difficulty),
+        height,
+        algo,
     })
 }
 
@@ -447,6 +458,48 @@ mod tests {
         assert_eq!(o.sent.len(), 1, "the stale ones are gone");
         assert_eq!(o.answered(5, t0 + OUTSTANDING_MAX_AGE + Duration::from_secs(2)), None);
         assert!(o.answered(1000, t0 + OUTSTANDING_MAX_AGE + Duration::from_secs(2)).is_some());
+    }
+
+    /// A mining.notify as the pool sends it, for a block at `height`.
+    fn notify_params(height: u32, version: u32) -> Vec<Value> {
+        let mut coinb1 = Vec::new();
+        coinb1.extend_from_slice(&2u32.to_le_bytes());
+        coinb1.push(0x01);
+        coinb1.extend_from_slice(&[0u8; 32]);
+        coinb1.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        coinb1.push(24);
+        coinb1.push(0x04);
+        coinb1.extend_from_slice(&height.to_le_bytes());
+        coinb1.extend_from_slice(b"/bc3.online/");
+        vec![
+            json!("job1"),
+            json!(hex::encode([0x11u8; 32])),
+            json!(hex::encode(&coinb1)),
+            json!("ffffffff"),
+            json!([]),
+            json!(format!("{version:08x}")),
+            json!("1d00ffff"),
+            json!("6a000000"),
+            json!(true),
+        ]
+    }
+
+    /// Every job carries its height and the PoW the schedule picks for it.
+    #[test]
+    fn notify_decides_the_jobs_pow() {
+        use crate::consensus::PowAlgo;
+        let fork = PowSchedule { next_pow_height: Some(70_000) };
+        let job = parse_notify(&notify_params(69_999, 0x2000_1000), &[1, 2], 4, 1.0, &fork).unwrap();
+        assert_eq!(job.height, Some(69_999));
+        assert_eq!(job.algo, Some(PowAlgo::Sha3t));
+
+        let job = parse_notify(&notify_params(70_000, 0x2000_1000), &[1, 2], 4, 1.0, &fork).unwrap();
+        assert_eq!(job.height, Some(70_000));
+        assert_eq!(job.algo, None, "past the fork this build must not hash");
+
+        let none = PowSchedule { next_pow_height: None };
+        let job = parse_notify(&notify_params(70_000, 0x2000_0000), &[1, 2], 4, 1.0, &none).unwrap();
+        assert_eq!(job.algo, Some(PowAlgo::Sha256d));
     }
 
     #[test]

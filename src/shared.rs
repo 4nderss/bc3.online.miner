@@ -1,7 +1,7 @@
 //! State shared between the stratum client and the worker threads.
 
-use crate::consensus::Target;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::consensus::{PowAlgo, Target};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 #[cfg(test)]
 use std::sync::Arc;
@@ -21,6 +21,11 @@ pub struct MinerJob {
     pub ntime: u32,
     /// Share target for the difficulty that was in effect at notify time.
     pub share_target: Target,
+    /// Block height from the coinbase (BIP34); None if it could not be read.
+    pub height: Option<u32>,
+    /// The PoW this job must be hashed with, decided once at notify time.
+    /// None = a PoW this build does not implement: nobody hashes the job.
+    pub algo: Option<PowAlgo>,
 }
 
 /// How many found shares may wait for the stratum thread.
@@ -142,6 +147,60 @@ pub struct Shared {
     pub stats: Stats,
     /// Bounded on purpose - see `Shared::submit`.
     pub submit_tx: std::sync::mpsc::SyncSender<FoundShare>,
+    /// The latest job uses a PoW this build cannot hash. Kept so the warning
+    /// is said once when it starts and once when it ends - not per job.
+    pow_unsupported: AtomicBool,
+}
+
+/// What the user is told when the pool has moved to a PoW this build does not
+/// implement.
+pub fn unsupported_pow_message(height: Option<u32>) -> String {
+    let at = match height {
+        Some(h) => format!("at height {h}"),
+        None => "at this height".into(),
+    };
+    format!(
+        "this miner version does not support the new BC3 proof of work {at} - \
+         update the miner. Hashing has stopped; it resumes by itself if the pool \
+         sends a job this version can mine."
+    )
+}
+
+/// A worker's gate in front of its hashing loop: which algorithm to hash the
+/// job with, or None to sit the job out.
+///
+/// Sitting out is the whole point. Grinding a job with the wrong PoW still
+/// "finds" shares, every one of which the pool rejects - so the rig looks
+/// busy, burns power, and earns nothing.
+#[derive(Default)]
+pub struct AlgoGate {
+    /// The algorithm this worker last said it cannot hash, so it says it once.
+    warned: Option<PowAlgo>,
+}
+
+impl AlgoGate {
+    pub fn check(
+        &mut self,
+        job: &MinerJob,
+        worker: &str,
+        supports: impl Fn(PowAlgo) -> bool,
+    ) -> Option<PowAlgo> {
+        // None: Shared::publish_job has already told the user, once for all
+        // workers.
+        let algo = job.algo?;
+        if supports(algo) {
+            self.warned = None;
+            return Some(algo);
+        }
+        if self.warned != Some(algo) {
+            eprintln!(
+                "[miner] {worker} has no implementation of {} - it idles until a job it can hash",
+                algo.name()
+            );
+            self.warned = Some(algo);
+        }
+        None
+    }
 }
 
 impl Shared {
@@ -153,6 +212,7 @@ impl Shared {
             generation: AtomicU64::new(0),
             stats: Stats::default(),
             submit_tx,
+            pow_unsupported: AtomicBool::new(false),
         }
     }
 
@@ -229,7 +289,7 @@ impl Shared {
 
     pub fn publish_job(&self, job: MinerJob) {
         self.stats.network_bits.store(job.bits, Ordering::Relaxed);
-        if let Some(h) = crate::consensus::bip34_height(&job.coinb1) {
+        if let Some(h) = job.height {
             // Only report on an actual height change - the pool sends new
             // jobs within the same block too (new transactions, new ntime).
             let prev = self.stats.job_height.swap(h, Ordering::Relaxed);
@@ -238,9 +298,59 @@ impl Shared {
                 crate::human!("[pool] now working on block #{h}");
             }
         }
-        *self.job.lock().unwrap() = Some(job);
-        self.generation.fetch_add(1, Ordering::Release);
+        self.note_pow_support(&job);
+        {
+            // The bump happens under the lock so that `wait_for_job_after`,
+            // which checks the generation under the same lock, cannot see the
+            // old generation and then sleep through this notify.
+            let mut slot = self.job.lock().unwrap();
+            *slot = Some(job);
+            self.generation.fetch_add(1, Ordering::Release);
+        }
         self.job_cv.notify_all();
+    }
+
+    /// Tell the user when the pool's jobs move to a PoW this build cannot
+    /// hash, and again when they move back. Only the stratum thread publishes
+    /// jobs, so this runs once per job, not once per worker.
+    fn note_pow_support(&self, job: &MinerJob) {
+        let unsupported = job.algo.is_none();
+        if self.pow_unsupported.swap(unsupported, Ordering::Relaxed) == unsupported {
+            return;
+        }
+        if unsupported {
+            let message = unsupported_pow_message(job.height);
+            eprintln!("[miner] {message}");
+            crate::ipc::emit(&crate::ipc::Event::Status {
+                state: crate::ipc::StatusState::Error,
+                message,
+            });
+        } else {
+            let name = job.algo.map(|a| a.name()).unwrap_or("?");
+            crate::human!("[miner] the pool's jobs use {name} again - mining resumed");
+            crate::ipc::emit(&crate::ipc::Event::Status {
+                state: crate::ipc::StatusState::Mining,
+                message: format!("{name} job received - mining resumed"),
+            });
+        }
+    }
+
+    /// Like `wait_for_job`, but only for a job published after generation
+    /// `seen`. A worker that sat a job out waits here instead of spinning on
+    /// the job it cannot hash.
+    pub fn wait_for_job_after(&self, seen: u64) -> (u64, MinerJob) {
+        let mut guard = self.job.lock().unwrap();
+        loop {
+            let generation = self.generation.load(Ordering::Acquire);
+            if generation != seen {
+                if let Some(j) = guard.as_ref() {
+                    return (generation, j.clone());
+                }
+            }
+            // publish_job bumps the generation under this lock, so it cannot
+            // slip in between the check above and this wait.
+            guard = self.job_cv.wait(guard).unwrap();
+        }
     }
 
     /// Queue a share for the pool. Never blocks; counts what it drops.
@@ -289,6 +399,8 @@ mod tests {
             bits: 0x1d00_ffff,
             ntime: 1_700_000_000,
             share_target: [0xFFu8; 32],
+            height: Some(59_342),
+            algo: Some(PowAlgo::Sha3t),
         }
     }
 
@@ -335,6 +447,61 @@ mod tests {
     fn shared() -> Shared {
         let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
         Shared::new(tx)
+    }
+
+    /// The GPU kernels only do SHA3-256t: a GPU worker sits out anything
+    /// else, and a job with no algorithm at all, instead of grinding it.
+    #[test]
+    fn the_gate_lets_through_only_what_the_backend_supports() {
+        let gpu = crate::backend::kernel_supports;
+        let mut gate = AlgoGate::default();
+        let mut job = a_job();
+        assert_eq!(gate.check(&job, "gpu", gpu), Some(PowAlgo::Sha3t));
+        job.algo = Some(PowAlgo::Sha256d);
+        assert_eq!(gate.check(&job, "gpu", gpu), None);
+        assert_eq!(gate.warned, Some(PowAlgo::Sha256d), "said once, remembered");
+        job.algo = None;
+        assert_eq!(gate.check(&job, "gpu", gpu), None);
+        assert_eq!(gate.check(&job, "cpu", crate::worker::cpu_supports), None);
+        job.algo = Some(PowAlgo::Sha3t);
+        assert_eq!(gate.check(&job, "gpu", gpu), Some(PowAlgo::Sha3t));
+        assert_eq!(gate.warned, None, "back to normal");
+    }
+
+    /// The unsupported-PoW warning follows the jobs: on with the first job
+    /// this build cannot hash, off with the first one it can.
+    #[test]
+    fn publish_tracks_an_unsupported_pow() {
+        let s = shared();
+        s.publish_job(a_job());
+        assert!(!s.pow_unsupported.load(Ordering::Relaxed));
+        let mut new_pow = a_job();
+        new_pow.algo = None;
+        s.publish_job(new_pow.clone());
+        assert!(s.pow_unsupported.load(Ordering::Relaxed));
+        s.publish_job(new_pow);
+        assert!(s.pow_unsupported.load(Ordering::Relaxed));
+        s.publish_job(a_job());
+        assert!(!s.pow_unsupported.load(Ordering::Relaxed));
+        assert!(unsupported_pow_message(Some(123)).contains("at height 123"));
+    }
+
+    /// A worker that sat a job out wakes for the next job, not before.
+    #[test]
+    fn wait_for_job_after_waits_for_a_newer_job() {
+        let s = Arc::new(shared());
+        s.publish_job(a_job());
+        let (seen, _) = s.wait_for_job();
+        let s2 = s.clone();
+        let waiter = std::thread::spawn(move || s2.wait_for_job_after(seen));
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "returned the job it was told to skip");
+        let mut next = a_job();
+        next.job_id = "next".into();
+        s.publish_job(next);
+        let (generation, job) = waiter.join().unwrap();
+        assert_ne!(generation, seen);
+        assert_eq!(job.job_id, "next");
     }
 
     #[test]

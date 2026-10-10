@@ -5,9 +5,10 @@
 
 use crate::backend::{open_backend_with_fallback, GpuDevice, MiningBackend};
 use crate::consensus::{
-    compact_to_target, hash_meets_target, root_from_steps, sha256d, BlockHeader,
+    compact_to_target, hash_meets_target, hash_to_display, root_from_steps, sha256d, BlockHeader,
+    PowAlgo,
 };
-use crate::shared::{FoundShare, MinerJob, Shared};
+use crate::shared::{AlgoGate, FoundShare, MinerJob, Shared};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,14 +74,26 @@ pub fn run_gpu_worker(
     let mut en2 = worker_index as u64;
     let mut nonce: u32 = 0;
     let mut reopens: u32 = 0;
+    let mut gate = AlgoGate::default();
+    // Generation of a job this worker sat out; wait for the next one instead
+    // of spinning on it.
+    let mut sat_out: Option<u64> = None;
     loop {
-        let (generation, job) = shared.wait_for_job();
+        let (generation, job) = match sat_out.take() {
+            Some(seen) => shared.wait_for_job_after(seen),
+            None => shared.wait_for_job(),
+        };
+        // Decided per job, so the launch loop below carries no dispatch.
+        let Some(algo) = gate.check(&job, &backend.name(), |a| backend.supports(a)) else {
+            sat_out = Some(generation);
+            continue;
+        };
         if prev.as_ref().is_none_or(|p| !p.same_search_space(&job)) {
             en2 = worker_index as u64;
             nonce = 0;
         }
         let alive = mine_job(
-            &shared, &job, generation, total_workers, &mut backend, &mut batch, &mut en2,
+            &shared, &job, algo, generation, total_workers, &mut backend, &mut batch, &mut en2,
             &mut nonce,
         );
         if !alive {
@@ -138,6 +151,7 @@ const MAX_SCAN_ERRORS: u32 = 5;
 fn mine_job(
     shared: &Shared,
     job: &MinerJob,
+    algo: PowAlgo,
     generation: u64,
     total_workers: usize,
     backend: &mut Box<dyn MiningBackend>,
@@ -181,7 +195,7 @@ fn mine_job(
             let count = (*batch).min(remaining);
 
             let t0 = Instant::now();
-            let hits = match backend.scan_range(&header76, start, count, &job.share_target) {
+            let hits = match backend.scan_range(algo, &header76, start, count, &job.share_target) {
                 Ok(h) => h,
                 Err(e) => {
                     errors += 1;
@@ -201,10 +215,11 @@ fn mine_job(
             errors = 0;
 
             // Verify every hit on the CPU before submit - guards against
-            // kernel bugs.
+            // kernel bugs. Against the job's algorithm, not the version bit:
+            // past a fork the two can disagree.
             for nonce in hits {
                 header.nonce = nonce;
-                let hash = header.hash();
+                let hash = algo.hash(&header.serialize());
                 if !hash_meets_target(&hash, &job.share_target) {
                     eprintln!(
                         "[gpu] WARNING: {} reported a false hit, nonce={nonce:08x} - ignored",
@@ -221,7 +236,7 @@ fn mine_job(
                     extranonce2: extranonce2.clone(),
                     ntime: job.ntime,
                     nonce,
-                    hash_display: header.hash_display(),
+                    hash_display: hash_to_display(&hash),
                     is_block_candidate: is_block,
                 });
             }
