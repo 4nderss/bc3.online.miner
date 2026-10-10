@@ -33,6 +33,9 @@ src/                 mining core (the bc3-miner CLI)
   kernels/sha3t.cl   GPU kernel - shared source for CUDA and OpenCL
   kernels/sha3t.ptx  GENERATED from sha3t.cl - never hand-edit
   consensus.rs       CPU reference implementation; the correctness oracle
+bc3hash/             BC3Hash, the PoW of the second fork: the node's own C++
+  vendor/            src/crypto/bc3 + src/secp256k1 of the node - never edit
+  vectors/           the node's test vectors (doc/bc3/vectors)
 wasm/                browser miner used on bc3.online
 gui/dist/            Tauri frontend - plain HTML/CSS/JS, no build step
 gui/src-tauri/       Tauri shell; runs the CLI as a sidecar
@@ -52,6 +55,48 @@ runs with CUDA on NVIDIA, OpenCL on AMD/Intel, or CPU alone.
 falls back to the checked-in `sha3t.ptx`. That fallback is the normal path:
 NVRTC ships with the CUDA *Toolkit*, not the graphics driver, so the kernel must
 be compiled ahead of time and embedded.
+
+### BC3Hash and its C++
+
+The version bits pick the PoW per job, exactly as the node's `GetHash` does:
+bit 11 (`0x800`) is BC3Hash and wins over bit 12 (`0x1000`, SHA3-256t);
+neither is SHA256d. BC3Hash is not ported - `bc3hash/` compiles the node's
+reference code from `bc3hash/vendor/` (commit in `vendor/SOURCE_COMMIT`)
+behind a small C shim of ours, `bc3hash/src/shim.cpp`. A port could differ
+from the node in one bit and no test of ours would notice; the node's own code
+plus the node's vectors cannot. To move to a newer node, copy the two
+directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
+
+- **A compiler can build it wrong and nothing fails.** GCC 13 (Ubuntu 24.04)
+  at -O3 turns mix.cpp into code that runs and gets every hash wrong. The
+  shares would look fine to the miner and all be rejected by the pool. Two
+  defences, keep both: `bc3hash/build.rs` compiles the C++ with
+  `-fno-strict-aliasing` and loop vectorisation off, in each compiler's
+  spelling (cost: under 2 %), and `bc3hash::initialize` hashes four of the
+  node's vectors before anything is mined. A build that fails them never
+  mines BC3Hash; it says "this build computes BC3Hash incorrectly - report
+  it" on stderr and as a GUI status, and SHA3-256t carries on.
+- **Run the vector tests with every compiler that builds a release** -
+  `cargo test` in `bc3hash/` and in the root, which needs `bc3hash/vectors/`.
+  For the Windows build, cross-build the test binaries with cargo-xwin and run
+  them under Wine; they pass there.
+- It needs a C++20 compiler with `unsigned __int128`: GCC or Clang. MSVC's
+  `cl.exe` cannot build it; on an MSVC target `bc3hash/build.rs` switches to
+  `clang-cl` (cargo-xwin already uses it; GitHub's Windows images ship LLVM).
+  The Windows binary then also imports `MSVCP140.dll`, from the same VC++
+  redistributable as the `VCRUNTIME140.dll` it always needed.
+- Native builds prefer `clang`/`clang++` when the environment names no
+  compiler: ~10 % more hashrate than GCC 14, measured. The build warns when
+  it has to fall back. -O3 stays: -O2 measured 20-25 % slower with either.
+- There is no GPU kernel for it, so in `--backend auto` the CPU threads stand
+  in for the GPU on BC3Hash jobs (`worker::CpuRole::GpuFallback`).
+- The browser build (`wasm/`) shares `consensus.rs` but never has the
+  `bc3hash` feature: no C++ in wasm32. It stays SHA3-256t only.
+- `BC3HASH_VENDOR` and `BC3HASH_VECTORS` point the build and the tests at the
+  same sources and vectors somewhere else.
+- `cargo run --release --example bench -- fast 8` in `bc3hash/` measures the
+  hash rate per thread; `cargo test --release -- --ignored bc3hash_worker_rate
+  --nocapture` measures the same through the worker loop.
 
 ### Environment pitfalls
 

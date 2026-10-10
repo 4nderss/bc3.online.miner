@@ -4,7 +4,7 @@ version = "1.3.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/4nderss/bc3.online.miner"
-description = "GPU/CPU miner for BC3 (BitcoinIII, SHA3-256t) - the bc3.online client"
+description = "GPU/CPU miner for BC3 (BitcoinIII) - the bc3.online client"
 
 [[bin]]
 name = "bc3-miner"
@@ -16,12 +16,16 @@ path = "src/main.rs"
 # fallback). Both GPU paths are part of the default build: both are loaded
 # dynamically at runtime, so ONE binary runs CUDA on NVIDIA, OpenCL on
 # AMD/Intel and CPU if there is nothing.
-default = ["cuda", "opencl"]
+default = ["cuda", "opencl", "bc3hash"]
 cuda = ["dep:cudarc", "dep:nvml-wrapper"]
 # OpenCL is loaded dynamically via src/backend/cl_sys.rs - NOT linked against
 # OpenCL.lib/libOpenCL.so. Static linking would have made the binary refuse
 # to start on machines without an OpenCL runtime.
 opencl = ["dep:libloading"]
+# BC3Hash, the PoW of the second fork: the node's own C++ (bc3hash/), mined on
+# the CPU. Needs a C++20 compiler with unsigned __int128 - GCC or Clang, and
+# clang-cl rather than cl.exe on Windows (bc3hash/build.rs picks it).
+bc3hash = ["dep:bc3hash"]
 
 [dependencies]
 sha3 = "0.10"
@@ -39,6 +43,10 @@ cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040",
 ], optional = true }
 libloading = { version = "0.8", optional = true }
+
+# Never in a wasm build: the browser miner has no C++ toolchain behind it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bc3hash = { path = "bc3hash", optional = true }
 
 # Note: not panic = "abort" - cudarc's dynamic loader panics if libcuda is
 # missing, and the CUDA detection catches that with catch_unwind (CPU

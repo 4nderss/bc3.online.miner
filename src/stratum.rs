@@ -1,7 +1,7 @@
 //! Stratum v1 client: keeps the connection to the pool, receives jobs and
 //! submits found shares. Reconnects with backoff when the link drops.
 
-use crate::consensus::{bip34_height, swab32, target_for_difficulty, PowSchedule};
+use crate::consensus::{bip34_height, swab32, target_for_difficulty, PowAlgo};
 use crate::shared::{FoundShare, MinerJob, Shared};
 use serde_json::{json, Value};
 use std::io::{BufReader, ErrorKind, Read, Write};
@@ -73,8 +73,6 @@ fn next_line<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Opti
 pub struct StratumConfig {
     pub pool: String,
     pub user: String,
-    /// Which PoW each job height uses - decided per job at notify time.
-    pub pow_schedule: PowSchedule,
 }
 
 /// Requests the pool has not answered yet, so that its answer can be timed.
@@ -293,7 +291,7 @@ fn session(
                 if p.len() < 9 || extranonce1.is_empty() {
                     continue;
                 }
-                match parse_notify(&p, &extranonce1, extranonce2_size, difficulty, &cfg.pow_schedule) {
+                match parse_notify(&p, &extranonce1, extranonce2_size, difficulty) {
                     Some(job) => shared.publish_job(job),
                     None => eprintln!("[pool] invalid notify message"),
                 }
@@ -311,15 +309,15 @@ fn parse_notify(
     extranonce1: &[u8],
     extranonce2_size: usize,
     difficulty: f64,
-    pow_schedule: &PowSchedule,
 ) -> Option<MinerJob> {
     let prev_swab: [u8; 32] = hex::decode(p[1].as_str()?).ok()?.try_into().ok()?;
     let coinb1 = hex::decode(p[2].as_str()?).ok()?;
     let version = u32::from_str_radix(p[5].as_str()?, 16).ok()?;
-    // The height in the coinbase is the height of the block being mined, and
-    // with it the PoW. Decided here, once, so no worker ever has to guess.
+    // The version bits decide the PoW, exactly as the node's GetHash does -
+    // decided here, once per job, so no worker has to. The height is only
+    // for showing the user which block is being mined.
     let height = bip34_height(&coinb1);
-    let algo = pow_schedule.algo_for_job(height, version);
+    let algo = PowAlgo::for_version(version);
     let steps = p[4]
         .as_array()?
         .iter()
@@ -484,22 +482,24 @@ mod tests {
         ]
     }
 
-    /// Every job carries its height and the PoW the schedule picks for it.
+    /// Every job carries its height and the PoW its version bits pick - the
+    /// height plays no part in the choice.
     #[test]
     fn notify_decides_the_jobs_pow() {
-        use crate::consensus::PowAlgo;
-        let fork = PowSchedule { next_pow_height: Some(70_000) };
-        let job = parse_notify(&notify_params(69_999, 0x2000_1000), &[1, 2], 4, 1.0, &fork).unwrap();
-        assert_eq!(job.height, Some(69_999));
-        assert_eq!(job.algo, Some(PowAlgo::Sha3t));
-
-        let job = parse_notify(&notify_params(70_000, 0x2000_1000), &[1, 2], 4, 1.0, &fork).unwrap();
-        assert_eq!(job.height, Some(70_000));
-        assert_eq!(job.algo, None, "past the fork this build must not hash");
-
-        let none = PowSchedule { next_pow_height: None };
-        let job = parse_notify(&notify_params(70_000, 0x2000_0000), &[1, 2], 4, 1.0, &none).unwrap();
-        assert_eq!(job.algo, Some(PowAlgo::Sha256d));
+        for (height, version, algo) in [
+            (64_359, 0x2000_1000, PowAlgo::Sha3t),
+            // What getblocktemplate hands out from the fork height on.
+            (64_360, 0x2000_1800, PowAlgo::Bc3Hash),
+            (64_360, 0x2000_0800, PowAlgo::Bc3Hash),
+            // A SHA3-256t version past the height is still SHA3-256t.
+            (64_361, 0x2000_1000, PowAlgo::Sha3t),
+            (10, 0x2000_0000, PowAlgo::Sha256d),
+        ] {
+            let job = parse_notify(&notify_params(height, version), &[1, 2], 4, 1.0).unwrap();
+            assert_eq!(job.height, Some(height));
+            assert_eq!(job.version, version);
+            assert_eq!(job.algo, algo, "height {height}, version {version:08x}");
+        }
     }
 
     #[test]

@@ -15,6 +15,12 @@ sha3 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
+# src/consensus.rs, shared with the CLI, asks for the CLI's `bc3hash` feature.
+# This crate never has it - BC3Hash is the node's C++, which has no place in a
+# browser - so the check-cfg lint is told to expect the name.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("bc3hash"))'] }
+
 [profile.release]
 # Speed over size: this is a hash loop, not a widget.
 opt-level = 3

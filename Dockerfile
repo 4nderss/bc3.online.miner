@@ -6,9 +6,15 @@
 # and not three.
 #
 # No CUDA toolkit is installed: the kernel is precompiled to PTX at build time
-# and the driver JITs it. The build stage needs nothing but Rust.
+# and the driver JITs it. The build stage needs nothing but Rust and a C++
+# compiler for BC3Hash.
 
 FROM rust:1-trixie AS build
+# Clang for BC3Hash's C++: ~10 % more hashrate than the image's GCC 14, measured.
+# bc3hash/build.rs picks it up from PATH.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends clang \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked

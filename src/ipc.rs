@@ -27,7 +27,12 @@ pub enum Event {
         backend: String,
         gpus: Vec<String>,
         cpu_threads: usize,
+        /// CPU threads that only mine when the GPUs cannot (BC3Hash).
+        cpu_fallback_threads: usize,
     },
+    /// The pool's jobs moved to another PoW (and on the first job): which one,
+    /// and where it is hashed - "gpu", "cpu", "gpu+cpu" or "none".
+    Pow { algo: String, devices: String },
     /// Connection state towards the pool.
     Status {
         state: StatusState,
@@ -153,10 +158,22 @@ mod tests {
             backend: "cuda".into(),
             gpus: vec!["RTX 3050 Ti".into()],
             cpu_threads: 0,
+            cpu_fallback_threads: 20,
         })
         .unwrap();
         assert!(s.contains(r#""type":"startup""#));
         assert!(s.contains(r#""gpus":["RTX 3050 Ti"]"#));
+        assert!(s.contains(r#""cpu_fallback_threads":20"#));
+    }
+
+    #[test]
+    fn pow_event_names_the_algorithm_and_devices() {
+        let s = serde_json::to_string(&Event::Pow {
+            algo: "BC3Hash".into(),
+            devices: "cpu".into(),
+        })
+        .unwrap();
+        assert_eq!(s, r#"{"type":"pow","algo":"BC3Hash","devices":"cpu"}"#);
     }
 
     #[test]

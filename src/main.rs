@@ -16,11 +16,12 @@ mod stratum;
 mod worker;
 
 use backend::BackendKind;
+use worker::CpuRole;
 use clap::Parser;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "bc3-miner", version, about = "BC3 (SHA3-256t) miner - bc3.online")]
+#[command(name = "bc3-miner", version, about = "BC3 miner - bc3.online")]
 struct Args {
     /// Payout mode. Picks the pool port: pplns 3111, solo 3112.
     #[arg(long, value_enum, default_value_t = Mode::Pplns, env = "BC3_MODE")]
@@ -44,7 +45,9 @@ struct Args {
     #[arg(long, env = "BC3_WORKER")]
     rig: Option<String>,
 
-    /// Backend: auto = CUDA if possible, else OpenCL, else CPU.
+    /// Backend: auto = CUDA if possible, else OpenCL, else CPU. In auto the
+    /// CPU also mines whatever the GPU has no kernel for (BC3Hash); with cuda
+    /// or opencl it mines only if --threads asks it to.
     #[arg(long, value_enum, default_value_t = BackendKind::Auto, env = "BC3_BACKEND")]
     backend: BackendKind,
 
@@ -52,10 +55,18 @@ struct Args {
     #[arg(long, env = "BC3_GPU_ID")]
     gpu_id: Option<usize>,
 
-    /// Number of CPU threads (0 = all cores). With a GPU backend the default
-    /// is to start no CPU threads - pass the flag to mine with both.
+    /// Number of CPU threads (0 = all cores), mining every job. Without the
+    /// flag a GPU in --backend auto leaves the CPU idle until a job comes that
+    /// the GPU has no kernel for, and then mines it on all cores; with
+    /// --backend cuda or opencl the CPU does not mine at all.
     #[arg(long, env = "BC3_THREADS")]
     threads: Option<usize>,
+
+    /// BC3Hash lookup tables: fast (~256 MiB of RAM, the default) or compact
+    /// (~7 MiB, 10-20 % slower). Both find exactly the same shares.
+    #[cfg(feature = "bc3hash")]
+    #[arg(long, value_enum, default_value_t = Bc3HashMode::Fast, env = "BC3_BC3HASH_MODE")]
+    bc3hash_mode: Bc3HashMode,
 
     /// Intensity 1-100 %. Below 100 the workers idle between passes, which
     /// lowers heat/power draw and keeps the machine usable while mining.
@@ -87,12 +98,24 @@ struct Args {
     /// List available hardware and exit (the GUI asks before starting).
     #[arg(long)]
     probe: bool,
+}
 
-    /// First block height of the next PoW hard fork. For testing on regtest
-    /// only: the mainnet height is built in. From this height on the miner
-    /// stops hashing, since this version does not implement that PoW.
-    #[arg(long, env = "BC3_NEXT_POW_HEIGHT")]
-    next_pow_height: Option<u32>,
+/// Size of the BC3Hash tables - see `bc3hash::Mode`.
+#[cfg(feature = "bc3hash")]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum Bc3HashMode {
+    Compact,
+    Fast,
+}
+
+#[cfg(feature = "bc3hash")]
+impl From<Bc3HashMode> for bc3hash::Mode {
+    fn from(mode: Bc3HashMode) -> Self {
+        match mode {
+            Bc3HashMode::Compact => bc3hash::Mode::Compact,
+            Bc3HashMode::Fast => bc3hash::Mode::Fast,
+        }
+    }
 }
 
 /// Payout mode. Only the port differs, but nobody should have to remember
@@ -124,7 +147,7 @@ impl Mode {
 fn normalise_env() {
     const VARS: [&str; 10] = [
         "BC3_WALLET", "BC3_WORKER", "BC3_USER", "BC3_MODE", "BC3_POOL",
-        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID", "BC3_NEXT_POW_HEIGHT",
+        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID", "BC3_BC3HASH_MODE",
     ];
     let present: Vec<(String, String)> = std::env::vars().collect();
     for want in VARS {
@@ -207,11 +230,6 @@ fn main() {
         std::process::exit(2);
     };
     let pool = args.pool.clone().unwrap_or_else(|| args.mode.default_pool().to_string());
-    let mut pow_schedule = consensus::PowSchedule::MAINNET;
-    if let Some(h) = args.next_pow_height {
-        pow_schedule.next_pow_height = Some(h);
-        human!("[miner] next PoW fork at height {h} (override)");
-    }
 
     let gpus = if matches!(args.backend, BackendKind::Cpu) {
         vec![]
@@ -239,38 +257,85 @@ fn main() {
         }
     }
 
-    // "All cores" (0) means different things with and without a GPU: every
-    // GPU has a feeder thread that must get CPU time to launch the next
-    // kernel in time. If we let CPU mining take every core the feeders starve
-    // and the GPU hashrate drops more than the CPU adds. So we reserve one
-    // core per GPU plus one more.
-    let threads = match (args.threads, gpus.is_empty()) {
-        (Some(0), true) => all_cores,
-        (Some(0), false) => all_cores.saturating_sub(gpus.len() + 1).max(1),
-        (Some(n), _) => n,
-        (None, true) => all_cores, // pure CPU mining, as before
-        (None, false) => 0,        // GPU mode: no CPU threads unless asked for
+    let (threads, role) = plan_cpu(args.backend, gpus.len(), args.threads, all_cores);
+    let plan = shared::MiningPlan {
+        gpus: gpus.len(),
+        cpu_threads: if role == CpuRole::All { threads } else { 0 },
+        cpu_fallback_threads: if role == CpuRole::GpuFallback { threads } else { 0 },
     };
 
     human!(
         "bc3-miner {} - {} GPU(s), {} CPU thread(s)",
         env!("CARGO_PKG_VERSION"),
         gpus.len(),
-        threads
+        plan.cpu_threads
     );
     for gpu in &gpus {
         human!("[gpu] found: {}", gpu.describe());
+    }
+    if plan.cpu_fallback_threads > 0 {
+        human!(
+            "[cpu] {} thread(s) standing by for jobs the GPU has no kernel for (BC3Hash)",
+            plan.cpu_fallback_threads
+        );
     }
     ipc::emit(&ipc::Event::Startup {
         version: env!("CARGO_PKG_VERSION").to_string(),
         backend: if gpus.is_empty() { "cpu".into() } else { "gpu".into() },
         gpus: gpus.iter().map(|g| g.describe()).collect(),
-        cpu_threads: threads,
+        cpu_threads: plan.cpu_threads,
+        cpu_fallback_threads: plan.cpu_fallback_threads,
     });
+
+    // The BC3Hash tables are built now, on their own thread, rather than by
+    // the first hash: the fast ones take ~11 s, which would otherwise land in
+    // the middle of mining - at the fork, the moment it matters. The same call
+    // runs the build's self-test against the node's vectors. Without CPU
+    // threads nothing here ever hashes BC3Hash, so nothing is built.
+    #[cfg(feature = "bc3hash")]
+    {
+        bc3hash::configure(args.bc3hash_mode.into());
+        if threads > 0 {
+            let mode = args.bc3hash_mode;
+            std::thread::Builder::new()
+                .name("bc3hash-init".into())
+                .spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    // No exit: SHA3-256t, on the GPU above all, mines on
+                    // regardless. The CPU threads see the same result through
+                    // worker::cpu_supports and leave BC3Hash alone - shares
+                    // from a wrong build would only ever be rejected.
+                    if let Err(e) = bc3hash::initialize() {
+                        let message = match e {
+                            bc3hash::InitError::Tables { .. } => format!(
+                                "BC3Hash: NOT mining - {e} With little memory, start with \
+                                 --bc3hash-mode compact."
+                            ),
+                            bc3hash::InitError::WrongResult { .. } => {
+                                format!("BC3Hash: NOT mining - {e}")
+                            }
+                        };
+                        eprintln!("bc3-miner: {message}");
+                        ipc::emit(&ipc::Event::Status {
+                            state: ipc::StatusState::Error,
+                            message,
+                        });
+                        return;
+                    }
+                    human!(
+                        "[cpu] BC3Hash tables ready and self-tested ({}, {:.0} MiB) in {:.1} s",
+                        format!("{mode:?}").to_lowercase(),
+                        bc3hash::table_bytes() as f64 / (1u64 << 20) as f64,
+                        t0.elapsed().as_secs_f64()
+                    );
+                })
+                .expect("could not start the BC3Hash table thread");
+        }
+    }
 
     // Bunden kö: se Shared::submit.
     let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(shared::SUBMIT_QUEUE);
-    let shared = Arc::new(shared::Shared::new(submit_tx));
+    let shared = Arc::new(shared::Shared::new(submit_tx, plan));
     shared.set_intensity(args.intensity);
     if args.intensity < 100 {
         human!("[miner] intensity {}%", args.intensity);
@@ -282,7 +347,7 @@ fn main() {
         let s = shared.clone();
         std::thread::Builder::new()
             .name(format!("worker-{i}"))
-            .spawn(move || worker::run_worker(s, i, total_workers))
+            .spawn(move || worker::run_worker(s, i, total_workers, role))
             .expect("could not start a worker thread");
     }
     // Counted here, before the threads start: a worker that has not been
@@ -304,33 +369,96 @@ fn main() {
         std::thread::spawn(move || stats::run_reporter(s, interval));
     }
 
-    // Watchdog: a GPU-only run where every GPU worker has stopped is not
-    // mining, however healthy the process looks. It stays connected to the
-    // pool, the GUI keeps saying "Mining", and the hashrate is zero - on a
-    // rented GPU host that is billed at GPU prices. Exit instead, so a restart
-    // policy or an alert has something to react to.
-    if threads == 0 && total_workers > 0 {
+    // Watchdog: a run where every GPU worker has stopped and the CPU does not
+    // mine the current PoW either is not mining, however healthy the process
+    // looks. It stays connected to the pool, the GUI keeps saying "Mining",
+    // and the hashrate is zero - on a rented GPU host that is billed at GPU
+    // prices. Exit instead, so a restart policy or an alert has something to
+    // react to. Stand-in CPU threads only count while the PoW is theirs: on
+    // BC3Hash they are the miner, and a dead GPU changes nothing.
+    if plan.gpus > 0 {
         let s = shared.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(10));
-            if s.stats.gpu_workers_alive.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                eprintln!(
-                    "bc3-miner: every GPU worker has stopped and no CPU threads are running - \n\
-                     nothing is being mined. Exiting with an error so this is noticed.\n\
-                     Common causes: a driver too old for the kernel, or a GPU that fell off the bus."
-                );
-                std::process::exit(1);
+            if s.stats.gpu_workers_alive.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                continue;
             }
+            let algo = s.current_algo();
+            // Before the first job the PoW is unknown, and any CPU thread
+            // might turn out to be the one mining it.
+            let cpu_mining = match algo {
+                Some(a) => s.plan.devices_for(a).cpu,
+                None => s.plan.cpu_threads + s.plan.cpu_fallback_threads > 0,
+            };
+            if cpu_mining {
+                continue;
+            }
+            eprintln!(
+                "bc3-miner: every GPU worker has stopped and the CPU is not mining {} - \n\
+                 nothing is being mined. Exiting with an error so this is noticed.\n\
+                 Common causes: a driver too old for the kernel, or a GPU that fell off the bus.",
+                algo.map(|a| a.name()).unwrap_or("this job")
+            );
+            std::process::exit(1);
         });
     }
 
-    stratum::run_client(
-        shared,
-        submit_rx,
-        stratum::StratumConfig {
-            pool,
-            user,
-            pow_schedule,
-        },
-    );
+    stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user });
+}
+
+/// How many CPU threads to start, and what they mine.
+///
+/// "All cores" (0) means different things with and without a GPU: every GPU
+/// has a feeder thread that must get CPU time to launch the next kernel in
+/// time. If we let CPU mining take every core next to a busy GPU the feeders
+/// starve and the GPU hashrate drops more than the CPU adds. So `--threads 0`
+/// reserves one core per GPU plus one more.
+///
+/// The stand-ins are different. They only run when the GPU has nothing to do,
+/// on BC3Hash, which has no kernel; then its feeder needs no core, and they
+/// get all of them.
+fn plan_cpu(
+    backend: BackendKind,
+    gpus: usize,
+    threads: Option<usize>,
+    all_cores: usize,
+) -> (usize, CpuRole) {
+    match (threads, gpus) {
+        (Some(0), 0) => (all_cores, CpuRole::All),
+        (Some(0), g) => (all_cores.saturating_sub(g + 1).max(1), CpuRole::All),
+        (Some(n), _) => (n, CpuRole::All),
+        // Pure CPU mining, as before.
+        (None, 0) => (all_cores, CpuRole::All),
+        // A GPU in auto: no CPU mining next to it, but every core stands by
+        // for what it cannot do. Since the fork that is everything.
+        (None, _) if backend == BackendKind::Auto => (all_cores, CpuRole::GpuFallback),
+        // A GPU backend the user chose by name: the CPU stays out of it.
+        (None, _) => (0, CpuRole::All),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fallback decision for every way the miner can be started. The case
+    /// the fork hinges on: auto with a GPU and no --threads stands every core
+    /// by for BC3Hash, while a GPU backend chosen by name leaves the CPU alone.
+    #[test]
+    fn cpu_threads_and_their_role() {
+        use BackendKind::*;
+        assert_eq!(plan_cpu(Auto, 1, None, 20), (20, CpuRole::GpuFallback));
+        assert_eq!(plan_cpu(Auto, 2, None, 20), (20, CpuRole::GpuFallback));
+        assert_eq!(plan_cpu(Cuda, 1, None, 20), (0, CpuRole::All));
+        assert_eq!(plan_cpu(Opencl, 1, None, 20), (0, CpuRole::All));
+        // --threads always means "mine with these, everything".
+        assert_eq!(plan_cpu(Auto, 1, Some(4), 20), (4, CpuRole::All));
+        assert_eq!(plan_cpu(Cuda, 1, Some(4), 20), (4, CpuRole::All));
+        assert_eq!(plan_cpu(Auto, 2, Some(0), 20), (17, CpuRole::All));
+        assert_eq!(plan_cpu(Auto, 2, Some(0), 2), (1, CpuRole::All));
+        // No GPU: plain CPU mining on every core.
+        assert_eq!(plan_cpu(Auto, 0, None, 20), (20, CpuRole::All));
+        assert_eq!(plan_cpu(Cpu, 0, None, 20), (20, CpuRole::All));
+        assert_eq!(plan_cpu(Cpu, 0, Some(0), 20), (20, CpuRole::All));
+    }
 }

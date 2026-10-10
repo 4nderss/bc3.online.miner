@@ -1,0 +1,17 @@
+[package]
+name = "bc3hash"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "BC3Hash, the proof of work of BC3's second fork, via the node's C++ reference"
+# One copy of the C++ objects per binary, whatever else links them.
+links = "bc3hashref"
+publish = false
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+hex = "0.4"

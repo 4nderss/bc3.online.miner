@@ -306,6 +306,13 @@ listen("miner-event", ({ payload: ev }) => {
         : `${ev.cpu_threads} threads`;
       log(`miner ${ev.version} started — ${ev.gpus.length ? ev.gpus.join(", ") : "CPU only"}`);
       break;
+    case "pow": {
+      // Where the current PoW is hashed. Since BC3Hash (no GPU kernel) a GPU
+      // rig mines on its CPU, and the card has to say so.
+      const where = { gpu: "GPU", cpu: "CPU", "gpu+cpu": "GPU + CPU", none: "—" }[ev.devices];
+      el("backend").textContent = `${where || ev.devices} · ${ev.algo}`;
+      break;
+    }
     case "status":
       if (ev.state === "mining") setStatus("mining", "Mining");
       else if (ev.state === "connecting") setStatus("connecting", "Connecting");

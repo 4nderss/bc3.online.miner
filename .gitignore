@@ -24,3 +24,8 @@ gui/src-tauri/binaries/*.exe
 .env
 .env.*
 !.env.example
+
+# bc3hash/ is built as part of the miner (Cargo.lock at the root). Running its
+# own tests or benchmark from inside it writes a second lockfile; that one is
+# noise.
+/bc3hash/Cargo.lock

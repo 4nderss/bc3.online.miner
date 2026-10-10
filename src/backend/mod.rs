@@ -325,16 +325,20 @@ impl HitBudget {
 ///
 /// The match is exhaustive on purpose: a new `PowAlgo` variant does not
 /// compile until someone decides here whether a kernel exists for it. Without
-/// one the GPU worker idles on those jobs, which is correct - the CPU
-/// reference in consensus.rs is enough to mine, just slowly.
+/// one the GPU worker idles on those jobs and, in `--backend auto`, the CPU
+/// threads mine them - see `worker::CpuRole::GpuFallback`.
 pub fn kernel_supports(algo: PowAlgo) -> bool {
     match algo {
         PowAlgo::Sha3t => true,
         // The kernel always runs SHA3-256t; every hit would fail the CPU
         // re-check.
         PowAlgo::Sha256d => false,
-        // NEW POW: true once a kernel for it exists, and make scan_range in
-        // cuda.rs and opencl.rs launch that kernel for it.
+        // No kernel. BC3Hash is secp256k1 point multiplication from tables and
+        // modular inversion with 64-512-bit moduli - nothing like the
+        // keccak kernel - and costs about 1000 SHA3-256t hashes. When one is
+        // written: true here, and scan_range in cuda.rs and opencl.rs must
+        // launch it for this algo.
+        PowAlgo::Bc3Hash => false,
     }
 }
 

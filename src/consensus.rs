@@ -1,14 +1,22 @@
-//! BC3 consensus primitives the miner needs: SHA3-256t, header
+//! BC3 consensus primitives the miner needs: the PoW functions, header
 //! serialization, targets and merkle folding.
 //!
 //! Deliberately duplicated from the pool's private `bc3-core` (this client is
 //! open source). The test vectors at the bottom are chain-verified - the same
 //! expected values as the pool's - and lock the implementations to each other.
+//! BC3Hash is the exception: it is the node's own C++ (the `bc3hash` crate),
+//! because a port could differ from the node in one bit and nobody would know
+//! until no block was ever accepted.
 
 use sha3::{Digest, Sha3_256};
 
-/// Version bit marking SHA3-256t hashing (set in every post-fork block).
+/// Version bit marking SHA3-256t hashing (set in every block since the first
+/// fork, and still set after the second).
 pub const SHA3_VBIT: u32 = 0x0000_1000;
+
+/// Version bit 11, marking BC3Hash (set from the second fork on). It takes
+/// precedence over `SHA3_VBIT`; both stay in the hashed header.
+pub const BC3HASH_VBIT: u32 = 0x0000_0800;
 
 /// SHA3-256t: triple NIST SHA3-256 - BC3's PoW function.
 #[inline]
@@ -28,22 +36,31 @@ pub fn sha256d(data: &[u8]) -> [u8; 32] {
 
 /// A proof-of-work function, chosen per job.
 ///
-/// BC3 has changed its PoW once already (SHA256d -> SHA3-256t at the version
-/// bit) and a second hard fork will replace it again. Everything that hashes a
-/// header goes through this enum, and every `match` on it is exhaustive on
-/// purpose: adding the next variant must fail to compile at each place that
-/// has to learn about it, rather than silently fall into a default arm.
+/// BC3 has changed its PoW twice (SHA256d -> SHA3-256t -> BC3Hash), each time
+/// at a version bit. Everything that hashes a header goes through this enum,
+/// and every `match` on it is exhaustive on purpose: a new variant must fail
+/// to compile at each place that has to learn about it, rather than silently
+/// fall into a default arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowAlgo {
-    /// Pre-fork blocks (no version bit). Never sent by the pool today; kept
-    /// so the chain-verified genesis vector still runs through this path.
+    /// No version bit: blocks before the first fork. Never sent by the pool;
+    /// kept so the chain-verified genesis vector still runs through this path.
     Sha256d,
-    /// SHA3-256t, selected by `SHA3_VBIT`.
+    /// `SHA3_VBIT` without `BC3HASH_VBIT`.
     Sha3t,
-    // NEW POW: add the variant for the next hard fork here, then fix every
-    // compile error - `name`, `hash`, `PowSchedule::algo_for`, the backends'
-    // `supports` and the wasm algo ids.
+    /// `BC3HASH_VBIT`. CPU only: there is no GPU kernel for it.
+    Bc3Hash,
 }
+
+/// A PoW over one serialized 80-byte header.
+pub type PowFn = fn(&[u8; 80]) -> [u8; 32];
+
+/// BC3Hash where this build has it. The browser build (wasm/) shares this file
+/// but not the C++ behind it, and leaves the `bc3hash` feature off.
+#[cfg(feature = "bc3hash")]
+const BC3HASH: Option<PowFn> = Some(|h: &[u8; 80]| ::bc3hash::bc3hash(h));
+#[cfg(not(feature = "bc3hash"))]
+const BC3HASH: Option<PowFn> = None;
 
 impl PowAlgo {
     /// The name used in logs and shared with the pool.
@@ -51,75 +68,39 @@ impl PowAlgo {
         match self {
             PowAlgo::Sha256d => "SHA256d",
             PowAlgo::Sha3t => "SHA3-256t",
+            PowAlgo::Bc3Hash => "BC3Hash",
         }
     }
 
-    /// The version-bit rule alone, without the height schedule.
+    /// The node's rule, `CBlockHeader::GetHash`: bit 11 before bit 12, and
+    /// neither means SHA256d. The version alone decides - not the height - so
+    /// the job's version is all a miner needs.
     pub fn for_version(version: u32) -> PowAlgo {
-        if version & SHA3_VBIT != 0 {
+        if version & BC3HASH_VBIT != 0 {
+            PowAlgo::Bc3Hash
+        } else if version & SHA3_VBIT != 0 {
             PowAlgo::Sha3t
         } else {
             PowAlgo::Sha256d
         }
     }
 
-    /// Hash a serialized 80-byte header. This is the CPU reference for every
-    /// algorithm - and the oracle every GPU hit is re-checked against.
-    pub fn hash(&self, header80: &[u8; 80]) -> [u8; 32] {
+    /// The CPU implementation of this PoW, as a plain function so a hot loop
+    /// resolves it once per job instead of matching on every nonce. It is the
+    /// reference every GPU hit is re-checked against. None where this build
+    /// has no implementation - BC3Hash in the browser build.
+    pub fn hash_fn(&self) -> Option<PowFn> {
         match self {
-            PowAlgo::Sha256d => sha256d(header80),
-            PowAlgo::Sha3t => sha3t(header80),
+            PowAlgo::Sha256d => Some(|h: &[u8; 80]| sha256d(h)),
+            PowAlgo::Sha3t => Some(|h: &[u8; 80]| sha3t(h)),
+            PowAlgo::Bc3Hash => BC3HASH,
         }
     }
 
-    /// The hash as a plain function, so a hot loop can resolve the algorithm
-    /// once per job instead of matching on every nonce.
-    pub fn hash_fn(&self) -> fn(&[u8; 80]) -> [u8; 32] {
-        match self {
-            PowAlgo::Sha256d => |h: &[u8; 80]| sha256d(h),
-            PowAlgo::Sha3t => |h: &[u8; 80]| sha3t(h),
-        }
-    }
-}
-
-/// Height of the next PoW hard fork on mainnet. `None` until the spec and the
-/// height are known; set it in the same release that adds the `PowAlgo`
-/// variant, or this build stops mining at that height (which is the point:
-/// grinding the old PoW past the fork only produces rejected shares).
-pub const MAINNET_NEXT_POW_HEIGHT: Option<u32> = None;
-
-/// Which PoW a block at a given height uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PowSchedule {
-    /// First height of the next PoW. From that height on this build has no
-    /// implementation and `algo_for` answers `None`.
-    pub next_pow_height: Option<u32>,
-}
-
-impl PowSchedule {
-    pub const MAINNET: PowSchedule = PowSchedule {
-        next_pow_height: MAINNET_NEXT_POW_HEIGHT,
-    };
-
-    /// The PoW for a block at `height` with header `version`. `None` means a
-    /// PoW this build does not implement - do not hash at all.
-    pub fn algo_for(&self, height: u32, version: u32) -> Option<PowAlgo> {
-        match self.next_pow_height {
-            // NEW POW: once the variant exists, return it here instead.
-            Some(h) if height >= h => None,
-            _ => Some(PowAlgo::for_version(version)),
-        }
-    }
-
-    /// `algo_for` for a job whose height may not be readable. Without a fork
-    /// scheduled the height does not matter; with one, an unknown height could
-    /// be on either side of it, and guessing wrong grinds a dead PoW.
-    pub fn algo_for_job(&self, height: Option<u32>, version: u32) -> Option<PowAlgo> {
-        match (height, self.next_pow_height) {
-            (Some(h), _) => self.algo_for(h, version),
-            (None, None) => Some(PowAlgo::for_version(version)),
-            (None, Some(_)) => None,
-        }
+    /// Hash one serialized 80-byte header; None as for `hash_fn`.
+    #[cfg(test)]
+    pub fn hash(&self, header80: &[u8; 80]) -> Option<[u8; 32]> {
+        self.hash_fn().map(|f| f(header80))
     }
 }
 
@@ -145,12 +126,13 @@ impl BlockHeader {
         out
     }
 
-    /// The PoW hash by the version-bit rule alone. Mining goes through the
-    /// job's `PowAlgo` instead, which also knows the fork height; this stays
-    /// for the chain-verified vectors - test-only, so nothing mines with it.
+    /// The block hash, as the node's `GetHash` computes it. Test-only: mining
+    /// resolves the job's `PowAlgo` once per job instead of once per header.
     #[cfg(test)]
     pub fn hash(&self) -> [u8; 32] {
-        PowAlgo::for_version(self.version).hash(&self.serialize())
+        let algo = PowAlgo::for_version(self.version);
+        algo.hash(&self.serialize())
+            .unwrap_or_else(|| panic!("this build has no {}", algo.name()))
     }
 
     #[cfg(test)]
@@ -207,31 +189,47 @@ pub fn hash_meets_target(hash: &[u8; 32], target: &Target) -> bool {
     true
 }
 
-/// Target for a stratum difficulty: diff1 target / difficulty.
-/// Fractional difficulties are supported via 2^24 scaling (as the pool does).
+/// Target for a stratum difficulty: diff1 target / difficulty, computed
+/// exactly as the pool's bc3-core does - floor((diff1 << 31) /
+/// floor(difficulty * 2^31)) - so the two agree on every share.
+///
+/// 31 bits, not the 24 this used to scale by: BC3Hash share difficulties sit
+/// around 1e-6, and the pool's floor is 1e-7. At 24 bits the difficulty is
+/// rounded to whole steps of 6e-8, so at 1e-7 the target came out 1.7 times
+/// too easy and ~40 % of the shares sent were below the pool's target - about
+/// 5 % at 1e-6. diff1 is below 2^224, so the shift still fits in 256 bits.
 pub fn target_for_difficulty(difficulty: f64) -> Target {
-    // diff1 = 0x00000000ffff0000...0000. Division is done in u128 limbs.
-    const SCALE_BITS: u32 = 24;
-    let divisor = ((difficulty * (1u64 << SCALE_BITS) as f64).max(1.0)) as u128;
-    // diff1 << 24 as a 256-bit number in four 64-bit big-endian limbs:
-    // diff1 = 0xffff << 208 -> shifted = 0xffff << 232 ... as a byte array.
-    // Simple long division over 32 bytes.
-    let mut dividend = [0u8; 33]; // extra byte for the <<24 overhang
-    // diff1 (32B BE) has 0xff at bytes 4,5. In the 33-byte array that becomes
-    // idx 5,6; <<24 moves it up three bytes -> idx 2,3.
-    dividend[2] = 0xff;
-    dividend[3] = 0xff;
+    const SCALE_BITS: u32 = 31;
+    // The remainder below is shifted by a byte per step inside a u128, so the
+    // divisor has to stay under 2^120 - a share difficulty of 2^89, which no
+    // pool comes near.
+    let divisor = ((difficulty * (1u64 << SCALE_BITS) as f64).max(1.0) as u128)
+        .min((1u128 << 120) - 1);
+    let diff1 = compact_to_target(0x1d00ffff).expect("diff1 is a valid target");
+    let dividend = shl(&diff1, SCALE_BITS);
+    // Long division over the 32 big-endian bytes.
     let mut out = [0u8; 32];
     let mut rem: u128 = 0;
-    for i in 0..33 {
-        rem = (rem << 8) | dividend[i] as u128;
-        let q = rem / divisor;
+    for (q, d) in out.iter_mut().zip(dividend) {
+        rem = (rem << 8) | d as u128;
+        *q = (rem / divisor) as u8; // < 256: rem < divisor before the shift
         rem %= divisor;
-        if i > 0 {
-            out[i - 1] = q as u8; // q < 256 guaranteed by the long-division invariant
+    }
+    out
+}
+
+/// `x << n` for a 256-bit big-endian number, n < 256; bits shifted past the
+/// top are lost.
+fn shl(x: &[u8; 32], n: u32) -> [u8; 32] {
+    let (bytes, bits) = ((n / 8) as usize, n % 8);
+    let byte = |i: usize| x.get(i).copied().unwrap_or(0);
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = if bits == 0 {
+            byte(i + bytes)
         } else {
-            debug_assert_eq!(q, 0);
-        }
+            (byte(i + bytes) << bits) | (byte(i + bytes + 1) >> (8 - bits))
+        };
     }
     out
 }
@@ -402,6 +400,47 @@ mod tests {
             hex::encode(t16),
             "000000000ffff000000000000000000000000000000000000000000000000000"
         );
+        // The smallest step: diff1 << 31 over 1, i.e. 0xffff << 239.
+        assert_eq!(
+            hex::encode(target_for_difficulty(1.0 / (1u64 << 31) as f64)),
+            "7fff800000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(target_for_difficulty(1e-12), target_for_difficulty(1.0 / (1u64 << 31) as f64));
+    }
+
+    /// The pool's formula at the difficulties BC3Hash uses. For 1e-7 the
+    /// pool divides by floor(1e-7 * 2^31) = 214, and the target must be the
+    /// exact quotient: target * 214 <= diff1 << 31 < (target + 1) * 214.
+    /// With the old 2^24 scaling the divisor was 1 and the target 1.7 times
+    /// too large.
+    #[test]
+    fn small_difficulties_match_the_pool() {
+        fn times(x: &[u8; 32], m: u64) -> [u8; 33] {
+            let mut out = [0u8; 33];
+            let mut carry = 0u128;
+            for i in (0..32).rev() {
+                let v = x[i] as u128 * m as u128 + carry;
+                out[i + 1] = v as u8;
+                carry = v >> 8;
+            }
+            out[0] = carry as u8;
+            out
+        }
+        let mut dividend = [0u8; 33];
+        dividend[1..].copy_from_slice(&shl(&compact_to_target(0x1d00ffff).unwrap(), 31));
+        for (difficulty, divisor) in [(1e-7, 214u64), (1e-6, 2147), (2.5e-5, 53_687), (0.1, 214_748_364)] {
+            let target = target_for_difficulty(difficulty);
+            assert!(times(&target, divisor) <= dividend, "{difficulty}: target too large");
+            let mut next = target;
+            for b in next.iter_mut().rev() {
+                let (v, overflow) = b.overflowing_add(1);
+                *b = v;
+                if !overflow {
+                    break;
+                }
+            }
+            assert!(times(&next, divisor) > dividend, "{difficulty}: target too small");
+        }
     }
 
     #[test]
@@ -438,9 +477,8 @@ mod tests {
         assert_eq!(bip34_height(&cb[..30]), None);
     }
 
-    /// The parser now decides the PoW, so the edges matter: regtest heights
-    /// written as small-integer opcodes, a push cut off by the end of coinb1,
-    /// oversized and negative pushes.
+    /// The edges: regtest heights written as small-integer opcodes, a push
+    /// cut off by the end of coinb1, oversized and negative pushes.
     #[test]
     fn bip34_height_edge_cases() {
         let prefix = |script: &[u8]| {
@@ -471,63 +509,84 @@ mod tests {
         assert_eq!(bip34_height(&cb), Some(59_342));
     }
 
+    /// The node's `GetHash` rule: bit 11 wins whatever else is set, then bit
+    /// 12, then SHA256d. Every combination, plus neighbouring bits that must
+    /// not matter.
     #[test]
-    fn pow_schedule_without_a_fork_follows_the_version_bit() {
-        let s = PowSchedule { next_pow_height: None };
-        assert_eq!(s.algo_for(10, 1), Some(PowAlgo::Sha256d));
-        assert_eq!(s.algo_for(30_239, 0x2000_0000), Some(PowAlgo::Sha256d));
-        assert_eq!(s.algo_for(59_342, 0x2000_1000), Some(PowAlgo::Sha3t));
-        assert_eq!(s.algo_for(u32::MAX, SHA3_VBIT), Some(PowAlgo::Sha3t));
-        // Mainnet has no next fork until a release sets one.
-        assert_eq!(PowSchedule::MAINNET.next_pow_height, MAINNET_NEXT_POW_HEIGHT);
-    }
-
-    #[test]
-    fn pow_schedule_refuses_heights_at_and_after_the_next_fork() {
-        let s = PowSchedule { next_pow_height: Some(100_000) };
-        assert_eq!(s.algo_for(99_999, 0x2000_1000), Some(PowAlgo::Sha3t));
-        assert_eq!(s.algo_for(99_999, 0x2000_0000), Some(PowAlgo::Sha256d));
-        assert_eq!(s.algo_for(100_000, 0x2000_1000), None);
-        assert_eq!(s.algo_for(100_001, 0x2000_1000), None);
-        assert_eq!(s.algo_for(u32::MAX, 0), None);
-    }
-
-    /// An unreadable height is harmless without a fork scheduled, and a
-    /// reason to stop with one: it could be on either side.
-    #[test]
-    fn pow_schedule_with_an_unknown_height() {
-        let none = PowSchedule { next_pow_height: None };
-        assert_eq!(none.algo_for_job(None, 0x2000_1000), Some(PowAlgo::Sha3t));
-        let fork = PowSchedule { next_pow_height: Some(5) };
-        assert_eq!(fork.algo_for_job(None, 0x2000_1000), None);
-        assert_eq!(fork.algo_for_job(Some(4), 0x2000_1000), Some(PowAlgo::Sha3t));
-        assert_eq!(fork.algo_for_job(Some(5), 0x2000_1000), None);
+    fn the_version_bits_pick_the_pow() {
+        for (version, algo) in [
+            (0x0000_0001, PowAlgo::Sha256d),
+            (0x2000_0000, PowAlgo::Sha256d),
+            (0x2000_1000, PowAlgo::Sha3t),
+            (0x2000_0800, PowAlgo::Bc3Hash),
+            (0x2000_1800, PowAlgo::Bc3Hash),
+            (0x2000_0400, PowAlgo::Sha256d),
+            (0x2000_2000, PowAlgo::Sha256d),
+            (0xffff_ffff, PowAlgo::Bc3Hash),
+            (0xffff_f7ff, PowAlgo::Sha3t),
+            (0xffff_e7ff, PowAlgo::Sha256d),
+        ] {
+            assert_eq!(PowAlgo::for_version(version), algo, "version {version:08x}");
+        }
+        assert_eq!(PowAlgo::Sha256d.name(), "SHA256d");
+        assert_eq!(PowAlgo::Sha3t.name(), "SHA3-256t");
+        assert_eq!(PowAlgo::Bc3Hash.name(), "BC3Hash");
     }
 
     /// `hash`, `hash_fn` and the version-bit `BlockHeader::hash` must agree.
     #[test]
     fn pow_algo_dispatch_matches_the_reference() {
-        let mut h = BlockHeader {
-            version: 1,
+        let h = BlockHeader {
+            version: 0x2000_1000,
             prev_hash: [3u8; 32],
             merkle_root: [5u8; 32],
             time: 1_777_245_555,
             bits: 0x1d00ffff,
             nonce: 42,
         };
-        for algo in [PowAlgo::Sha256d, PowAlgo::Sha3t] {
-            h.version = match algo {
-                PowAlgo::Sha256d => 0x2000_0000,
-                PowAlgo::Sha3t => 0x2000_1000,
-            };
-            let ser = h.serialize();
-            assert_eq!(PowAlgo::for_version(h.version), algo);
-            assert_eq!(algo.hash(&ser), h.hash(), "{}", algo.name());
-            assert_eq!((algo.hash_fn())(&ser), h.hash(), "{}", algo.name());
+        let ser = h.serialize();
+        assert_eq!(PowAlgo::Sha3t.hash(&ser), Some(sha3t(&ser)));
+        assert_eq!(PowAlgo::Sha3t.hash(&ser), Some(h.hash()));
+        assert_eq!(PowAlgo::Sha256d.hash(&ser), Some(sha256d(&ser)));
+        for algo in [PowAlgo::Sha256d, PowAlgo::Sha3t, PowAlgo::Bc3Hash] {
+            if let Some(f) = algo.hash_fn() {
+                assert_eq!(Some(f(&ser)), algo.hash(&ser), "{}", algo.name());
+            }
         }
-        assert_eq!(PowAlgo::Sha3t.hash(&h.serialize()), sha3t(&h.serialize()));
-        assert_eq!(PowAlgo::Sha256d.name(), "SHA256d");
-        assert_eq!(PowAlgo::Sha3t.name(), "SHA3-256t");
+        // Only the browser build may lack BC3Hash.
+        assert_eq!(PowAlgo::Bc3Hash.hash_fn().is_some(), cfg!(feature = "bc3hash"));
+    }
+
+    /// The node's header vectors (doc/bc3/vectors/header-vectors.json): one
+    /// 80-byte header under all four combinations of bits 11 and 12, with the
+    /// digest `GetHash` gives and the block id RPC shows. Run through the
+    /// miner's own path - version -> PowAlgo -> hash - not the crate's.
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    fn node_header_vectors_through_the_miner_path() {
+        let dir = std::env::var_os("BC3HASH_VECTORS")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bc3hash/vectors")
+            });
+        let path = dir.join("header-vectors.json");
+        let json = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e} - copy doc/bc3/vectors from the node", path.display()));
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for v in &vectors {
+            let header: [u8; 80] = hex::decode(v["header"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
+            let algo = PowAlgo::for_version(version);
+            seen.insert(version & (BC3HASH_VBIT | SHA3_VBIT));
+            let digest = algo.hash(&header).unwrap();
+            assert_eq!(hex::encode(digest), v["digest"], "version {version:08x}, {}", algo.name());
+            assert_eq!(hash_to_display(&digest), v["block_id"], "version {version:08x}");
+        }
+        assert_eq!(seen.len(), 4, "the vectors must cover all four bit combinations");
     }
 
     #[test]

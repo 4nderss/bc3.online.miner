@@ -1,7 +1,7 @@
 //! State shared between the stratum client and the worker threads.
 
 use crate::consensus::{PowAlgo, Target};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 #[cfg(test)]
 use std::sync::Arc;
@@ -23,9 +23,9 @@ pub struct MinerJob {
     pub share_target: Target,
     /// Block height from the coinbase (BIP34); None if it could not be read.
     pub height: Option<u32>,
-    /// The PoW this job must be hashed with, decided once at notify time.
-    /// None = a PoW this build does not implement: nobody hashes the job.
-    pub algo: Option<PowAlgo>,
+    /// The PoW this job must be hashed with, decided once at notify time from
+    /// the version bits.
+    pub algo: PowAlgo,
 }
 
 /// How many found shares may wait for the stratum thread.
@@ -147,27 +147,92 @@ pub struct Shared {
     pub stats: Stats,
     /// Bounded on purpose - see `Shared::submit`.
     pub submit_tx: std::sync::mpsc::SyncSender<FoundShare>,
-    /// The latest job uses a PoW this build cannot hash. Kept so the warning
-    /// is said once when it starts and once when it ends - not per job.
-    pow_unsupported: AtomicBool,
+    /// Which devices mine which PoW; fixed before the workers start.
+    pub plan: MiningPlan,
+    /// The PoW of the latest job, so a change of PoW is announced once - not
+    /// once per job.
+    last_algo: Mutex<Option<PowAlgo>>,
 }
 
-/// What the user is told when the pool has moved to a PoW this build does not
-/// implement.
-pub fn unsupported_pow_message(height: Option<u32>) -> String {
-    let at = match height {
-        Some(h) => format!("at height {h}"),
-        None => "at this height".into(),
-    };
-    format!(
-        "this miner version does not support the new BC3 proof of work {at} - \
-         update the miner. Hashing has stopped; it resumes by itself if the pool \
-         sends a job this version can mine."
-    )
+/// Which devices mine what. Decided once in main from the backends that came
+/// up, and read per job: by the stand-in CPU threads to know whether they are
+/// needed, and by `publish_job` to tell the user where the hashing happens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MiningPlan {
+    /// GPU workers started.
+    pub gpus: usize,
+    /// CPU threads that mine every job the CPU can hash.
+    pub cpu_threads: usize,
+    /// CPU threads that mine only what no GPU kernel can - see
+    /// `worker::CpuRole::GpuFallback`.
+    pub cpu_fallback_threads: usize,
 }
 
-/// A worker's gate in front of its hashing loop: which algorithm to hash the
-/// job with, or None to sit the job out.
+/// Where the jobs of one PoW are hashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PowDevices {
+    pub gpu: bool,
+    pub cpu: bool,
+}
+
+impl PowDevices {
+    /// For the GUI: "gpu", "cpu", "gpu+cpu" or "none".
+    pub fn label(&self) -> &'static str {
+        match (self.gpu, self.cpu) {
+            (true, true) => "gpu+cpu",
+            (true, false) => "gpu",
+            (false, true) => "cpu",
+            (false, false) => "none",
+        }
+    }
+}
+
+impl MiningPlan {
+    /// Do the GPUs take jobs of this PoW? Decided by what was started, not by
+    /// what is still alive: a GPU that dies is the watchdog's business in
+    /// main, not a reason to move its work to the stand-in CPU threads.
+    pub fn gpus_mine(&self, algo: PowAlgo) -> bool {
+        self.gpus > 0 && crate::backend::kernel_supports(algo)
+    }
+
+    /// Never waits: this runs on the stratum thread, and a BC3Hash still
+    /// building its tables counts as mining until it is known not to.
+    pub fn devices_for(&self, algo: PowAlgo) -> PowDevices {
+        let gpu = self.gpus_mine(algo);
+        let cpu = crate::worker::cpu_may_support(algo)
+            && (self.cpu_threads > 0 || (self.cpu_fallback_threads > 0 && !gpu));
+        PowDevices { gpu, cpu }
+    }
+
+    /// What the user is told when jobs of this PoW start arriving: whether
+    /// anything is mining them, and where.
+    pub fn status(&self, algo: PowAlgo) -> (bool, String) {
+        let name = algo.name();
+        let d = self.devices_for(algo);
+        match (d.gpu, d.cpu) {
+            (true, true) => (true, format!("{name}: mining on GPU and CPU")),
+            (true, false) => (true, format!("{name}: mining on GPU")),
+            (false, true) if self.gpus > 0 => {
+                (true, format!("{name}: mining on CPU (no GPU kernel yet)"))
+            }
+            (false, true) => (true, format!("{name}: mining on CPU")),
+            (false, false) if !crate::worker::cpu_may_support(algo) => {
+                let why = crate::worker::cpu_unavailable(algo, false).unwrap_or_default();
+                (false, format!("{name}: NOT mining - {why}"))
+            }
+            (false, false) => (
+                false,
+                format!(
+                    "{name}: NOT mining - there is no GPU kernel for it yet and no CPU threads \
+                     are running. Use --backend auto, or add --threads N"
+                ),
+            ),
+        }
+    }
+}
+
+/// A worker's gate in front of its hashing loop: may it hash this PoW, or
+/// does it sit the job out?
 ///
 /// Sitting out is the whole point. Grinding a job with the wrong PoW still
 /// "finds" shares, every one of which the pool rejects - so the rig looks
@@ -179,24 +244,25 @@ pub struct AlgoGate {
 }
 
 impl AlgoGate {
+    /// `worker` names the worker in the warning; None keeps it quiet, so
+    /// twenty CPU threads do not say the same thing twenty times.
     pub fn check(
         &mut self,
-        job: &MinerJob,
-        worker: &str,
+        algo: PowAlgo,
+        worker: Option<&str>,
         supports: impl Fn(PowAlgo) -> bool,
     ) -> Option<PowAlgo> {
-        // None: Shared::publish_job has already told the user, once for all
-        // workers.
-        let algo = job.algo?;
         if supports(algo) {
             self.warned = None;
             return Some(algo);
         }
         if self.warned != Some(algo) {
-            eprintln!(
-                "[miner] {worker} has no implementation of {} - it idles until a job it can hash",
-                algo.name()
-            );
+            if let Some(worker) = worker {
+                eprintln!(
+                    "[miner] {worker} has no {} implementation - idle until a job it can hash",
+                    algo.name()
+                );
+            }
             self.warned = Some(algo);
         }
         None
@@ -204,7 +270,7 @@ impl AlgoGate {
 }
 
 impl Shared {
-    pub fn new(submit_tx: std::sync::mpsc::SyncSender<FoundShare>) -> Self {
+    pub fn new(submit_tx: std::sync::mpsc::SyncSender<FoundShare>, plan: MiningPlan) -> Self {
         Self {
             job: Mutex::new(None),
             job_cv: Condvar::new(),
@@ -212,7 +278,8 @@ impl Shared {
             generation: AtomicU64::new(0),
             stats: Stats::default(),
             submit_tx,
-            pow_unsupported: AtomicBool::new(false),
+            plan,
+            last_algo: Mutex::new(None),
         }
     }
 
@@ -298,7 +365,7 @@ impl Shared {
                 crate::human!("[pool] now working on block #{h}");
             }
         }
-        self.note_pow_support(&job);
+        self.note_pow(job.algo);
         {
             // The bump happens under the lock so that `wait_for_job_after`,
             // which checks the generation under the same lock, cannot see the
@@ -310,29 +377,41 @@ impl Shared {
         self.job_cv.notify_all();
     }
 
-    /// Tell the user when the pool's jobs move to a PoW this build cannot
-    /// hash, and again when they move back. Only the stratum thread publishes
-    /// jobs, so this runs once per job, not once per worker.
-    fn note_pow_support(&self, job: &MinerJob) {
-        let unsupported = job.algo.is_none();
-        if self.pow_unsupported.swap(unsupported, Ordering::Relaxed) == unsupported {
-            return;
+    /// Tell the user where the hashing happens whenever the pool's jobs move
+    /// to another PoW - at the fork, that is the moment a GPU rig switches to
+    /// its CPU. Only the stratum thread publishes jobs, so this is said once
+    /// per change, not once per worker.
+    fn note_pow(&self, algo: PowAlgo) {
+        {
+            let mut last = self.last_algo.lock().unwrap();
+            if *last == Some(algo) {
+                return;
+            }
+            *last = Some(algo);
         }
-        if unsupported {
-            let message = unsupported_pow_message(job.height);
-            eprintln!("[miner] {message}");
-            crate::ipc::emit(&crate::ipc::Event::Status {
-                state: crate::ipc::StatusState::Error,
-                message,
-            });
+        let (mining, message) = self.plan.status(algo);
+        if mining {
+            crate::human!("[miner] {message}");
         } else {
-            let name = job.algo.map(|a| a.name()).unwrap_or("?");
-            crate::human!("[miner] the pool's jobs use {name} again - mining resumed");
-            crate::ipc::emit(&crate::ipc::Event::Status {
-                state: crate::ipc::StatusState::Mining,
-                message: format!("{name} job received - mining resumed"),
-            });
+            eprintln!("[miner] {message}");
         }
+        crate::ipc::emit(&crate::ipc::Event::Pow {
+            algo: algo.name().into(),
+            devices: self.plan.devices_for(algo).label().into(),
+        });
+        crate::ipc::emit(&crate::ipc::Event::Status {
+            state: if mining {
+                crate::ipc::StatusState::Mining
+            } else {
+                crate::ipc::StatusState::Error
+            },
+            message,
+        });
+    }
+
+    /// The PoW of the latest job; None before the first one.
+    pub fn current_algo(&self) -> Option<PowAlgo> {
+        *self.last_algo.lock().unwrap()
     }
 
     /// Like `wait_for_job`, but only for a job published after generation
@@ -400,7 +479,7 @@ mod tests {
             ntime: 1_700_000_000,
             share_target: [0xFFu8; 32],
             height: Some(59_342),
-            algo: Some(PowAlgo::Sha3t),
+            algo: PowAlgo::Sha3t,
         }
     }
 
@@ -446,44 +525,82 @@ mod tests {
 
     fn shared() -> Shared {
         let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
-        Shared::new(tx)
+        Shared::new(tx, MiningPlan::default())
     }
 
-    /// The GPU kernels only do SHA3-256t: a GPU worker sits out anything
-    /// else, and a job with no algorithm at all, instead of grinding it.
+    /// The GPU kernels only do SHA3-256t: a GPU worker sits out BC3Hash (and
+    /// SHA256d) instead of grinding it, and says so once.
     #[test]
     fn the_gate_lets_through_only_what_the_backend_supports() {
         let gpu = crate::backend::kernel_supports;
         let mut gate = AlgoGate::default();
-        let mut job = a_job();
-        assert_eq!(gate.check(&job, "gpu", gpu), Some(PowAlgo::Sha3t));
-        job.algo = Some(PowAlgo::Sha256d);
-        assert_eq!(gate.check(&job, "gpu", gpu), None);
-        assert_eq!(gate.warned, Some(PowAlgo::Sha256d), "said once, remembered");
-        job.algo = None;
-        assert_eq!(gate.check(&job, "gpu", gpu), None);
-        assert_eq!(gate.check(&job, "cpu", crate::worker::cpu_supports), None);
-        job.algo = Some(PowAlgo::Sha3t);
-        assert_eq!(gate.check(&job, "gpu", gpu), Some(PowAlgo::Sha3t));
+        assert_eq!(gate.check(PowAlgo::Sha3t, Some("gpu"), gpu), Some(PowAlgo::Sha3t));
+        assert_eq!(gate.check(PowAlgo::Bc3Hash, Some("gpu"), gpu), None);
+        assert_eq!(gate.warned, Some(PowAlgo::Bc3Hash), "said once, remembered");
+        assert_eq!(gate.check(PowAlgo::Bc3Hash, Some("gpu"), gpu), None);
+        assert_eq!(gate.check(PowAlgo::Sha256d, Some("gpu"), gpu), None);
+        assert_eq!(gate.check(PowAlgo::Sha3t, Some("gpu"), gpu), Some(PowAlgo::Sha3t));
         assert_eq!(gate.warned, None, "back to normal");
+        // The CPU hashes whatever this build implements.
+        let cpu = crate::worker::cpu_supports;
+        assert_eq!(gate.check(PowAlgo::Sha3t, Some("cpu"), cpu), Some(PowAlgo::Sha3t));
+        assert_eq!(
+            gate.check(PowAlgo::Bc3Hash, Some("cpu"), cpu).is_some(),
+            cfg!(feature = "bc3hash")
+        );
     }
 
-    /// The unsupported-PoW warning follows the jobs: on with the first job
-    /// this build cannot hash, off with the first one it can.
+    /// Where each PoW is mined, for every way main can start the workers -
+    /// and what the user is told. The auto-mode fork case is the one that
+    /// matters: SHA3-256t on the GPU, BC3Hash on the stand-in CPU threads.
+    #[cfg(feature = "bc3hash")]
     #[test]
-    fn publish_tracks_an_unsupported_pow() {
+    fn the_plan_says_who_mines_each_pow() {
+        let devices = |plan: MiningPlan, algo| {
+            let d = plan.devices_for(algo);
+            (d.gpu, d.cpu)
+        };
+        // --backend auto with a GPU: CPU threads stand by for BC3Hash.
+        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 20 };
+        assert_eq!(devices(auto, PowAlgo::Sha3t), (true, false));
+        assert_eq!(devices(auto, PowAlgo::Bc3Hash), (false, true));
+        assert_eq!(auto.status(PowAlgo::Sha3t), (true, "SHA3-256t: mining on GPU".into()));
+        assert_eq!(
+            auto.status(PowAlgo::Bc3Hash),
+            (true, "BC3Hash: mining on CPU (no GPU kernel yet)".into())
+        );
+        // A forced GPU backend has no CPU threads: BC3Hash is not mined, and
+        // that must read as an error, not as "Mining".
+        let forced = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 0 };
+        assert_eq!(devices(forced, PowAlgo::Sha3t), (true, false));
+        assert_eq!(devices(forced, PowAlgo::Bc3Hash), (false, false));
+        let (mining, message) = forced.status(PowAlgo::Bc3Hash);
+        assert!(!mining && message.contains("NOT mining"), "{message}");
+        // GPU plus --threads: both on SHA3-256t, the CPU alone on BC3Hash.
+        let dual = MiningPlan { gpus: 1, cpu_threads: 4, cpu_fallback_threads: 0 };
+        assert_eq!(devices(dual, PowAlgo::Sha3t), (true, true));
+        assert_eq!(devices(dual, PowAlgo::Bc3Hash), (false, true));
+        // CPU only.
+        let cpu = MiningPlan { gpus: 0, cpu_threads: 8, cpu_fallback_threads: 0 };
+        assert_eq!(devices(cpu, PowAlgo::Bc3Hash), (false, true));
+        assert_eq!(cpu.status(PowAlgo::Bc3Hash), (true, "BC3Hash: mining on CPU".into()));
+        assert_eq!(PowDevices { gpu: true, cpu: true }.label(), "gpu+cpu");
+    }
+
+    /// A change of PoW is announced once, not once per job.
+    #[test]
+    fn publish_announces_each_change_of_pow_once() {
         let s = shared();
+        assert_eq!(*s.last_algo.lock().unwrap(), None);
         s.publish_job(a_job());
-        assert!(!s.pow_unsupported.load(Ordering::Relaxed));
-        let mut new_pow = a_job();
-        new_pow.algo = None;
-        s.publish_job(new_pow.clone());
-        assert!(s.pow_unsupported.load(Ordering::Relaxed));
-        s.publish_job(new_pow);
-        assert!(s.pow_unsupported.load(Ordering::Relaxed));
+        assert_eq!(*s.last_algo.lock().unwrap(), Some(PowAlgo::Sha3t));
+        let mut fork = a_job();
+        fork.algo = PowAlgo::Bc3Hash;
+        s.publish_job(fork.clone());
+        s.publish_job(fork);
+        assert_eq!(*s.last_algo.lock().unwrap(), Some(PowAlgo::Bc3Hash));
         s.publish_job(a_job());
-        assert!(!s.pow_unsupported.load(Ordering::Relaxed));
-        assert!(unsupported_pow_message(Some(123)).contains("at height 123"));
+        assert_eq!(*s.last_algo.lock().unwrap(), Some(PowAlgo::Sha3t));
     }
 
     /// A worker that sat a job out wakes for the next job, not before.

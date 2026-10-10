@@ -6,7 +6,7 @@
 use crate::backend::{open_backend_with_fallback, GpuDevice, MiningBackend};
 use crate::consensus::{
     compact_to_target, hash_meets_target, hash_to_display, root_from_steps, sha256d, BlockHeader,
-    PowAlgo,
+    PowAlgo, PowFn,
 };
 use crate::shared::{AlgoGate, FoundShare, MinerJob, Shared};
 use std::sync::atomic::Ordering;
@@ -83,8 +83,16 @@ pub fn run_gpu_worker(
             Some(seen) => shared.wait_for_job_after(seen),
             None => shared.wait_for_job(),
         };
-        // Decided per job, so the launch loop below carries no dispatch.
-        let Some(algo) = gate.check(&job, &backend.name(), |a| backend.supports(a)) else {
+        // Decided per job, so the launch loop below carries no dispatch. A
+        // kernel without a CPU reference to re-check its hits against does
+        // not mine at all - see AGENTS.md.
+        let supported = |a: PowAlgo| backend.supports(a) && a.hash_fn().is_some();
+        let Some((algo, verify)) = gate
+            .check(job.algo, Some(backend.name().as_str()), supported)
+            .and_then(|a| Some((a, a.hash_fn()?)))
+        else {
+            // BC3Hash since the fork: in --backend auto the CPU threads take
+            // it over, and this worker sleeps until SHA3-256t comes back.
             sat_out = Some(generation);
             continue;
         };
@@ -93,8 +101,8 @@ pub fn run_gpu_worker(
             nonce = 0;
         }
         let alive = mine_job(
-            &shared, &job, algo, generation, total_workers, &mut backend, &mut batch, &mut en2,
-            &mut nonce,
+            &shared, &job, algo, verify, generation, total_workers, &mut backend, &mut batch,
+            &mut en2, &mut nonce,
         );
         if !alive {
             // The device stopped answering. Re-open it - after a driver reset
@@ -152,6 +160,8 @@ fn mine_job(
     shared: &Shared,
     job: &MinerJob,
     algo: PowAlgo,
+    // The CPU reference for `algo`, resolved once per job.
+    verify: PowFn,
     generation: u64,
     total_workers: usize,
     backend: &mut Box<dyn MiningBackend>,
@@ -215,11 +225,10 @@ fn mine_job(
             errors = 0;
 
             // Verify every hit on the CPU before submit - guards against
-            // kernel bugs. Against the job's algorithm, not the version bit:
-            // past a fork the two can disagree.
+            // kernel bugs.
             for nonce in hits {
                 header.nonce = nonce;
-                let hash = algo.hash(&header.serialize());
+                let hash = verify(&header.serialize());
                 if !hash_meets_target(&hash, &job.share_target) {
                     eprintln!(
                         "[gpu] WARNING: {} reported a false hit, nonce={nonce:08x} - ignored",

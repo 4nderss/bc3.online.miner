@@ -14,7 +14,7 @@
 #[path = "../../src/consensus.rs"]
 mod consensus;
 
-use consensus::{hash_meets_target, sha3t, PowAlgo, PowSchedule, Target};
+use consensus::{hash_meets_target, sha3t, PowAlgo, Target};
 
 /// PoW algorithms as the numbers JS passes across the wasm boundary. Part of
 /// the ABI: a number, once given out, keeps its meaning.
@@ -22,43 +22,29 @@ fn algo_id(algo: PowAlgo) -> i32 {
     match algo {
         PowAlgo::Sha256d => 0,
         PowAlgo::Sha3t => 1,
-        // NEW POW: give the new variant the next free number.
+        PowAlgo::Bc3Hash => 2,
     }
 }
 
+/// The algorithm behind an id - only if this module can hash it. BC3Hash
+/// cannot be: it is the node's C++, which the browser build leaves out.
 fn algo_from_id(id: u32) -> Option<PowAlgo> {
-    [PowAlgo::Sha256d, PowAlgo::Sha3t]
+    [PowAlgo::Sha256d, PowAlgo::Sha3t, PowAlgo::Bc3Hash]
         .into_iter()
-        .find(|a| algo_id(*a) == id as i32)
+        .find(|a| algo_id(*a) == id as i32 && a.hash_fn().is_some())
 }
 
-/// The PoW to mine a job with, from its coinb1 (BIP34 height) and version -
-/// the same decision the CLI makes at notify time. `next_pow_height` < 0
-/// means no fork scheduled (an f64, like `search`'s result, to keep BigInt
-/// out of JS).
+/// The PoW to mine a job with, from its version - the node's rule, the same
+/// decision the CLI makes at notify time.
 ///
 /// Returns the algorithm id for `search_algo`, or -1 for a PoW this module
-/// does not implement: the page must stop hashing and tell the user, not
-/// grind the old PoW into rejected shares.
-///
-/// # Safety
-/// `coinb1_ptr` must point at `coinb1_len` readable bytes.
+/// cannot hash (BC3Hash): the page must stop hashing and tell the user, not
+/// grind SHA3-256t into rejected shares.
 #[no_mangle]
-pub unsafe extern "C" fn job_pow_algo(
-    coinb1_ptr: *const u8,
-    coinb1_len: usize,
-    version: u32,
-    next_pow_height: f64,
-) -> i32 {
-    if coinb1_ptr.is_null() {
-        return -1;
-    }
-    let coinb1 = core::slice::from_raw_parts(coinb1_ptr, coinb1_len);
-    let schedule = PowSchedule {
-        next_pow_height: (next_pow_height >= 0.0).then_some(next_pow_height as u32),
-    };
-    match schedule.algo_for_job(consensus::bip34_height(coinb1), version) {
-        Some(algo) => algo_id(algo),
+pub extern "C" fn job_pow_algo(version: u32) -> i32 {
+    let algo = PowAlgo::for_version(version);
+    match algo.hash_fn() {
+        Some(_) => algo_id(algo),
         None => -1,
     }
 }
@@ -169,7 +155,8 @@ pub unsafe extern "C" fn search_algo(
             search_with(|h| consensus::sha256d(h), header, &target, nonce_start, nonce_count)
         }
         PowAlgo::Sha3t => search_with(|h| sha3t(h), header, &target, nonce_start, nonce_count),
-        // NEW POW: one more arm with its hash.
+        // Never reached: algo_from_id does not hand it out here.
+        PowAlgo::Bc3Hash => -2.0,
     }
 }
 
@@ -195,12 +182,12 @@ pub unsafe extern "C" fn hash_header_algo(algo: u32, header_ptr: *const u8, out_
     if header_ptr.is_null() || out_ptr.is_null() {
         return 0;
     }
-    let Some(algo) = algo_from_id(algo) else {
+    let Some(pow) = algo_from_id(algo).and_then(|a| a.hash_fn()) else {
         return 0;
     };
     let mut header = [0u8; 80];
     core::ptr::copy_nonoverlapping(header_ptr, header.as_mut_ptr(), 80);
-    let hash = algo.hash(&header);
+    let hash = pow(&header);
     core::ptr::copy_nonoverlapping(hash.as_ptr(), out_ptr, 32);
     1
 }
@@ -413,25 +400,23 @@ mod tests {
         assert_eq!(got, -1.0);
     }
 
-    /// The page asks the module which PoW a job uses, the same way the CLI
-    /// decides it - and gets -1 past a fork this module cannot hash.
+    /// The page asks the module which PoW a job uses, by the same version-bit
+    /// rule as the CLI - and gets -1 for BC3Hash, which the browser build
+    /// cannot hash.
     #[test]
-    fn job_pow_algo_follows_the_schedule() {
-        let mut cb = Vec::new();
-        cb.extend_from_slice(&2u32.to_le_bytes());
-        cb.push(0x01);
-        cb.extend_from_slice(&[0u8; 32]);
-        cb.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-        cb.push(24);
-        cb.extend_from_slice(&[0x03, 0xce, 0xe7, 0x00]); // 59342
-        cb.extend_from_slice(b"/bc3.online/");
-        let algo = |version, fork| unsafe { job_pow_algo(cb.as_ptr(), cb.len(), version, fork) };
-        assert_eq!(algo(0x2000_1000, -1.0), 1);
-        assert_eq!(algo(0x2000_0000, -1.0), 0);
-        assert_eq!(algo(0x2000_1000, 59_343.0), 1);
-        assert_eq!(algo(0x2000_1000, 59_342.0), -1);
-        assert_eq!(algo(0x2000_1000, 1.0), -1);
-        assert_eq!(unsafe { job_pow_algo(core::ptr::null(), 0, 0x2000_1000, -1.0) }, -1);
+    fn job_pow_algo_follows_the_version_bits() {
+        assert_eq!(job_pow_algo(0x2000_1000), 1);
+        assert_eq!(job_pow_algo(0x2000_0000), 0);
+        assert_eq!(job_pow_algo(0x2000_1800), -1);
+        assert_eq!(job_pow_algo(0x2000_0800), -1);
+        // Id 2 is BC3Hash's, and refused here rather than hashed as SHA3-256t.
+        assert_eq!(algo_id(PowAlgo::Bc3Hash), 2);
+        assert_eq!(algo_from_id(2), None);
+        let header = [0u8; 80];
+        let target = [0xffu8; 32];
+        assert_eq!(unsafe { search_algo(2, header.as_ptr(), target.as_ptr(), 0, 10) }, -2.0);
+        let mut out = [0u8; 32];
+        assert_eq!(unsafe { hash_header_algo(2, header.as_ptr(), out.as_mut_ptr()) }, 0);
     }
 
     /// The per-algorithm exports agree with the reference, and an unknown id
