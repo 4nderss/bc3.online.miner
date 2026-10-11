@@ -696,6 +696,11 @@ fn prepare_bc3(
                 state: crate::ipc::StatusState::Error,
                 message,
             });
+            // The card has held BC3Hash since it opened, so the stand-ins
+            // stay out of its way while it loads. Without giving that up
+            // here they never took over: nothing mined BC3Hash, and the
+            // message above said the CPU did.
+            caps.set(PowAlgo::Bc3Hash, false);
         }
     }
 }
@@ -1037,5 +1042,81 @@ mod tests {
         assert!(c.enqueue(&Launch { algo: PowAlgo::Sha3t, header76: &h, start: 0, count: 1, target: &t }).is_err());
         assert!(c.collect().is_err());
         assert!(!c.supports(PowAlgo::Sha3t));
+    }
+
+    /// A card whose BC3Hash kernel will not load or fails its self-test, the
+    /// way `run_gpu_worker` meets it at the fork: the card claimed BC3Hash
+    /// when it opened (so the stand-ins keep out of its table build and
+    /// self-test), and a failure has to give that claim up - or the stand-in
+    /// CPU threads of --backend auto never take over, nothing mines the
+    /// fork's PoW at all, and the status line says the CPU does.
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    fn a_failed_bc3hash_kernel_hands_the_pow_to_the_cpu() {
+        struct NoBc3;
+        impl MiningBackend for NoBc3 {
+            fn name(&self) -> String {
+                "no-bc3".into()
+            }
+            fn has_kernel(&self, _: PowAlgo) -> bool {
+                true
+            }
+            fn supports(&self, algo: PowAlgo) -> bool {
+                algo == PowAlgo::Sha3t
+            }
+            fn prepare_bc3hash(&mut self, _: u32) -> Result<Duration, String> {
+                Err("self-test failed: scripted".into())
+            }
+            fn enqueue(&mut self, _: &Launch) -> Result<(), String> {
+                Err("not in this test".into())
+            }
+            fn collect(&mut self) -> Result<Scan, String> {
+                Err("not in this test".into())
+            }
+            fn in_flight(&self) -> usize {
+                0
+            }
+            fn abandon(&mut self) {}
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let plan = MiningPlan {
+            gpus: 1,
+            cpu_threads: 0,
+            cpu_fallback_threads: 1,
+            gpu_kernel: [false, true, true],
+            compile_ahead: true,
+        };
+        let shared = Arc::new(Shared::new(tx, plan));
+        // What run_gpu_worker claims when the card opens.
+        let mut caps = GpuCapability::new(&shared);
+        caps.set(PowAlgo::Sha3t, true);
+        caps.set(PowAlgo::Bc3Hash, true);
+        shared.gpu_opened();
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            crate::worker::run_worker(s, 1, 2, crate::worker::CpuRole::GpuFallback)
+        });
+        // The fork's first job, with a target every hash meets.
+        let mut fork = job([0xff; 32]);
+        fork.version = 0x2000_0800;
+        fork.algo = PowAlgo::Bc3Hash;
+        shared.publish_job(fork);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_recv().is_err(), "the stand-in mined what the card had claimed");
+
+        let mut failed = None;
+        prepare_bc3(&shared, &mut NoBc3, 0, &mut caps, &mut failed);
+        assert_eq!(failed, Some(shared.bc3_window()));
+        assert_eq!(shared.gpu_slot_bc3[0].load(Ordering::Relaxed), BC3_SLOT_FAILED);
+        assert!(!shared.gpus_mine(PowAlgo::Bc3Hash), "the failed card still claims BC3Hash");
+        assert!(shared.devices_for(PowAlgo::Bc3Hash).cpu);
+        let share = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("nothing mines BC3Hash after the card's kernel failed");
+        assert_eq!(share.job_id, "j");
+        // The next job looks again and finds the same failure: no claim.
+        prepare_bc3(&shared, &mut NoBc3, 0, &mut caps, &mut failed);
+        assert!(!shared.gpus_mine(PowAlgo::Bc3Hash));
+        shared.clear_job();
     }
 }
