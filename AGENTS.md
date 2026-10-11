@@ -91,8 +91,18 @@ directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
 - Where a card has no BC3Hash kernel, or its kernel failed the self-test, the
   CPU threads stand in for it in `--backend auto`
   (`worker::CpuRole::GpuFallback`). See "The BC3Hash GPU kernel" below.
-- The browser build (`wasm/`) shares `consensus.rs` but never has the
-  `bc3hash` feature: no C++ in wasm32. It stays SHA3-256t only.
+- The browser build (`wasm/`) shares `consensus.rs` and has the `bc3hash`
+  feature too: the same C++, compiled for wasm32 by clang against WASI's
+  libc/libc++ headers (`wasm/build.sh` installs them; `bc3hash/build.rs`
+  has the wasm32 flags). The module imports nothing: `bc3hash/src/wasm_rt.cpp`
+  and `wasm_malloc.rs` stand in for the C runtime, every error path traps,
+  and libc++ without threads gets a no-op `std::mutex`
+  (`bc3hash/wasm/include/mutex` - one thread per wasm instance). secp256k1
+  is built with its 32-bit field there (`USE_FORCE_WIDEMUL_INT64`): wasm has
+  no 64x64->128 multiply, and that alone took the module from 165 to 240 H/s
+  a thread. `wasm/test/vectors.mjs` runs the node's vectors against the
+  built module - the host tests cannot vouch for the wasm32 build - and
+  `build.sh` ships nothing that fails them.
 - `BC3HASH_VENDOR` and `BC3HASH_VECTORS` point the build and the tests at the
   same sources and vectors somewhere else.
 - `cargo run --release --example bench -- fast 8` in `bc3hash/` measures the

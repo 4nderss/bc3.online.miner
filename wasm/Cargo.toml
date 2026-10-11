@@ -3,7 +3,7 @@ name = "bc3-miner-wasm"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "SHA3-256t-sokkarna for bc3.online:s webbaserade miner (WebAssembly)"
+description = "Search kernels (SHA3-256t, BC3Hash) for the bc3.online web miner (WebAssembly)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -15,11 +15,20 @@ sha3 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-# src/consensus.rs, shared with the CLI, asks for the CLI's `bc3hash` feature.
-# This crate never has it - BC3Hash is the node's C++, which has no place in a
-# browser - so the check-cfg lint is told to expect the name.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("bc3hash"))'] }
+# BC3Hash, the PoW from the second fork on: the node's own C++ (../bc3hash),
+# compiled to wasm32 by clang against WASI's libc/libc++ headers - see
+# build.sh for the toolchain and BC3HASH_VENDOR for the sources. src/consensus.rs
+# (shared with the CLI) turns it on under the same feature name as the CLI.
+# Without it this crate builds as before: SHA3-256t and SHA256d only.
+bc3hash = { path = "../bc3hash", optional = true }
+
+[dev-dependencies]
+# src/consensus.rs runs the node's header vectors (JSON) under the bc3hash feature.
+serde_json = "1"
+
+[features]
+default = ["bc3hash"]
+bc3hash = ["dep:bc3hash"]
 
 [profile.release]
 # Speed over size: this is a hash loop, not a widget.

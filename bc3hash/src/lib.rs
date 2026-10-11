@@ -15,6 +15,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+#[cfg(target_arch = "wasm32")]
+mod wasm_malloc;
+
 extern "C" {
     fn bc3hash_initialize(fast: i32) -> i32;
     fn bc3hash_hash(data: *const u8, len: usize, out32: *mut u8) -> i32;

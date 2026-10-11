@@ -1,0 +1,25 @@
+// <mutex> for the wasm32 build of the node's reference code (bc3hash/build.rs
+// puts this directory first on the include path for wasm32 only).
+//
+// WASI's libc++ is built without threads, so its <mutex> has no std::mutex,
+// and mix.cpp locks one around configure(). A wasm instance is one thread -
+// every Web Worker of the browser miner has its own instance and its own
+// tables - so a mutex that does nothing is exact here, not an approximation.
+#pragma once
+#include_next <mutex>
+
+#if !defined(_LIBCPP_HAS_NO_THREADS) && (!defined(_LIBCPP_HAS_THREADS) || _LIBCPP_HAS_THREADS)
+#error "this <mutex> is only for a libc++ without threads"
+#endif
+
+namespace std {
+class mutex {
+public:
+    constexpr mutex() noexcept = default;
+    mutex(const mutex&) = delete;
+    mutex& operator=(const mutex&) = delete;
+    void lock() noexcept {}
+    bool try_lock() noexcept { return true; }
+    void unlock() noexcept {}
+};
+} // namespace std

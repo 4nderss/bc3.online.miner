@@ -1,4 +1,6 @@
-//! SHA3-256t search kernel for the web miner, compiled to WebAssembly.
+//! Search kernels for the web miner, compiled to WebAssembly: SHA3-256t, and
+//! BC3Hash (the PoW of the second fork) when built with the `bc3hash` feature
+//! (the default) - the node's own C++ via the `bc3hash` crate, as in the CLI.
 //!
 //! Deliberately WITHOUT wasm-bindgen: the interface is four numbers and two
 //! byte buffers, so bindgen would only add glue and a build dependency. JS
@@ -26,26 +28,55 @@ fn algo_id(algo: PowAlgo) -> i32 {
     }
 }
 
-/// The algorithm behind an id - only if this module can hash it. BC3Hash
-/// cannot be: it is the node's C++, which the browser build leaves out.
+/// The algorithm behind an id - only if this module can hash it. BC3Hash can
+/// only with the `bc3hash` feature, and only once its tables are built and
+/// the build has passed the node's vectors (`bc3hash_init`, which this runs
+/// on first use): a build that fails them must not hash at all.
 fn algo_from_id(id: u32) -> Option<PowAlgo> {
     [PowAlgo::Sha256d, PowAlgo::Sha3t, PowAlgo::Bc3Hash]
         .into_iter()
         .find(|a| algo_id(*a) == id as i32 && a.hash_fn().is_some())
+        .filter(|a| *a != PowAlgo::Bc3Hash || bc3hash_init() == 1)
 }
 
 /// The PoW to mine a job with, from its version - the node's rule, the same
 /// decision the CLI makes at notify time.
 ///
 /// Returns the algorithm id for `search_algo`, or -1 for a PoW this module
-/// cannot hash (BC3Hash): the page must stop hashing and tell the user, not
-/// grind SHA3-256t into rejected shares.
+/// cannot hash (BC3Hash in a build without the `bc3hash` feature): the page
+/// must stop hashing and tell the user, not grind SHA3-256t into rejected
+/// shares.
 #[no_mangle]
 pub extern "C" fn job_pow_algo(version: u32) -> i32 {
     let algo = PowAlgo::for_version(version);
     match algo.hash_fn() {
         Some(_) => algo_id(algo),
         None => -1,
+    }
+}
+
+/// Build this instance's BC3Hash tables (compact mode, ~7 MiB) and check the
+/// build against the node's vectors - the CLI's `bc3hash::initialize`. Call
+/// it before the first BC3Hash search: the first hash would do it anyway,
+/// but a build that fails the vectors would then trap mid-search instead of
+/// saying so here.
+///
+/// 1 = ready; 0 = the tables could not be built (out of memory); -1 = this
+/// build computes BC3Hash wrongly - mine no BC3Hash with it; -2 = built
+/// without the `bc3hash` feature. Idempotent and cheap after the first call.
+#[no_mangle]
+pub extern "C" fn bc3hash_init() -> i32 {
+    #[cfg(feature = "bc3hash")]
+    {
+        match bc3hash::initialize() {
+            Ok(()) => 1,
+            Err(bc3hash::InitError::Tables { .. }) => 0,
+            Err(bc3hash::InitError::WrongResult { .. }) => -1,
+        }
+    }
+    #[cfg(not(feature = "bc3hash"))]
+    {
+        -2
     }
 }
 
@@ -155,8 +186,10 @@ pub unsafe extern "C" fn search_algo(
             search_with(|h| consensus::sha256d(h), header, &target, nonce_start, nonce_count)
         }
         PowAlgo::Sha3t => search_with(|h| sha3t(h), header, &target, nonce_start, nonce_count),
-        // Never reached: algo_from_id does not hand it out here.
-        PowAlgo::Bc3Hash => -2.0,
+        PowAlgo::Bc3Hash => match algo.hash_fn() {
+            Some(pow) => search_with(pow, header, &target, nonce_start, nonce_count),
+            None => -2.0,
+        },
     }
 }
 
@@ -190,6 +223,37 @@ pub unsafe extern "C" fn hash_header_algo(algo: u32, header_ptr: *const u8, out_
     let hash = pow(&header);
     core::ptr::copy_nonoverlapping(hash.as_ptr(), out_ptr, 32);
     1
+}
+
+/// BC3Hash (`which` = 0) or BC3Mix (`which` = 1) of an arbitrary buffer,
+/// for running the node's reference vectors (any input length) against the
+/// built module: wasm/test/vectors.mjs. 1 = written, 0 = not available
+/// (feature off, or `bc3hash_init` did not return 1) or a null pointer.
+///
+/// # Safety
+/// `ptr` must point at `len` readable bytes (or be anything when `len` is 0),
+/// `out_ptr` at at least 32.
+#[no_mangle]
+pub unsafe extern "C" fn bc3hash_bytes_into(which: u32, ptr: *const u8, len: usize, out_ptr: *mut u8) -> u32 {
+    if out_ptr.is_null() || (ptr.is_null() && len > 0) || bc3hash_init() != 1 {
+        return 0;
+    }
+    #[cfg(feature = "bc3hash")]
+    {
+        let data: &[u8] = if len == 0 { &[] } else { core::slice::from_raw_parts(ptr, len) };
+        let digest = match which {
+            0 => bc3hash::bc3hash(data),
+            1 => bc3hash::bc3mix(data),
+            _ => return 0,
+        };
+        core::ptr::copy_nonoverlapping(digest.as_ptr(), out_ptr, 32);
+        1
+    }
+    #[cfg(not(feature = "bc3hash"))]
+    {
+        let _ = which;
+        0
+    }
 }
 
 /// SHA256d over an arbitrary buffer (coinbase txid, merkle steps).
@@ -401,22 +465,58 @@ mod tests {
     }
 
     /// The page asks the module which PoW a job uses, by the same version-bit
-    /// rule as the CLI - and gets -1 for BC3Hash, which the browser build
-    /// cannot hash.
+    /// rule as the CLI. Without the `bc3hash` feature BC3Hash is -1 and
+    /// refused everywhere rather than hashed as SHA3-256t.
     #[test]
+    #[cfg(not(feature = "bc3hash"))]
     fn job_pow_algo_follows_the_version_bits() {
         assert_eq!(job_pow_algo(0x2000_1000), 1);
         assert_eq!(job_pow_algo(0x2000_0000), 0);
         assert_eq!(job_pow_algo(0x2000_1800), -1);
         assert_eq!(job_pow_algo(0x2000_0800), -1);
-        // Id 2 is BC3Hash's, and refused here rather than hashed as SHA3-256t.
         assert_eq!(algo_id(PowAlgo::Bc3Hash), 2);
         assert_eq!(algo_from_id(2), None);
+        assert_eq!(bc3hash_init(), -2);
         let header = [0u8; 80];
         let target = [0xffu8; 32];
         assert_eq!(unsafe { search_algo(2, header.as_ptr(), target.as_ptr(), 0, 10) }, -2.0);
         let mut out = [0u8; 32];
         assert_eq!(unsafe { hash_header_algo(2, header.as_ptr(), out.as_mut_ptr()) }, 0);
+    }
+
+    /// With the `bc3hash` feature, bit 11 is BC3Hash (id 2) and wins over
+    /// bit 12, and the exports hash it exactly as the CLI's reference does.
+    #[test]
+    #[cfg(feature = "bc3hash")]
+    fn job_pow_algo_follows_the_version_bits() {
+        assert_eq!(job_pow_algo(0x2000_1000), 1);
+        assert_eq!(job_pow_algo(0x2000_0000), 0);
+        assert_eq!(job_pow_algo(0x2000_1800), 2);
+        assert_eq!(job_pow_algo(0x2000_0800), 2);
+        assert_eq!(bc3hash_init(), 1);
+        assert_eq!(algo_from_id(2), Some(PowAlgo::Bc3Hash));
+
+        let mut header = [0u8; 80];
+        header[0..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+        let mut out = [0u8; 32];
+        assert_eq!(unsafe { hash_header_algo(2, header.as_ptr(), out.as_mut_ptr()) }, 1);
+        assert_eq!(out, bc3hash::bc3hash(&header));
+
+        // A share-difficulty target (1/64 of the space) finds the first
+        // nonce that a straightforward loop over the reference finds.
+        let mut target = [0xffu8; 32];
+        target[0] = 0x03;
+        let expected = (0..2000u32)
+            .find(|&n| {
+                let mut h = header;
+                h[76..80].copy_from_slice(&n.to_le_bytes());
+                hash_meets_target(&bc3hash::bc3hash(&h), &target)
+            })
+            .expect("a hit within 2000 nonces at 1/64");
+        let got = unsafe { search_algo(2, header.as_ptr(), target.as_ptr(), 0, 2000) };
+        assert_eq!(got, expected as f64);
+        let miss = unsafe { search_algo(2, header.as_ptr(), target.as_ptr(), 0, expected) };
+        assert_eq!(miss, -1.0);
     }
 
     /// The per-algorithm exports agree with the reference, and an unknown id
@@ -444,6 +544,33 @@ mod tests {
         assert!(hash_meets_target(&consensus::sha256d(&h), &target));
         assert_eq!(unsafe { search_algo(99, header.as_ptr(), target.as_ptr(), 0, 10) }, -2.0);
     }
+
+    /// The native half of the cross-check in wasm/test/vectors.mjs: SHA-256
+    /// over the BC3Hash digests of 64 fixed pseudo-random headers, hashed by
+    /// the host build of the node's C++. The harness computes the same with
+    /// the wasm32 build; the two builds agree when both match this constant.
+    #[test]
+    #[cfg(feature = "bc3hash")]
+    fn cross_check_matches_the_wasm_harness() {
+        use sha2::{Digest, Sha256};
+        let mut agg = Sha256::new();
+        for i in 0..64u32 {
+            let mut h = [0u8; 80];
+            for (j, b) in h.iter_mut().enumerate() {
+                *b = ((j as u32 * 31 + i * 7 + 0x5a) & 0xff) as u8;
+            }
+            h[0..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+            h[76..80].copy_from_slice(&i.to_le_bytes());
+            agg.update(bc3hash::bc3hash(&h));
+        }
+        let got = hex::encode(agg.finalize());
+        assert_eq!(got, CROSS_CHECK, "the harness's CROSS_CHECK must be {got}");
+        let harness = include_str!("../test/vectors.mjs");
+        assert!(harness.contains(&format!("\"{CROSS_CHECK}\"")), "vectors.mjs has another CROSS_CHECK");
+    }
+
+    #[cfg(feature = "bc3hash")]
+    const CROSS_CHECK: &str = "0b625bcc9887a866a75689b8b1a91f21a5c0fee4b3ce7c319aef84e146a3ebeb";
 
     /// Locks down the expected value in `SELF_TEST_DIGEST`. If this test
     /// breaks, the hash implementation has changed - and then the web

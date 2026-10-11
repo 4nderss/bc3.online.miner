@@ -2,7 +2,8 @@
 //! the node's own sources: `vendor/bc3` is `src/crypto/bc3` and
 //! `vendor/secp256k1` is the `src/secp256k1` subtree of bitcoiniii-core, at the
 //! commit in `vendor/SOURCE_COMMIT`. Nothing in vendor/ is edited here; the
-//! only code of ours is `src/shim.cpp`.
+//! only code of ours is `src/shim.cpp` (and, for wasm32 only, `src/wasm_rt.cpp`,
+//! `src/wasm_malloc.rs` and `wasm/include/mutex`).
 //!
 //! `BC3HASH_VENDOR` points the build at the same layout somewhere else.
 //!
@@ -15,6 +16,8 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-env-changed=BC3HASH_VENDOR");
     println!("cargo:rerun-if-changed=src/shim.cpp");
+    println!("cargo:rerun-if-changed=src/wasm_rt.cpp");
+    println!("cargo:rerun-if-changed=wasm/include");
     let vendor = std::env::var_os("BC3HASH_VENDOR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("vendor"));
@@ -30,6 +33,7 @@ fn main() {
     }
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
     let native = std::env::var("TARGET").ok() == std::env::var("HOST").ok();
+    let wasm = std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32");
 
     let mut secp = cc::Build::new();
     secp.include(vendor.join("secp256k1/include"))
@@ -49,6 +53,16 @@ fn main() {
         use_clang_cl(&mut secp);
     } else if native {
         prefer_clang(&mut secp, "CC", "clang");
+    }
+    if wasm {
+        wasm_flags(&mut secp);
+        // The default callbacks print with fprintf; wasm_rt.cpp has ours.
+        secp.define("USE_EXTERNAL_DEFAULT_CALLBACKS", None);
+        // wasm has no 64x64->128 multiply: every unsigned __int128 product
+        // is a call to __multi3 doing four 32-bit ones. The library's 10x26
+        // field and 8x32 scalar - its own configuration for 32-bit targets,
+        // same results - multiply in 64-bit registers instead.
+        secp.define("USE_FORCE_WIDEMUL_INT64", None);
     }
     secp.compile("bc3secp256k1");
 
@@ -93,7 +107,49 @@ fn main() {
     for flag in guards {
         bc3.flag(flag);
     }
+    if wasm {
+        wasm_flags(&mut bc3);
+        bc3.include("wasm/include")
+            // One thread per wasm instance: no guard variables, and no
+            // __cxa_guard_* to link.
+            .flag("-fno-threadsafe-statics")
+            .file("src/wasm_rt.cpp")
+            // cc would ask for -lstdc++; wasm_link names WASI's libc++.
+            .cpp_link_stdlib(None);
+        wasm_link();
+    }
     bc3.compile("bc3hashref");
+}
+
+/// wasm32 (the browser miner): compile against WASI's libc and libc++
+/// headers. The Rust target is wasm32-unknown-unknown, which has no C
+/// library, so clang is told the target is wasm32-wasi to find the headers;
+/// the objects are the same wasm32 objects either way. Nothing of WASI is
+/// imported in the end - `wasm_rt.cpp` and the Rust side of this crate supply
+/// what the C++ needs from a system (malloc, abort, the error paths), and
+/// wasm/test/vectors.mjs checks that the module imports nothing.
+///
+/// `BC3HASH_WASM_SYSROOT` is the sysroot holding `include/wasm32-wasi` and
+/// `lib/wasm32-wasi` (Debian's wasi-libc and libc++-19-dev-wasm32 put them
+/// under /usr, the default).
+fn wasm_flags(build: &mut cc::Build) {
+    println!("cargo:rerun-if-env-changed=BC3HASH_WASM_SYSROOT");
+    build.flag("--target=wasm32-wasi");
+    if let Some(sysroot) = std::env::var_os("BC3HASH_WASM_SYSROOT") {
+        build.flag(format!("--sysroot={}", Path::new(&sysroot).display()));
+    }
+}
+
+/// libc++ and libc++abi for the little of them the reference code links:
+/// the constructors of the exceptions it throws on impossible inputs (the
+/// throws themselves trap, see wasm_rt.cpp) and operator new/delete.
+fn wasm_link() {
+    let sysroot = std::env::var_os("BC3HASH_WASM_SYSROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr"));
+    println!("cargo:rustc-link-search=native={}", sysroot.join("lib/wasm32-wasi").display());
+    println!("cargo:rustc-link-lib=static=c++");
+    println!("cargo:rustc-link-lib=static=c++abi");
 }
 
 /// Clang where the build has not named a compiler of its own: the reference
