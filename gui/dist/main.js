@@ -38,15 +38,20 @@ let mining = false;
 let mode = "pplns";   // payout: pplns | solo
 let hw = "gpu";       // hardware: gpu | cpu | dual
 const spark = [];
+let sparkAlgo = null; // the PoW the sparkline's samples are of
+let sparkSkip = 0;    // samples to leave out after a change of PoW
 
 // ---------- Formatting ----------
 const num1 = new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-// MH/s with one decimal from 1 MH/s up, never GH/s: "1 698,4 MH/s" rather
+// MH/s with one decimal from 10 MH/s up, never GH/s: "1 698,4 MH/s" rather
 // than "1,70 GH/s". The rounding to two decimals of a GH hid the last
-// percent or two, which is exactly the range people tune in.
+// percent or two, which is exactly the range people tune in. Below 10 MH/s,
+// two decimals for the same reason: an RTX 4090 on BC3Hash is ~1.25 MH/s,
+// and "1,3" would hide the few percent the table windows differ by.
 function fmtHashrate(h) {
   if (!isFinite(h) || h <= 0) return "0 H/s";
-  if (h >= 1e6) return num1.format(h / 1e6) + " MH/s";
+  if (h >= 1e7) return num1.format(h / 1e6) + " MH/s";
+  if (h >= 1e6) return num2.format(h / 1e6) + " MH/s";
   if (h >= 1e3) return num2.format(h / 1e3) + " kH/s";
   return numInt.format(Math.round(h)) + " H/s";
 }
@@ -59,11 +64,14 @@ function fmtDuration(s) {
   if (m > 0) return `${m}m ${sec}s`;
   return `${sec}s`;
 }
+// Below 1, three significant digits: BC3Hash share difficulties are
+// thousandths to millionths, and two decimals showed every one as "0,00".
+const sig3 = new Intl.NumberFormat(undefined, { maximumSignificantDigits: 3 });
 function fmtDiff(d) {
   if (!isFinite(d) || d <= 0) return "—";
   const units = [["G", 1e9], ["M", 1e6], ["k", 1e3]];
   for (const [u, f] of units) if (d >= f) return num2.format(d / f) + u;
-  return num2.format(d);
+  return d >= 1 ? num2.format(d) : sig3.format(d);
 }
 function setStat(id, value) {
   const e = el(id);
@@ -88,6 +96,31 @@ function log(text, cls) {
   box.append(line);
   while (box.children.length > 300) box.firstChild.remove();
   box.scrollTop = box.scrollHeight;
+}
+
+// ---------- Share answers ----------
+// Logged one line a second at most, not one each. Right after the fork the
+// pool starts every connection at a difficulty a fast card beats ~145 times
+// a second, and rate-limits all but a few of those shares until vardiff has
+// caught up: a line per share replaced the whole 300-line log within a
+// second, the PoW and kernel lines of the fork with it.
+const shareTally = { accepted: 0, rejected: 0 };
+let shareFlush = null;
+function noteShare(accepted) {
+  if (!shareFlush) {
+    log(accepted ? "share accepted" : "share rejected", accepted ? "l-ok" : "l-bad");
+    shareFlush = setTimeout(flushShares, 1000);
+    return;
+  }
+  shareTally[accepted ? "accepted" : "rejected"]++;
+}
+function flushShares() {
+  const { accepted: a, rejected: r } = shareTally;
+  shareTally.accepted = 0;
+  shareTally.rejected = 0;
+  shareFlush = a || r ? setTimeout(flushShares, 1000) : null;
+  if (a) log(`${numInt.format(a)} more share${a === 1 ? "" : "s"} accepted`, "l-ok");
+  if (r) log(`${numInt.format(r)} more share${r === 1 ? "" : "s"} rejected`, "l-bad");
 }
 
 // ---------- Hashrate-sparkline ----------
@@ -269,6 +302,8 @@ async function toggle() {
   el("address-error").textContent = "";
   el("address").classList.remove("invalid");
   spark.length = 0;
+  sparkAlgo = null;
+  sparkSkip = 0;
   drawSpark();
   try {
     await invoke("start_mining", {
@@ -311,6 +346,15 @@ listen("miner-event", ({ payload: ev }) => {
       // rig mines on its CPU, and the card has to say so.
       const where = { gpu: "GPU", cpu: "CPU", "gpu+cpu": "GPU + CPU", none: "—" }[ev.devices];
       el("backend").textContent = `${where || ev.devices} · ${ev.algo}`;
+      // A new PoW is a new scale: next to SHA3-256t's GH/s, BC3Hash's MH/s
+      // drew a flat line at zero for the three minutes the sparkline keeps.
+      // The first sample after the switch still counts hashes of both.
+      if (sparkAlgo !== null && sparkAlgo !== ev.algo) {
+        spark.length = 0;
+        sparkSkip = 1;
+        drawSpark();
+      }
+      sparkAlgo = ev.algo;
       break;
     }
     case "status":
@@ -339,10 +383,14 @@ listen("miner-event", ({ payload: ev }) => {
       setStat("best-share", ev.best_share > 0 ? fmtDiff(ev.best_share) : "—");
       setStat("blocks", numInt.format(ev.blocks || 0));
       // How close to a block the best share was (network difficulty = 100%).
+      // The miner starts the best share over when the PoW changes; so does
+      // this line, or the last SHA3-256t figure stayed under the dash.
       if (ev.best_share > 0 && ev.network_difficulty > 0) {
         const pct = (ev.best_share / ev.network_difficulty) * 100;
         el("best-share-sub").textContent =
           (pct >= 1 ? num2.format(pct) : pct.toPrecision(2)) + "% of a block";
+      } else if (!(ev.best_share > 0)) {
+        el("best-share-sub").textContent = "highest difficulty hit";
       }
       el("netdiff").textContent = "network difficulty " + fmtDiff(ev.network_difficulty);
       // The height the pool is working on - proof that we are in sync.
@@ -352,13 +400,16 @@ listen("miner-event", ({ payload: ev }) => {
         el("job-height-card").classList.add("live");
       }
       renderTemps(ev);
-      spark.push(ev.hashrate);
-      while (spark.length > 60) spark.shift();
-      drawSpark();
+      if (sparkSkip > 0) {
+        sparkSkip--;
+      } else {
+        spark.push(ev.hashrate);
+        while (spark.length > 60) spark.shift();
+        drawSpark();
+      }
       break;
     case "share":
-      log(ev.accepted ? "share accepted" : "share rejected",
-          ev.accepted ? "l-ok" : "l-bad");
+      noteShare(ev.accepted);
       break;
     case "newblockheight": {
       setStat("job-height", "#" + numInt.format(ev.height));
