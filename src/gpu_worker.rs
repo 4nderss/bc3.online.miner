@@ -102,6 +102,7 @@ pub fn run_gpu_worker(
         Ok(b) => b,
         Err(e) => {
             eprintln!("[gpu] could not open {}: {e}", device.describe());
+            shared.gpu_opened();
             return;
         }
     };
@@ -120,6 +121,7 @@ pub fn run_gpu_worker(
         }
     };
     claim(&mut caps, &*backend);
+    shared.gpu_opened();
     // The BC3Hash window that last failed here, so it is not retried on
     // every job; a different window still gets its chance.
     let mut bc3_failed: Option<u32> = None;

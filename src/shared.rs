@@ -159,6 +159,10 @@ pub struct Shared {
     /// worker's backend has a kernel for it, lowered when that kernel fails
     /// its self-test or the worker stops. The stand-in CPU threads go by it.
     gpu_capable: [AtomicU32; 3],
+    /// GPU workers past opening their backend, whether that worked or not.
+    /// Until all are, a PoW the GPUs have a kernel for but do not take yet
+    /// is still starting up - not failed.
+    gpus_opened: AtomicU32,
     /// The secp256k1 table window the GPUs' BC3Hash kernels should use; the
     /// GPU workers switch to it before their next BC3Hash job.
     bc3_window: AtomicU32,
@@ -356,6 +360,7 @@ impl Shared {
             plan,
             last_algo: Mutex::new(None),
             gpu_capable: Default::default(),
+            gpus_opened: AtomicU32::new(0),
             bc3_window: AtomicU32::new(DEFAULT_BC3_WINDOW),
             gpu_slot_hashes: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
             gpu_slot_bc3: (0..plan.gpus).map(|_| AtomicU32::new(0)).collect(),
@@ -378,7 +383,34 @@ impl Shared {
     }
 
     pub fn status(&self, algo: PowAlgo) -> (bool, String) {
-        self.plan.status(algo, self.gpus_mine(algo))
+        let gpu = self.gpus_mine(algo);
+        // The pool's first job usually comes before the GPU has loaded its
+        // kernels. That is a start, not a failed self-test.
+        if !gpu && self.plan.gpu_kernel[algo.index()] && self.gpus_starting() {
+            let name = algo.name();
+            return if self.plan.devices_for(algo, false).cpu {
+                (true, format!("{name}: mining on CPU until the GPU is ready"))
+            } else {
+                (true, format!("{name}: waiting for the GPU to start"))
+            };
+        }
+        self.plan.status(algo, gpu)
+    }
+
+    fn gpus_starting(&self) -> bool {
+        (self.gpus_opened.load(Ordering::Relaxed) as usize) < self.plan.gpus
+    }
+
+    /// A GPU worker is past opening its backend (after claiming what it can
+    /// mine). If the GPUs still do not take the current PoW, say where it is
+    /// mined now; if they do, the claim has already said so.
+    pub fn gpu_opened(&self) {
+        self.gpus_opened.fetch_add(1, Ordering::Relaxed);
+        if let Some(algo) = self.current_algo() {
+            if !self.gpus_mine(algo) {
+                self.announce(algo);
+            }
+        }
     }
 
     /// The BC3Hash table window the GPUs should use.
@@ -749,6 +781,32 @@ mod tests {
         assert_eq!(devices(cpu, PowAlgo::Bc3Hash, false), (false, true));
         assert_eq!(cpu.status(PowAlgo::Bc3Hash, false), (true, "BC3Hash: mining on CPU".into()));
         assert_eq!(PowDevices { gpu: true, cpu: true }.label(), "gpu+cpu");
+    }
+
+    /// The pool's first job comes before the GPU has opened its backend:
+    /// the CPU stands in, and that is reported as a start, not as a failed
+    /// self-test. Once the GPU is open, the real reason shows.
+    #[test]
+    fn a_starting_gpu_is_not_reported_as_failed() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let plan = MiningPlan {
+            gpus: 1,
+            cpu_threads: 0,
+            cpu_fallback_threads: 20,
+            gpu_kernel: [false, true, true],
+            compile_ahead: true,
+        };
+        let s = Shared::new(tx, plan);
+        assert_eq!(
+            s.status(PowAlgo::Sha3t),
+            (true, "SHA3-256t: mining on CPU until the GPU is ready".into())
+        );
+        s.gpu_opened();
+        assert!(s.status(PowAlgo::Sha3t).1.contains("self-test"));
+        // No GPU kernel for SHA256d at all: never "until the GPU is ready".
+        let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let s = Shared::new(tx, plan);
+        assert!(!s.status(PowAlgo::Sha256d).1.contains("until the GPU"));
     }
 
     /// The stand-in CPU threads follow what the GPUs can do now: a GPU that
