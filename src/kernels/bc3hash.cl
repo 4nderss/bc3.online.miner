@@ -2027,12 +2027,9 @@ DEVICE_FN void fold_fix(u32* r, int n, u32 c, u32 C) {
 // Not unrolled: with three warps a scheduler at different places in the
 // kernel, the squaring loop unrolled (the compiler's choice, 4 times, 21 KiB
 // of code) cost the whole kernel 7.5 % - while the powers alone ran 2 %
-// faster that way: the instruction cache.
-#if defined(__OPENCL_VERSION__)
-#define BC3_UNROLL1 __attribute__((opencl_unroll_hint(1)))
-#else
+// faster that way: the instruction cache. C99's _Pragma, so that OpenCL C 1.2
+// compilers take it too (opencl_unroll_hint is 2.0).
 #define BC3_UNROLL1 _Pragma("unroll 1")
-#endif
 
 // ---- Two independent chains at once ----
 //
