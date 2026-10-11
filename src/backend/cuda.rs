@@ -23,7 +23,7 @@ use super::{
     kernel_lanes, kernel_supports, kernel_target, Launch, MiningBackend, Scan, MAX_HITS,
     QUEUE_DEPTH,
 };
-use crate::consensus::{PowAlgo, Target};
+use crate::consensus::PowAlgo;
 use cudarc::driver::{
     sys, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig,
     PinnedHostSlice, PushKernelArg,
@@ -390,16 +390,6 @@ impl super::bc3::Bc3Ops for CudaBackend {
     fn bc3_batch(&mut self, headers: &[[u8; 80]]) -> Result<Vec<[u8; 32]>, String> {
         CudaBackend::bc3_batch(self, headers)
     }
-
-    fn bc3_scan(
-        &mut self,
-        header76: &[u8; 76],
-        start: u32,
-        count: u32,
-        target: &Target,
-    ) -> Result<Vec<u32>, String> {
-        self.scan_range(PowAlgo::Bc3Hash, header76, start, count, target)
-    }
 }
 
 impl MiningBackend for CudaBackend {
@@ -536,9 +526,7 @@ impl MiningBackend for CudaBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::{
-        compact_to_target, hash_meets_target, sha3t, BlockHeader,
-    };
+    use crate::consensus::{compact_to_target, hash_meets_target, sha3t, BlockHeader, Target};
 
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;

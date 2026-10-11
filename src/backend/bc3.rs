@@ -2,27 +2,35 @@
 //! the host side of its tables, the target in the kernel's limb order, and
 //! the self-test every card runs before it mines.
 
-use crate::consensus::Target;
-use std::sync::Arc;
+use super::{Launch, MiningBackend, QUEUE_DEPTH};
+use crate::consensus::{PowAlgo, Target};
+use std::sync::{Arc, Weak};
 
 /// The kernel source, for the OpenCL backend, which builds it at run time
 /// (`-DBC3_WINDOW=N`); CUDA embeds the PTX that build.rs made from it.
 #[cfg(feature = "opencl")]
 pub const SOURCE: &str = include_str!("../kernels/bc3hash.cl");
 
-/// The host side of the GPU tables, built once per window for every card in
-/// the process. Only the latest window is kept: at 16 bits that is 256 MiB.
+/// The host side of the GPU tables for `window`, shared by every card that
+/// loads them at the same time - at 16 bits they are 256 MiB.
+///
+/// Held only as long as a card is uploading them. Kept for the life of the
+/// process, they were 256 MiB of RAM nobody read again after the start; a
+/// card that loads them later (a reopen, another window) builds them again,
+/// about 3 s at window 16.
 pub fn host_tables(window: u32) -> Result<Arc<Vec<u64>>, String> {
-    static CACHE: std::sync::Mutex<Option<(u32, Arc<Vec<u64>>)>> = std::sync::Mutex::new(None);
+    static CACHE: std::sync::Mutex<Option<(u32, Weak<Vec<u64>>)>> = std::sync::Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((w, tables)) = cache.as_ref() {
         if *w == window {
-            return Ok(tables.clone());
+            if let Some(tables) = tables.upgrade() {
+                return Ok(tables);
+            }
         }
     }
-    *cache = None; // the old window's tables go first, not after
+    *cache = None;
     let tables = Arc::new(bc3hash::gpu_tables(window)?);
-    *cache = Some((window, tables.clone()));
+    *cache = Some((window, Arc::downgrade(&tables)));
     Ok(tables)
 }
 
@@ -37,27 +45,20 @@ pub fn target_limbs(target: &Target) -> [u64; 4] {
     limbs
 }
 
-/// The two ways into a loaded BC3Hash kernel, as the self-test needs them.
-pub trait Bc3Ops {
+/// A backend with a loaded BC3Hash kernel, as the self-test needs it: the
+/// batch entry point next to the mining path.
+pub trait Bc3Ops: MiningBackend {
     /// BC3Hash of whole 80-byte headers, through the batch entry point.
     fn bc3_batch(&mut self, headers: &[[u8; 80]]) -> Result<Vec<[u8; 32]>, String>;
-    /// The nonces in [start, start+count) whose hash meets `target`, through
-    /// the scan entry point - the mining path.
-    fn bc3_scan(
-        &mut self,
-        header76: &[u8; 76],
-        start: u32,
-        count: u32,
-        target: &Target,
-    ) -> Result<Vec<u32>, String>;
 }
 
 /// Check a loaded BC3Hash kernel against the node: the node's header vectors
 /// and random headers against the CPU reference through the batch entry
-/// point, then a range through the scan entry point - the exact mining path,
-/// nonce placement and target compare included - against the CPU's own hit
-/// set. Every architecture and driver compiles the kernel for itself, so this
-/// runs on every card, for every window.
+/// point, then three launches through the launch queue - the exact mining
+/// path, every slot, the nonce placement up to the top of the nonce space and
+/// the target compare - each against the CPU's own hit set. Every
+/// architecture and driver compiles the kernel for itself, so this runs on
+/// every card, for every window. Leaves nothing in flight.
 pub fn self_test(k: &mut impl Bc3Ops) -> Result<(), String> {
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -97,38 +98,74 @@ pub fn self_test(k: &mut impl Bc3Ops) -> Result<(), String> {
         }
     }
 
-    // Target 2^253 - 1: about one hash in eight is a hit, so 256 nonces give
-    // the scan's compare and hit list something to do both ways.
-    let mut header76 = [0u8; 76];
-    for b in header76.iter_mut() {
-        *b = next() as u8;
-    }
-    header76[0..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+    // Target 2^253 - 1: about one hash in eight is a hit, so 128 nonces a
+    // launch give the compare and the hit list something to do both ways.
+    // The last launch ends at nonce 2^32 - 1.
     let mut target: Target = [0xff; 32];
     target[0] = 0x1f;
-    let start = next() as u32;
-    let mut gpu = k.bc3_scan(&header76, start, 256, &target)?;
-    let mut header80 = [0u8; 80];
-    header80[..76].copy_from_slice(&header76);
-    let mut cpu: Vec<u32> = (0..256u32)
-        .map(|i| start.wrapping_add(i))
-        .filter(|&nonce| {
-            header80[76..80].copy_from_slice(&nonce.to_le_bytes());
-            crate::consensus::hash_meets_target(&bc3hash::bc3hash(&header80), &target)
+    const COUNT: u32 = 128;
+    let launches: Vec<([u8; 76], u32)> = (0..QUEUE_DEPTH + 1)
+        .map(|i| {
+            let mut header76 = [0u8; 76];
+            for b in header76.iter_mut() {
+                *b = next() as u8;
+            }
+            header76[0..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+            // Never across 2^32: the worker does not launch that way either.
+            let start = if i == QUEUE_DEPTH { 0u32.wrapping_sub(COUNT) } else { next() as u32 % (0u32.wrapping_sub(COUNT)) };
+            (header76, start)
         })
         .collect();
-    gpu.sort_unstable();
-    cpu.sort_unstable();
-    if gpu != cpu {
-        return Err(format!(
-            "scan over 256 nonces: GPU found {} hits, CPU {} (first GPU {:?}, first CPU {:?})",
-            gpu.len(),
-            cpu.len(),
-            gpu.first(),
-            cpu.first()
-        ));
+    let scans = queued_scans(k, &launches, COUNT, &target).inspect_err(|_| k.abandon())?;
+    for (i, ((header76, start), gpu)) in launches.iter().zip(scans).enumerate() {
+        let mut header80 = [0u8; 80];
+        header80[..76].copy_from_slice(header76);
+        let cpu: Vec<u32> = (0..COUNT)
+            .map(|n| start.wrapping_add(n))
+            .filter(|&nonce| {
+                header80[76..80].copy_from_slice(&nonce.to_le_bytes());
+                crate::consensus::hash_meets_target(&bc3hash::bc3hash(&header80), &target)
+            })
+            .collect();
+        if gpu != cpu {
+            return Err(format!(
+                "launch {i} over {COUNT} nonces from {start:08x}: GPU found {} hits, CPU {} \
+                 (first GPU {:?}, first CPU {:?})",
+                gpu.len(),
+                cpu.len(),
+                gpu.first(),
+                cpu.first()
+            ));
+        }
     }
     Ok(())
+}
+
+/// The hits of each launch, sorted, the launches queued as deep as the
+/// worker queues them.
+fn queued_scans(
+    k: &mut impl Bc3Ops,
+    launches: &[([u8; 76], u32)],
+    count: u32,
+    target: &Target,
+) -> Result<Vec<Vec<u32>>, String> {
+    let mut scans = Vec::new();
+    let mut collect = |k: &mut dyn MiningBackend| -> Result<(), String> {
+        let mut hits = k.collect()?.hits;
+        hits.sort_unstable();
+        scans.push(hits);
+        Ok(())
+    };
+    for (header76, start) in launches {
+        k.enqueue(&Launch { algo: PowAlgo::Bc3Hash, header76, start: *start, count, target })?;
+        if k.in_flight() == QUEUE_DEPTH {
+            collect(k)?;
+        }
+    }
+    while k.in_flight() > 0 {
+        collect(k)?;
+    }
+    Ok(scans)
 }
 
 #[cfg(test)]
@@ -145,5 +182,18 @@ mod tests {
         assert_eq!(limbs[0], 0x34);
         assert_eq!(limbs[3], 0x12 << 56);
         assert_eq!((limbs[1], limbs[2]), (0, 0));
+    }
+
+    /// The host tables are shared while a card holds them, and freed after.
+    #[test]
+    fn host_tables_live_as_long_as_a_card_holds_them() {
+        let a = host_tables(2).unwrap();
+        let b = host_tables(2).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "two cards loading at once share one copy");
+        let weak = Arc::downgrade(&a);
+        drop((a, b));
+        assert!(weak.upgrade().is_none(), "nobody holds them: they must be gone");
+        // And they come back, the same, when a card asks again.
+        assert_eq!(host_tables(2).unwrap().len(), bc3hash::gpu_tables(2).unwrap().len());
     }
 }

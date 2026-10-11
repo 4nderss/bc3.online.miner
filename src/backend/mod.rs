@@ -431,9 +431,9 @@ pub trait MiningBackend {
     /// to stop working on them, so their buffers can be reused.
     fn abandon(&mut self);
 
-    /// One launch from start to finish: the self-test's and the tests' view.
-    /// Only with nothing else in flight.
-    #[cfg_attr(not(any(feature = "cuda", feature = "opencl")), allow(dead_code))]
+    /// One launch from start to finish, for the tests. Only with nothing
+    /// else in flight.
+    #[cfg(test)]
     fn scan_range(
         &mut self,
         algo: PowAlgo,

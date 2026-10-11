@@ -21,7 +21,7 @@ use super::{
     kernel_lanes, kernel_supports, kernel_target, Launch, MiningBackend, Scan, KERNEL_SOURCE,
     MAX_HITS, QUEUE_DEPTH,
 };
-use crate::consensus::{PowAlgo, Target};
+use crate::consensus::PowAlgo;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
@@ -869,22 +869,13 @@ impl super::bc3::Bc3Ops for OpenClBackend {
         Ok(out.as_chunks::<32>().0.to_vec())
     }
 
-    fn bc3_scan(
-        &mut self,
-        header76: &[u8; 76],
-        start: u32,
-        count: u32,
-        target: &Target,
-    ) -> Result<Vec<u32>, String> {
-        self.scan_range(PowAlgo::Bc3Hash, header76, start, count, target)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::cl_sys::CL_DEVICE_TYPE_ALL;
-    use crate::consensus::{hash_meets_target, sha3t};
+    use crate::consensus::{hash_meets_target, sha3t, Target};
 
     /// Requires an OpenCL runtime. In CI/Docker pocl (a CPU implementation)
     /// is enough:
