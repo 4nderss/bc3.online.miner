@@ -897,6 +897,8 @@ mod tests {
             let Some(m) = pool.next() else { continue };
             assert_eq!(m["method"], "mining.submit", "{m}");
             let p = &m["params"];
+            // No version rolling, ever: the PoW bits stay the job's.
+            assert_eq!(p.as_array().map(Vec::len), Some(5), "a submit with version bits: {m}");
             let en2 = hex::decode(p[2].as_str().unwrap()).unwrap();
             let ntime = u32::from_str_radix(p[3].as_str().unwrap(), 16).unwrap();
             let nonce = u32::from_str_radix(p[4].as_str().unwrap(), 16).unwrap();

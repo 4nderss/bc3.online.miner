@@ -61,10 +61,10 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
         let best = shared.best_share();
         let blocks = shared.stats.blocks.load(Ordering::Relaxed);
         crate::human!(
-            "[miner] {} | shares {accepted} ok, {rejected} rejected | {} | best {:.3} | blocks {blocks} | est. block: {}{}",
+            "[miner] {} | shares {accepted} ok, {rejected} rejected | {} | best {} | blocks {blocks} | est. block: {}{}",
             format_hashrate(rate),
             format_pool_rtt(pool_rtt_ms),
-            best,
+            format_difficulty(best),
             eta_secs.map(format_duration).unwrap_or_else(|| "unknown".into()),
             temp_text
         );
@@ -77,6 +77,17 @@ pub fn format_pool_rtt(ms: Option<f64>) -> String {
         Some(ms) if ms >= 10.0 => format!("pool {ms:.0} ms"),
         Some(ms) => format!("pool {ms:.1} ms"),
         None => "pool -".into(),
+    }
+}
+
+/// A share difficulty for the stats line. Three decimals were enough for
+/// SHA3-256t, whose shares are worth 0.1 and up; a BC3Hash share at the
+/// pool's start difficulty is worth 2e-6, and "best 0.000" said nothing.
+pub fn format_difficulty(d: f64) -> String {
+    if d == 0.0 || d >= 0.1 {
+        format!("{d:.3}")
+    } else {
+        format!("{d:.2e}")
     }
 }
 
@@ -130,6 +141,9 @@ mod tests {
         for r in [0.0, 1.0, 1.5e3, 1.5e6, 1.5e9, 1.5e12] {
             samples.push(format_hashrate(r));
         }
+        for d in [0.0, 2e-6, 0.0213, 1.133, 5e3] {
+            samples.push(format_difficulty(d));
+        }
         for ms in [None, Some(0.4), Some(34.4), Some(1234.5)] {
             samples.push(format_pool_rtt(ms));
         }
@@ -148,6 +162,11 @@ mod tests {
         assert_eq!(format_duration(45.0), "45s");
         assert_eq!(format_duration(3900.0), "1h 5m");
         assert_eq!(format_duration(200_000.0), "2d 7h");
+        // BC3Hash shares are worth millionths; SHA3-256t's as before.
+        assert_eq!(format_difficulty(0.0), "0.000");
+        assert_eq!(format_difficulty(1.1334), "1.133");
+        assert_eq!(format_difficulty(0.0213), "2.13e-2");
+        assert_eq!(format_difficulty(2.5e-6), "2.50e-6");
         assert_eq!(format_pool_rtt(None), "pool -");
         assert_eq!(format_pool_rtt(Some(2.34)), "pool 2.3 ms");
         assert_eq!(format_pool_rtt(Some(34.4)), "pool 34 ms");
