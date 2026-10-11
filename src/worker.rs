@@ -202,7 +202,7 @@ fn mine_job(
                     let is_block = block_target
                         .map(|t| hash_meets_target(&hash, &t))
                         .unwrap_or(false);
-                    shared.record_share(crate::consensus::difficulty_of_hash(&hash), is_block);
+                    shared.record_share(job.algo, crate::consensus::difficulty_of_hash(&hash), is_block);
                     shared.submit(FoundShare {
                         job_id: job.job_id.clone(),
                         extranonce2: extranonce2.clone(),

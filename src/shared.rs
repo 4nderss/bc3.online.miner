@@ -449,8 +449,15 @@ impl Shared {
     }
 
     /// Record a submitted share: updates the best share (and the block
-    /// counter when the share also met the block's target).
-    pub fn record_share(&self, difficulty: f64, is_block: bool) {
+    /// counter when the share also met the block's target) - for a share of
+    /// the current PoW only. The difficulties of two PoWs do not compare: a
+    /// SHA3-256t best share kept past the fork read as hundreds of percent
+    /// of a BC3Hash block, and a launch still draining at the switch would
+    /// have put one back.
+    pub fn record_share(&self, algo: PowAlgo, difficulty: f64, is_block: bool) {
+        if self.current_algo().is_some_and(|current| current != algo) {
+            return;
+        }
         if is_block {
             self.stats.blocks.fetch_add(1, Ordering::Relaxed);
         }
@@ -567,6 +574,10 @@ impl Shared {
             let mut last = self.last_algo.lock().unwrap();
             if *last == Some(algo) {
                 return;
+            }
+            // A new PoW starts the best share over - see `record_share`.
+            if last.is_some() {
+                self.stats.best_share_bits.store(0, Ordering::Relaxed);
             }
             *last = Some(algo);
         }
@@ -883,12 +894,35 @@ mod tests {
     fn best_share_keeps_the_maximum_and_counts_blocks() {
         let s = shared();
         assert_eq!(s.best_share(), 0.0);
-        s.record_share(12.5, false);
-        s.record_share(3.0, false); // lower - must not overwrite
+        s.record_share(PowAlgo::Sha3t, 12.5, false);
+        s.record_share(PowAlgo::Sha3t, 3.0, false); // lower - must not overwrite
         assert_eq!(s.best_share(), 12.5);
-        s.record_share(900.0, true); // a block is a share as well
+        s.record_share(PowAlgo::Sha3t, 900.0, true); // a block is a share as well
         assert_eq!(s.best_share(), 900.0);
         assert_eq!(s.stats.blocks.load(Ordering::Relaxed), 1);
+    }
+
+    /// The best share is per PoW: the fork starts it over, and a SHA3-256t
+    /// share from a launch still draining after the switch does not put the
+    /// old figure back - nor count as a block.
+    #[test]
+    fn the_best_share_starts_over_with_a_new_pow() {
+        let s = shared();
+        s.publish_job(a_job());
+        s.record_share(PowAlgo::Sha3t, 5_000.0, false);
+        assert_eq!(s.best_share(), 5_000.0);
+        let mut fork = a_job();
+        fork.algo = PowAlgo::Bc3Hash;
+        s.publish_job(fork.clone());
+        assert_eq!(s.best_share(), 0.0, "the SHA3-256t best share outlived the fork");
+        s.record_share(PowAlgo::Sha3t, 9_000.0, true);
+        assert_eq!(s.best_share(), 0.0, "a late SHA3-256t share counted");
+        assert_eq!(s.stats.blocks.load(Ordering::Relaxed), 0);
+        s.record_share(PowAlgo::Bc3Hash, 0.002, false);
+        assert_eq!(s.best_share(), 0.002);
+        // A new job of the same PoW keeps it.
+        s.publish_job(fork);
+        assert_eq!(s.best_share(), 0.002);
     }
 
     #[test]
