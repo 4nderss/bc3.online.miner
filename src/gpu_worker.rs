@@ -32,14 +32,16 @@ const START_BATCH: u32 = 1 << 20;
 const TARGET_LAUNCH: Duration = Duration::from_millis(100);
 
 /// The same for BC3Hash, which is ~1000 times SHA3-256t's work per hash -
-/// about 110 kH/s on an RTX 3050 Ti. A 16k start is ~0.15 s there and a few
-/// ms on a big card, from where the autotune doubles its way up, in whole
-/// waves of the card (`launch_granule`). 400 ms per launch is several waves -
-/// what runs short at the end of a launch is a small part of it - and stays
-/// far from the Windows TDR watchdog (2 s) on slow cards too.
-const BC3_MIN_BATCH: u32 = 1 << 10;
+/// about 110 kH/s on an RTX 3050 Ti. Launches start at the floor: 256 nonces
+/// are 2 ms there, and still far from the Windows TDR watchdog (2 s) on an
+/// integrated GPU through OpenCL that may manage a few hundred hashes a
+/// second - a 16k start would have been seconds there. From the floor the
+/// autotune doubles its way up, in whole waves of the card (`launch_granule`;
+/// on CUDA the floor is one wave). 400 ms per launch is several waves - what
+/// runs short at the end of a launch is a small part of it.
+const BC3_MIN_BATCH: u32 = 1 << 8;
 const BC3_MAX_BATCH: u32 = 1 << 24;
-const BC3_START_BATCH: u32 = 1 << 14;
+const BC3_START_BATCH: u32 = 1 << 8;
 const BC3_TARGET_LAUNCH: Duration = Duration::from_millis(400);
 
 /// Launch sizing per PoW: (min, max, start, target time per launch).

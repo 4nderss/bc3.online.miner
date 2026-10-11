@@ -123,16 +123,18 @@ for w in 10 12 14 16; do
 done
 ```
 
-with the CUDA 12.0 toolkit, as for `sha3t.ptx`. The host builds the matching
-tables (`bc3hash::gpu_tables`), and every card self-tests every window before
-it mines with it: the node's header vectors, random headers against the CPU
+with the CUDA 12.0 toolkit, as for `sha3t.ptx`. OpenCL builds the same source
+at run time with `-DBC3_WINDOW=N` (`cargo test --release opencl -- --ignored`
+under pocl runs it, see the README). The host builds the matching tables
+(`bc3hash::gpu_tables`), and every card self-tests every window before it
+mines with it: the node's header vectors, random headers against the CPU
 reference, and a scan range against the CPU's hit set. A card that fails
 mines no BC3Hash; the CPU takes over. Launches are whole waves of the card
 (`launch_granule`) - a partial last wave cost 14 % on an RTX 3050 Ti.
 
 `bc3-miner --benchmark` measures it through the real worker path with an
-in-process job source, compares the four windows on CUDA cards, and checks
-every share with the CPU reference.
+in-process job source, compares the four windows on every card with the
+kernel, and checks every share with the CPU reference.
 
 ## Changing the GPU kernel
 

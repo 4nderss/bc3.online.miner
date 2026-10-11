@@ -47,9 +47,9 @@ struct Args {
     rig: Option<String>,
 
     /// Backend: auto = CUDA if possible, else OpenCL, else CPU. In auto the
-    /// CPU also mines whatever the GPU cannot (BC3Hash on OpenCL cards, or a
-    /// CUDA card whose BC3Hash kernel failed its self-test); with cuda or
-    /// opencl it mines only if --threads asks it to.
+    /// CPU also mines whatever the GPU cannot (BC3Hash on a card whose
+    /// BC3Hash kernel failed its self-test); with cuda or opencl it mines
+    /// only if --threads asks it to.
     #[arg(long, value_enum, default_value_t = BackendKind::Auto, env = "BC3_BACKEND")]
     backend: BackendKind,
 

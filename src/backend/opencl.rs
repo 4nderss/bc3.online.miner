@@ -101,6 +101,53 @@ pub struct OpenClBackend {
     name: String,
     hits_reset: Vec<u32>,
     budget: HitBudget,
+    /// The device itself, for building the BC3Hash program later.
+    #[cfg(feature = "bc3hash")]
+    device: cl_handle,
+    /// The BC3Hash program in use - built on demand, for one window at a time.
+    #[cfg(feature = "bc3hash")]
+    bc3: Option<Bc3Program>,
+}
+
+/// Work-group size for BC3Hash: the kernel needs ~255 registers a work-item,
+/// and 64 is what it was measured with (32-256 the same on CUDA).
+#[cfg(feature = "bc3hash")]
+const BC3_LOCAL_SIZE: usize = 64;
+
+/// One built BC3Hash program: its window, both kernels, and the buffers they
+/// read - the tables (written once) and the per-launch header and target.
+/// Every handle is released on drop, however far the build got.
+#[cfg(feature = "bc3hash")]
+struct Bc3Program {
+    window: u32,
+    program: cl_handle,
+    scan: cl_handle,
+    batch: cl_handle,
+    d_tables: cl_handle,
+    d_header: cl_handle,
+    d_target: cl_handle,
+    local: usize,
+}
+
+#[cfg(feature = "bc3hash")]
+impl Drop for Bc3Program {
+    fn drop(&mut self) {
+        let Ok(cl) = cl() else { return };
+        unsafe {
+            for (release, handle) in [
+                (cl.release_mem_object, self.d_target),
+                (cl.release_mem_object, self.d_header),
+                (cl.release_mem_object, self.d_tables),
+                (cl.release_kernel, self.batch),
+                (cl.release_kernel, self.scan),
+                (cl.release_program, self.program),
+            ] {
+                if !handle.is_null() {
+                    let _ = release(handle);
+                }
+            }
+        }
+    }
 }
 
 /// Largest usable work-group size, given what the device reported.
@@ -160,6 +207,10 @@ impl OpenClBackend {
             name,
             hits_reset: vec![0u32; 1 + MAX_HITS],
             budget: HitBudget::default(),
+            #[cfg(feature = "bc3hash")]
+            device,
+            #[cfg(feature = "bc3hash")]
+            bc3: None,
         };
 
         unsafe {
@@ -297,6 +348,9 @@ impl OpenClBackend {
 
 impl Drop for OpenClBackend {
     fn drop(&mut self) {
+        // The BC3Hash program and buffers belong to the context: first.
+        #[cfg(feature = "bc3hash")]
+        drop(self.bc3.take());
         let Ok(cl) = cl() else { return };
         // Reverse of creation order; error codes are of no interest here.
         //
@@ -326,8 +380,40 @@ impl MiningBackend for OpenClBackend {
         format!("OpenCL: {}", self.name)
     }
 
+    fn has_kernel(&self, algo: PowAlgo) -> bool {
+        match algo {
+            PowAlgo::Bc3Hash => cfg!(feature = "bc3hash"),
+            PowAlgo::Sha256d | PowAlgo::Sha3t => kernel_supports(algo),
+        }
+    }
+
     fn supports(&self, algo: PowAlgo) -> bool {
-        kernel_supports(algo)
+        match algo {
+            #[cfg(feature = "bc3hash")]
+            PowAlgo::Bc3Hash => self.bc3.is_some(),
+            #[cfg(not(feature = "bc3hash"))]
+            PowAlgo::Bc3Hash => false,
+            PowAlgo::Sha256d | PowAlgo::Sha3t => kernel_supports(algo),
+        }
+    }
+
+    #[cfg(feature = "bc3hash")]
+    fn prepare_bc3hash(&mut self, window: u32) -> Result<std::time::Duration, String> {
+        let t0 = std::time::Instant::now();
+        // The old window's buffers leave the device before the new ones come.
+        self.bc3 = None;
+        let program = self.build_bc3(window)?;
+        self.bc3 = Some(program);
+        if let Err(e) = super::bc3::self_test(self) {
+            self.bc3 = None;
+            return Err(format!("self-test failed: {e}"));
+        }
+        Ok(t0.elapsed())
+    }
+
+    #[cfg(feature = "bc3hash")]
+    fn bc3hash_window(&self) -> Option<u32> {
+        self.bc3.as_ref().map(|k| k.window)
     }
 
     fn scan_range(
@@ -338,6 +424,13 @@ impl MiningBackend for OpenClBackend {
         count: u32,
         target: &Target,
     ) -> Result<Vec<u32>, String> {
+        #[cfg(feature = "bc3hash")]
+        if algo == PowAlgo::Bc3Hash {
+            if count == 0 {
+                return Ok(vec![]);
+            }
+            return super::bc3::Bc3Ops::bc3_scan(self, header76, start_nonce, count, target);
+        }
         if !kernel_supports(algo) {
             return Err(format!("no kernel for {}", algo.name()));
         }
@@ -470,6 +563,263 @@ impl OpenClBackend {
     }
 }
 
+#[cfg(feature = "bc3hash")]
+impl OpenClBackend {
+    /// Build the BC3Hash program for `window` (`-DBC3_WINDOW=N`) and write its
+    /// tables to the device. The runtime compiles a kernel this size for a
+    /// while - once per window and run.
+    fn build_bc3(&self, window: u32) -> Result<Bc3Program, String> {
+        let cl = cl()?;
+        // Owned from the start, so every early return releases what exists.
+        let mut k = Bc3Program {
+            window,
+            program: ptr::null_mut(),
+            scan: ptr::null_mut(),
+            batch: ptr::null_mut(),
+            d_tables: ptr::null_mut(),
+            d_header: ptr::null_mut(),
+            d_target: ptr::null_mut(),
+            local: BC3_LOCAL_SIZE,
+        };
+        unsafe {
+            let mut err: cl_int = CL_SUCCESS;
+            let source = super::bc3::SOURCE;
+            let src = cstr(source);
+            let src_ptr = src.as_ptr();
+            let src_len = source.len();
+            k.program =
+                (cl.create_program_with_source)(self.context, 1, &src_ptr, &src_len, &mut err);
+            if err != CL_SUCCESS || k.program.is_null() {
+                return Err(format!("clCreateProgramWithSource (BC3Hash): {}", err_str(err)));
+            }
+            let options = cstr(&format!("-DBC3_WINDOW={window}"));
+            let code = (cl.build_program)(
+                k.program,
+                1,
+                &self.device,
+                options.as_ptr(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            if code != CL_SUCCESS {
+                let log = info_string(|size, buf, len| {
+                    (cl.get_program_build_info)(
+                        k.program,
+                        self.device,
+                        CL_PROGRAM_BUILD_LOG,
+                        size,
+                        buf,
+                        len,
+                    )
+                })
+                .unwrap_or_else(|e| format!("(build log unavailable: {e})"));
+                return Err(format!(
+                    "building bc3hash.cl (window {window}) failed: {}\n{log}",
+                    err_str(code)
+                ));
+            }
+            for (name, slot) in [("bc3hash_scan", &mut k.scan), ("bc3hash_batch", &mut k.batch)] {
+                let kname = cstr(name);
+                *slot = (cl.create_kernel)(k.program, kname.as_ptr(), &mut err);
+                if err != CL_SUCCESS || slot.is_null() {
+                    return Err(format!("clCreateKernel {name}: {}", err_str(err)));
+                }
+            }
+            let mut device_max: usize = 0;
+            let code = (cl.get_kernel_work_group_info)(
+                k.scan,
+                self.device,
+                CL_KERNEL_WORK_GROUP_SIZE,
+                std::mem::size_of::<usize>(),
+                &mut device_max as *mut usize as *mut c_void,
+                ptr::null_mut(),
+            );
+            if code == CL_SUCCESS {
+                k.local = clamp_local_size(device_max).min(BC3_LOCAL_SIZE);
+            }
+            let tables = super::bc3::host_tables(window)?;
+            let bytes = tables.len() * std::mem::size_of::<u64>();
+            k.d_tables = self.bc3_buffer(CL_MEM_READ_ONLY, bytes, "tables")?;
+            self.bc3_write(k.d_tables, tables.as_ptr() as *const c_void, bytes, "tables")?;
+            k.d_header = self.bc3_buffer(CL_MEM_READ_ONLY, 76, "header")?;
+            k.d_target = self.bc3_buffer(CL_MEM_READ_ONLY, 32, "target")?;
+        }
+        Ok(k)
+    }
+
+    unsafe fn bc3_buffer(&self, flags: u64, bytes: usize, what: &str) -> Result<cl_handle, String> {
+        let cl = cl()?;
+        let mut err: cl_int = CL_SUCCESS;
+        let buffer = (cl.create_buffer)(self.context, flags, bytes, ptr::null_mut(), &mut err);
+        check(&format!("clCreateBuffer({what})"), err)?;
+        if buffer.is_null() {
+            return Err(format!("clCreateBuffer({what}) returned null"));
+        }
+        Ok(buffer)
+    }
+
+    unsafe fn bc3_write(
+        &self,
+        buffer: cl_handle,
+        data: *const c_void,
+        bytes: usize,
+        what: &str,
+    ) -> Result<(), String> {
+        let cl = cl()?;
+        check(
+            &format!("write {what}"),
+            (cl.enqueue_write_buffer)(
+                self.queue,
+                buffer,
+                CL_TRUE,
+                0,
+                bytes,
+                data as *mut c_void,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+        )
+    }
+
+    /// Set a kernel's arguments, in order: buffers by handle, numbers by value.
+    unsafe fn bc3_args(&self, kernel: cl_handle, args: &[Arg]) -> Result<(), String> {
+        let cl = cl()?;
+        for (i, arg) in args.iter().enumerate() {
+            let (size, p) = match arg {
+                Arg::Mem(h) => (std::mem::size_of::<cl_handle>(), h as *const cl_handle as *const c_void),
+                Arg::U32(v) => (4, v as *const u32 as *const c_void),
+            };
+            check(&format!("set arg {i}"), (cl.set_kernel_arg)(kernel, i as cl_uint, size, p))?;
+        }
+        Ok(())
+    }
+
+    unsafe fn bc3_launch(&self, kernel: cl_handle, items: u32, local: usize) -> Result<(), String> {
+        let cl = cl()?;
+        // Global rounds up to a multiple of local; the kernel guards its count.
+        let global = (items as usize).div_ceil(local) * local;
+        check(
+            "clEnqueueNDRangeKernel (BC3Hash)",
+            (cl.enqueue_nd_range_kernel)(
+                self.queue,
+                kernel,
+                1,
+                ptr::null(),
+                &global,
+                &local,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+        )
+    }
+
+    unsafe fn bc3_read(&self, buffer: cl_handle, out: *mut c_void, bytes: usize) -> Result<(), String> {
+        let cl = cl()?;
+        check(
+            "read (BC3Hash)",
+            (cl.enqueue_read_buffer)(
+                self.queue,
+                buffer,
+                CL_TRUE,
+                0,
+                bytes,
+                out,
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+            ),
+        )?;
+        check("clFinish", (cl.finish)(self.queue))
+    }
+}
+
+/// A kernel argument for `bc3_args`.
+#[cfg(feature = "bc3hash")]
+enum Arg {
+    Mem(cl_handle),
+    U32(u32),
+}
+
+#[cfg(feature = "bc3hash")]
+impl super::bc3::Bc3Ops for OpenClBackend {
+    fn bc3_batch(&mut self, headers: &[[u8; 80]]) -> Result<Vec<[u8; 32]>, String> {
+        let k = self.bc3.as_ref().ok_or("BC3Hash program not built")?;
+        let flat: Vec<u8> = headers.iter().flatten().copied().collect();
+        let count = headers.len() as u32;
+        let mut out = vec![0u8; headers.len() * 32];
+        // Released on every path out, like the rest of this backend's handles.
+        struct Temp(cl_handle);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                if let Ok(cl) = cl() {
+                    if !self.0.is_null() {
+                        unsafe {
+                            let _ = (cl.release_mem_object)(self.0);
+                        }
+                    }
+                }
+            }
+        }
+        unsafe {
+            let d_in = Temp(self.bc3_buffer(CL_MEM_READ_ONLY, flat.len(), "headers")?);
+            let d_out = Temp(self.bc3_buffer(CL_MEM_READ_WRITE, out.len(), "digests")?);
+            self.bc3_write(d_in.0, flat.as_ptr() as *const c_void, flat.len(), "headers")?;
+            self.bc3_args(
+                k.batch,
+                &[Arg::Mem(k.d_tables), Arg::Mem(d_in.0), Arg::U32(count), Arg::Mem(d_out.0)],
+            )?;
+            self.bc3_launch(k.batch, count, k.local)?;
+            self.bc3_read(d_out.0, out.as_mut_ptr() as *mut c_void, out.len())?;
+        }
+        Ok(out.as_chunks::<32>().0.to_vec())
+    }
+
+    fn bc3_scan(
+        &mut self,
+        header76: &[u8; 76],
+        start: u32,
+        count: u32,
+        target: &Target,
+    ) -> Result<Vec<u32>, String> {
+        let k = self.bc3.as_ref().ok_or("BC3Hash program not built")?;
+        let limbs = super::bc3::target_limbs(target);
+        let mut hits = vec![0u32; 1 + MAX_HITS];
+        unsafe {
+            self.bc3_write(k.d_header, header76.as_ptr() as *const c_void, 76, "header")?;
+            self.bc3_write(k.d_target, limbs.as_ptr() as *const c_void, 32, "target")?;
+            self.bc3_write(
+                self.d_hits,
+                self.hits_reset.as_ptr() as *const c_void,
+                std::mem::size_of_val(&self.hits_reset[..]),
+                "hits",
+            )?;
+            // The argument order must match bc3hash_scan in bc3hash.cl.
+            self.bc3_args(
+                k.scan,
+                &[
+                    Arg::Mem(k.d_tables),
+                    Arg::Mem(k.d_header),
+                    Arg::U32(start),
+                    Arg::U32(count),
+                    Arg::Mem(k.d_target),
+                    Arg::Mem(self.d_hits),
+                    Arg::U32(MAX_HITS as u32),
+                ],
+            )?;
+            self.bc3_launch(k.scan, count, k.local)?;
+            self.bc3_read(
+                self.d_hits,
+                hits.as_mut_ptr() as *mut c_void,
+                std::mem::size_of_val(&hits[..]),
+            )?;
+        }
+        let n = (hits[0] as usize).min(MAX_HITS);
+        Ok(hits[1..1 + n].to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -535,6 +885,40 @@ mod tests {
             assert!(gpu.contains(&pick), "round {round}: the chosen nonce is missing");
             assert_eq!(gpu, cpu, "round {round}: GPU and CPU hit sets differ");
         }
+    }
+
+    /// The BC3Hash program builds on this runtime and passes the self-test
+    /// every card runs: the node's header vectors, random headers and a scan
+    /// range against the CPU reference. Then a range through `scan_range`,
+    /// the mining path, against the CPU's hit set.
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    #[ignore = "requires an OpenCL runtime; building the kernel takes pocl minutes"]
+    fn opencl_bc3hash_passes_the_self_test() {
+        let mut backend =
+            OpenClBackend::new_typed(0, 0, CL_DEVICE_TYPE_ALL).expect("OpenCL backend");
+        let took = backend.prepare_bc3hash(10).expect("BC3Hash on OpenCL");
+        println!("{}: BC3Hash window 10 ready, self-test passed, {:.1} s", backend.name(), took.as_secs_f64());
+        assert!(backend.supports(PowAlgo::Bc3Hash));
+        assert_eq!(backend.bc3hash_window(), Some(10));
+
+        let mut header80 = [0u8; 80];
+        header80[..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+        header80[4] = 0x5a;
+        let header76: [u8; 76] = header80[..76].try_into().unwrap();
+        let mut target: Target = [0xff; 32];
+        target[0] = 0x0f; // about one hash in sixteen
+        let mut gpu = backend.scan_range(PowAlgo::Bc3Hash, &header76, 1000, 128, &target).unwrap();
+        let mut cpu: Vec<u32> = (1000..1128u32)
+            .filter(|&n| {
+                header80[76..80].copy_from_slice(&n.to_le_bytes());
+                hash_meets_target(&bc3hash::bc3hash(&header80), &target)
+            })
+            .collect();
+        gpu.sort_unstable();
+        cpu.sort_unstable();
+        assert_eq!(gpu, cpu);
+        assert!(!cpu.is_empty());
     }
 
     /// An empty range must never make it as far as a kernel launch.

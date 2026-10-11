@@ -2,11 +2,13 @@
 //! fallback).
 //!
 //! A backend grinds a nonce range for a fixed 76-byte header prefix and
-//! returns the nonces whose PoW hash is <= the share target. SHA3-256t is the
-//! only kernel; see `kernel_supports`. Every hit is re-checked on the CPU in
-//! gpu_worker before submit - a kernel bug can never produce a bad share, only
-//! a missed one.
+//! returns the nonces whose PoW hash is <= the share target: SHA3-256t with
+//! `sha3t.cl` (see `kernel_supports`), BC3Hash with `bc3hash.cl` (see bc3.rs).
+//! Every hit is re-checked on the CPU in gpu_worker before submit - a kernel
+//! bug can never produce a bad share, only a missed one.
 
+#[cfg(all(feature = "bc3hash", any(feature = "cuda", feature = "opencl")))]
+pub mod bc3;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 #[cfg(feature = "opencl")]
@@ -333,9 +335,8 @@ pub fn kernel_supports(algo: PowAlgo) -> bool {
         // The kernel always runs SHA3-256t; every hit would fail the CPU
         // re-check.
         PowAlgo::Sha256d => false,
-        // Not this kernel's: BC3Hash has its own, bc3hash.cl, so far loaded by
-        // the CUDA backend only (`CudaBackend::has_kernel`). OpenCL answers
-        // false here and the CPU mines BC3Hash for it.
+        // Not this kernel's: BC3Hash has its own, bc3hash.cl, which both
+        // backends load on demand - see their `has_kernel` and bc3.rs.
         PowAlgo::Bc3Hash => false,
     }
 }
@@ -418,13 +419,13 @@ impl GpuDevice {
     }
 }
 
-/// Will a device of this kind have a kernel for `algo` once it is opened?
-/// The same answer its backend's `has_kernel` gives, known before opening it.
-pub fn device_has_kernel(dev: &GpuDevice, algo: PowAlgo) -> bool {
-    match (dev, algo) {
-        #[cfg(feature = "cuda")]
-        (GpuDevice::Cuda { .. }, PowAlgo::Bc3Hash) => cfg!(feature = "bc3hash"),
-        _ => kernel_supports(algo),
+/// Will a device have a kernel for `algo` once it is opened? The same answer
+/// its backend's `has_kernel` gives - both backends have both kernels -
+/// known before opening it.
+pub fn device_has_kernel(_dev: &GpuDevice, algo: PowAlgo) -> bool {
+    match algo {
+        PowAlgo::Bc3Hash => cfg!(feature = "bc3hash"),
+        PowAlgo::Sha256d | PowAlgo::Sha3t => kernel_supports(algo),
     }
 }
 
