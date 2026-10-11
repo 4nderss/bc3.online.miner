@@ -36,7 +36,20 @@ impl Telemetry {
         {
             let prev = std::panic::take_hook();
             std::panic::set_hook(Box::new(|_| {}));
-            let nvml = std::panic::catch_unwind(Nvml::init).ok().and_then(|r| r.ok());
+            // NVML's loader asks for the unversioned libnvidia-ml.so, which
+            // distribution driver packages and containers often lack: they
+            // have libnvidia-ml.so.1, the name the driver's ABI promises.
+            let nvml = std::panic::catch_unwind(|| {
+                Nvml::init().or_else(|e| {
+                    if cfg!(target_os = "linux") {
+                        Nvml::builder().lib_path(std::ffi::OsStr::new("libnvidia-ml.so.1")).init()
+                    } else {
+                        Err(e)
+                    }
+                })
+            })
+            .ok()
+            .and_then(|r| r.ok());
             std::panic::set_hook(prev);
             return Self { nvml };
         }
