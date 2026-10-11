@@ -63,6 +63,18 @@ const BC3HASH: Option<PowFn> = Some(|h: &[u8; 80]| ::bc3hash::bc3hash(h));
 const BC3HASH: Option<PowFn> = None;
 
 impl PowAlgo {
+    /// Every variant, in `index` order.
+    pub const ALL: [PowAlgo; 3] = [PowAlgo::Sha256d, PowAlgo::Sha3t, PowAlgo::Bc3Hash];
+
+    /// Position in `ALL`, for per-algorithm tables.
+    pub fn index(&self) -> usize {
+        match self {
+            PowAlgo::Sha256d => 0,
+            PowAlgo::Sha3t => 1,
+            PowAlgo::Bc3Hash => 2,
+        }
+    }
+
     /// The name used in logs and shared with the pool.
     pub fn name(&self) -> &'static str {
         match self {
@@ -531,6 +543,9 @@ mod tests {
         assert_eq!(PowAlgo::Sha256d.name(), "SHA256d");
         assert_eq!(PowAlgo::Sha3t.name(), "SHA3-256t");
         assert_eq!(PowAlgo::Bc3Hash.name(), "BC3Hash");
+        for (i, algo) in PowAlgo::ALL.iter().enumerate() {
+            assert_eq!(algo.index(), i, "{}", algo.name());
+        }
     }
 
     /// `hash`, `hash_fn` and the version-bit `BlockHeader::hash` must agree.

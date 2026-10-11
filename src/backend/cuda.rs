@@ -20,6 +20,70 @@ const BLOCK_DIM: u32 = 256;
 /// Precompiled kernel PTX (built by build.rs).
 const SHA3T_PTX: &str = include_str!(env!("BC3_SHA3T_PTX"));
 
+/// The BC3Hash kernel, one PTX per secp256k1 table window: the best window
+/// depends on the card's L2 - on an RTX 3050 Ti (2 MB of L2) the lab measured
+/// 110 kH/s at 10 bits and 128 at 16 - so the choice is made at run time.
+#[cfg(feature = "bc3hash")]
+const BC3HASH_PTX: [(u32, &str); 4] = [
+    (10, include_str!(env!("BC3_BC3HASH_W10_PTX"))),
+    (12, include_str!(env!("BC3_BC3HASH_W12_PTX"))),
+    (14, include_str!(env!("BC3_BC3HASH_W14_PTX"))),
+    (16, include_str!(env!("BC3_BC3HASH_W16_PTX"))),
+];
+
+/// Threads per block for BC3Hash. 32 to 256 measured the same; a small
+/// block keeps the tail of a launch short.
+#[cfg(feature = "bc3hash")]
+const BC3_BLOCK_DIM: u32 = 64;
+
+/// One loaded BC3Hash kernel: its window, the two entry points, and the
+/// device buffers it reads - the tables (uploaded once) and the per-launch
+/// header and target.
+#[cfg(feature = "bc3hash")]
+struct Bc3Kernel {
+    window: u32,
+    scan: CudaFunction,
+    batch: CudaFunction,
+    d_tables: CudaSlice<u64>,
+    d_header: CudaSlice<u8>,
+    d_target: CudaSlice<u64>,
+    /// Nonces the card runs at once: SMs x resident blocks x block size.
+    /// At 255 registers a thread only 4 blocks of 64 fit on an SM, so a
+    /// launch that is not a whole number of these waves leaves most of the
+    /// card idle for its last one - 16384 nonces on an RTX 3050 Ti is 3.2
+    /// waves, which cost 14 %.
+    wave: u32,
+}
+
+/// The host side of the GPU tables, built once per window for every card in
+/// the process. Only the latest window is kept: at 16 bits that is 256 MiB.
+#[cfg(feature = "bc3hash")]
+fn host_tables(window: u32) -> Result<Arc<Vec<u64>>, String> {
+    static CACHE: std::sync::Mutex<Option<(u32, Arc<Vec<u64>>)>> = std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((w, tables)) = cache.as_ref() {
+        if *w == window {
+            return Ok(tables.clone());
+        }
+    }
+    *cache = None; // the old window's tables go first, not after
+    let tables = Arc::new(bc3hash::gpu_tables(window)?);
+    *cache = Some((window, tables.clone()));
+    Ok(tables)
+}
+
+/// The share target as the kernel takes it: four u64 limbs, least
+/// significant first. Our `Target` is 32 big-endian bytes.
+#[cfg(feature = "bc3hash")]
+fn target_limbs(target: &Target) -> [u64; 4] {
+    let mut limbs = [0u64; 4];
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let at = 32 - 8 * (i + 1);
+        *limb = u64::from_be_bytes(target[at..at + 8].try_into().unwrap());
+    }
+    limbs
+}
+
 /// List CUDA devices; empty list if the driver or the devices are missing.
 ///
 /// cudarc's dynamic loader PANICS if libcuda/nvcuda is not present on the
@@ -46,6 +110,8 @@ pub fn list_devices() -> Vec<super::GpuDevice> {
 }
 
 pub struct CudaBackend {
+    #[cfg(feature = "bc3hash")]
+    ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     func: CudaFunction,
     name: String,
@@ -53,6 +119,9 @@ pub struct CudaBackend {
     d_hits: CudaSlice<u32>,
     d_lanes: CudaSlice<u64>,
     hits_reset: Vec<u32>,
+    /// The BC3Hash kernel in use - loaded on demand, for one window at a time.
+    #[cfg(feature = "bc3hash")]
+    bc3: Option<Bc3Kernel>,
 }
 
 impl CudaBackend {
@@ -78,13 +147,206 @@ impl CudaBackend {
             .map_err(|e| format!("alloc lanes: {e}"))?;
 
         Ok(Self {
+            #[cfg(feature = "bc3hash")]
+            ctx,
             stream,
             func,
             name,
             d_hits,
             d_lanes,
             hits_reset: vec![0u32; 1 + MAX_HITS],
+            #[cfg(feature = "bc3hash")]
+            bc3: None,
         })
+    }
+
+    /// Load the BC3Hash kernel for `window` and upload its tables. The JIT
+    /// of a 2.8 MB PTX takes a while the first time on a card; the driver
+    /// caches the result.
+    #[cfg(feature = "bc3hash")]
+    fn load_bc3(&mut self, window: u32) -> Result<Bc3Kernel, String> {
+        let ptx = BC3HASH_PTX
+            .iter()
+            .find(|(w, _)| *w == window)
+            .map(|(_, ptx)| *ptx)
+            .ok_or_else(|| format!("no BC3Hash kernel for a window of {window} bits"))?;
+        let module = self
+            .ctx
+            .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+            .map_err(|e| format!("could not load the BC3Hash kernel (window {window}): {e}"))?;
+        let scan = module
+            .load_function("bc3hash_scan")
+            .map_err(|e| format!("load_function bc3hash_scan: {e}"))?;
+        let batch = module
+            .load_function("bc3hash_batch")
+            .map_err(|e| format!("load_function bc3hash_batch: {e}"))?;
+        let tables = host_tables(window)?;
+        let d_tables = self
+            .stream
+            .clone_htod(&tables[..])
+            .map_err(|e| format!("upload BC3Hash tables ({} MiB): {e}", (tables.len() * 8) >> 20))?;
+        let d_header = self.stream.alloc_zeros::<u8>(76).map_err(|e| format!("alloc header: {e}"))?;
+        let d_target = self.stream.alloc_zeros::<u64>(4).map_err(|e| format!("alloc target: {e}"))?;
+        let sms = self
+            .ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .unwrap_or(1)
+            .max(1) as u32;
+        let per_sm = scan
+            .occupancy_max_active_blocks_per_multiprocessor(BC3_BLOCK_DIM, 0, None)
+            .unwrap_or(1)
+            .max(1);
+        let wave = sms * per_sm * BC3_BLOCK_DIM;
+        Ok(Bc3Kernel { window, scan, batch, d_tables, d_header, d_target, wave })
+    }
+
+    /// BC3Hash of 80-byte headers on the GPU, through the kernel's batch
+    /// entry point - the self-test's view of the kernel.
+    #[cfg(feature = "bc3hash")]
+    fn bc3_batch(&mut self, headers: &[[u8; 80]]) -> Result<Vec<[u8; 32]>, String> {
+        let k = self.bc3.as_ref().ok_or("BC3Hash kernel not loaded")?;
+        let flat: Vec<u8> = headers.iter().flatten().copied().collect();
+        let d_in = self.stream.clone_htod(&flat[..]).map_err(|e| format!("htod headers: {e}"))?;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<u8>(headers.len() * 32)
+            .map_err(|e| format!("alloc digests: {e}"))?;
+        let count = headers.len() as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (count.div_ceil(BC3_BLOCK_DIM), 1, 1),
+            block_dim: (BC3_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut launch = self.stream.launch_builder(&k.batch);
+        launch.arg(&k.d_tables).arg(&d_in).arg(&count).arg(&mut d_out);
+        unsafe {
+            launch.launch(cfg).map_err(|e| format!("bc3hash_batch launch: {e}"))?;
+        }
+        let out = self.stream.clone_dtoh(&d_out).map_err(|e| format!("dtoh digests: {e}"))?;
+        self.stream.synchronize().map_err(|e| format!("synchronize: {e}"))?;
+        Ok(out.as_chunks::<32>().0.to_vec())
+    }
+
+    /// Check the loaded BC3Hash kernel against the node: the node's header
+    /// vectors and random headers against the CPU reference through the
+    /// batch entry point, then a range through the scan entry point - the
+    /// exact mining path, nonce placement and target compare included -
+    /// against the CPU's own hit set. Every architecture and driver JITs the
+    /// PTX for itself, so this runs on every card, for every window.
+    #[cfg(feature = "bc3hash")]
+    fn self_test_bc3(&mut self) -> Result<(), String> {
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x0bc3)
+            | 1;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut headers = Vec::new();
+        let mut expected = Vec::new();
+        for (header, digest) in bc3hash::header_vectors() {
+            headers.push(header);
+            expected.push(digest);
+        }
+        for _ in 0..14 {
+            let mut header = [0u8; 80];
+            for b in header.iter_mut() {
+                *b = next() as u8;
+            }
+            header[0..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+            expected.push(bc3hash::bc3hash(&header));
+            headers.push(header);
+        }
+        let got = self.bc3_batch(&headers)?;
+        for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+            if g != e {
+                return Err(format!(
+                    "header {i} ({}): GPU {} but CPU {}",
+                    if i < 2 { "the node's vector" } else { "random" },
+                    hex::encode(g),
+                    hex::encode(e)
+                ));
+            }
+        }
+
+        // Target 2^253 - 1: about one hash in eight is a hit, so 256 nonces
+        // give the scan's compare and hit list something to do both ways.
+        let mut header76 = [0u8; 76];
+        for b in header76.iter_mut() {
+            *b = next() as u8;
+        }
+        header76[0..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+        let mut target: Target = [0xff; 32];
+        target[0] = 0x1f;
+        let start = next() as u32;
+        let mut gpu = self.scan_bc3(&header76, start, 256, &target)?;
+        let mut header80 = [0u8; 80];
+        header80[..76].copy_from_slice(&header76);
+        let mut cpu: Vec<u32> = (0..256u32)
+            .map(|i| start.wrapping_add(i))
+            .filter(|&nonce| {
+                header80[76..80].copy_from_slice(&nonce.to_le_bytes());
+                crate::consensus::hash_meets_target(&bc3hash::bc3hash(&header80), &target)
+            })
+            .collect();
+        gpu.sort_unstable();
+        cpu.sort_unstable();
+        if gpu != cpu {
+            return Err(format!(
+                "scan over 256 nonces: GPU found {} hits, CPU {} (first GPU {:?}, first CPU {:?})",
+                gpu.len(),
+                cpu.len(),
+                gpu.first(),
+                cpu.first()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "bc3hash")]
+    fn scan_bc3(
+        &mut self,
+        header76: &[u8; 76],
+        start_nonce: u32,
+        count: u32,
+        target: &Target,
+    ) -> Result<Vec<u32>, String> {
+        let k = self.bc3.as_mut().ok_or("BC3Hash kernel not loaded")?;
+        self.stream
+            .memcpy_htod(&header76[..], &mut k.d_header)
+            .map_err(|e| format!("htod header: {e}"))?;
+        self.stream
+            .memcpy_htod(&target_limbs(target)[..], &mut k.d_target)
+            .map_err(|e| format!("htod target: {e}"))?;
+        self.stream
+            .memcpy_htod(&self.hits_reset, &mut self.d_hits)
+            .map_err(|e| format!("htod hits: {e}"))?;
+        let cfg = LaunchConfig {
+            grid_dim: (count.div_ceil(BC3_BLOCK_DIM), 1, 1),
+            block_dim: (BC3_BLOCK_DIM, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let max_hits = MAX_HITS as u32;
+        let mut launch = self.stream.launch_builder(&k.scan);
+        launch
+            .arg(&k.d_tables)
+            .arg(&k.d_header)
+            .arg(&start_nonce)
+            .arg(&count)
+            .arg(&k.d_target)
+            .arg(&mut self.d_hits)
+            .arg(&max_hits);
+        unsafe {
+            launch.launch(cfg).map_err(|e| format!("bc3hash_scan launch: {e}"))?;
+        }
+        let hits = self.stream.clone_dtoh(&self.d_hits).map_err(|e| format!("dtoh hits: {e}"))?;
+        self.stream.synchronize().map_err(|e| format!("synchronize: {e}"))?;
+        let n = (hits[0] as usize).min(MAX_HITS);
+        Ok(hits[1..1 + n].to_vec())
     }
 }
 
@@ -93,8 +355,49 @@ impl MiningBackend for CudaBackend {
         format!("CUDA: {}", self.name)
     }
 
+    fn has_kernel(&self, algo: PowAlgo) -> bool {
+        match algo {
+            PowAlgo::Bc3Hash => cfg!(feature = "bc3hash"),
+            PowAlgo::Sha256d | PowAlgo::Sha3t => kernel_supports(algo),
+        }
+    }
+
     fn supports(&self, algo: PowAlgo) -> bool {
-        kernel_supports(algo)
+        match algo {
+            #[cfg(feature = "bc3hash")]
+            PowAlgo::Bc3Hash => self.bc3.is_some(),
+            #[cfg(not(feature = "bc3hash"))]
+            PowAlgo::Bc3Hash => false,
+            PowAlgo::Sha256d | PowAlgo::Sha3t => kernel_supports(algo),
+        }
+    }
+
+    #[cfg(feature = "bc3hash")]
+    fn prepare_bc3hash(&mut self, window: u32) -> Result<std::time::Duration, String> {
+        let t0 = std::time::Instant::now();
+        // The old window's tables leave the card before the new ones arrive:
+        // at 16 bits they are 256 MiB.
+        self.bc3 = None;
+        let kernel = self.load_bc3(window)?;
+        self.bc3 = Some(kernel);
+        if let Err(e) = self.self_test_bc3() {
+            self.bc3 = None;
+            return Err(format!("self-test failed: {e}"));
+        }
+        Ok(t0.elapsed())
+    }
+
+    #[cfg(feature = "bc3hash")]
+    fn bc3hash_window(&self) -> Option<u32> {
+        self.bc3.as_ref().map(|k| k.window)
+    }
+
+    fn launch_granule(&self, algo: PowAlgo) -> u32 {
+        match algo {
+            #[cfg(feature = "bc3hash")]
+            PowAlgo::Bc3Hash => self.bc3.as_ref().map_or(1, |k| k.wave),
+            _ => 1,
+        }
     }
 
     fn scan_range(
@@ -105,6 +408,13 @@ impl MiningBackend for CudaBackend {
         count: u32,
         target: &Target,
     ) -> Result<Vec<u32>, String> {
+        #[cfg(feature = "bc3hash")]
+        if algo == PowAlgo::Bc3Hash {
+            if count == 0 {
+                return Ok(vec![]);
+            }
+            return self.scan_bc3(header76, start_nonce, count, target);
+        }
         if !kernel_supports(algo) {
             return Err(format!("no kernel for {}", algo.name()));
         }

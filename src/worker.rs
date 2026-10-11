@@ -74,11 +74,12 @@ pub enum CpuRole {
 }
 
 impl CpuRole {
-    /// Does a thread in this role take jobs of `algo`?
-    pub fn takes(&self, algo: PowAlgo, plan: &crate::shared::MiningPlan) -> bool {
+    /// Does a thread in this role take a job, given whether the GPUs take its
+    /// PoW right now (`Shared::gpus_mine`)?
+    pub fn takes(&self, gpus_mine: bool) -> bool {
         match self {
             CpuRole::All => true,
-            CpuRole::GpuFallback => !plan.gpus_mine(algo),
+            CpuRole::GpuFallback => !gpus_mine,
         }
     }
 }
@@ -103,7 +104,7 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize, rol
         };
         // A stand-in leaves the GPUs' work to the GPUs, silently: that is
         // the normal case, not something to warn about.
-        if !role.takes(job.algo, &shared.plan) {
+        if !role.takes(shared.gpus_mine(job.algo)) {
             sat_out = Some(generation);
             continue;
         }
@@ -328,6 +329,7 @@ mod tests {
     #[cfg(feature = "bc3hash")]
     use std::time::Duration;
 
+    #[cfg(feature = "bc3hash")]
     use crate::shared::MiningPlan;
     #[cfg(feature = "bc3hash")]
     use crate::shared::SUBMIT_QUEUE;
@@ -398,14 +400,24 @@ mod tests {
     }
 
     /// The fork as a GPU rig in `--backend auto` sees it. The stand-in CPU
-    /// thread leaves SHA3-256t to the GPU - not one hash - takes over as soon
-    /// as a BC3Hash job arrives, and steps back when SHA3-256t returns.
+    /// thread leaves to the GPU whatever the GPU claims - not one hash - and
+    /// takes over the moment it does not: a PoW without a GPU kernel, or a
+    /// GPU kernel that drops out (failed self-test) in the middle of a job,
+    /// without waiting for the next one.
     #[cfg(feature = "bc3hash")]
     #[test]
     fn a_stand_in_thread_mines_only_what_the_gpus_cannot() {
         let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
-        let plan = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 1 };
+        let plan = MiningPlan {
+            gpus: 1,
+            cpu_threads: 0,
+            cpu_fallback_threads: 1,
+            gpu_kernel: [false, true, true],
+        };
         let shared = Arc::new(Shared::new(tx, plan));
+        // The GPU worker's claim: SHA3-256t, for now.
+        let mut gpu = crate::shared::GpuCapability::new(&shared);
+        gpu.set(PowAlgo::Sha3t, true);
         shared.publish_job(easy_job("sha3t", PowAlgo::Sha3t));
         let s = shared.clone();
         std::thread::spawn(move || run_worker(s, 1, 2, CpuRole::GpuFallback));
@@ -414,6 +426,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "the stand-in submitted a share for the GPU's job");
         assert_eq!(shared.stats.hashes.load(Ordering::Relaxed), 0, "the stand-in hashed the GPU's job");
 
+        // No GPU kernel for BC3Hash (an OpenCL card): the CPU takes it.
         shared.publish_job(easy_job("fork", PowAlgo::Bc3Hash));
         let share = rx
             .recv_timeout(Duration::from_secs(30))
@@ -424,6 +437,22 @@ mod tests {
         wait_until_idle(&shared, &rx);
         std::thread::sleep(Duration::from_millis(300));
         assert!(rx.try_recv().is_err(), "a share was submitted after the GPU took over again");
+
+        // A CUDA card claims BC3Hash: the stand-in leaves it alone...
+        gpu.set(PowAlgo::Bc3Hash, true);
+        shared.publish_job(easy_job("fork-gpu", PowAlgo::Bc3Hash));
+        std::thread::sleep(Duration::from_millis(300));
+        let hashed = shared.stats.hashes.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(shared.stats.hashes.load(Ordering::Relaxed), hashed, "the stand-in hashed the GPU's BC3Hash");
+        assert!(rx.try_recv().is_err());
+        // ...until its kernel fails the self-test: no new job, and the CPU
+        // still takes over at once.
+        gpu.set(PowAlgo::Bc3Hash, false);
+        let share = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stand-in did not take over when the GPU dropped BC3Hash");
+        assert_eq!(share.job_id, "fork-gpu");
         shared.clear_job();
     }
 
@@ -434,7 +463,7 @@ mod tests {
     #[test]
     fn a_bc3hash_job_yields_valid_shares() {
         let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
-        let plan = MiningPlan { gpus: 0, cpu_threads: 1, cpu_fallback_threads: 0 };
+        let plan = MiningPlan { cpu_threads: 1, ..Default::default() };
         let shared = Arc::new(Shared::new(tx, plan));
         let job = easy_job("fork", PowAlgo::Bc3Hash);
         shared.publish_job(job.clone());
@@ -469,7 +498,7 @@ mod tests {
         ::bc3hash::configure(::bc3hash::Mode::Fast);
         ::bc3hash::initialize().unwrap();
         let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
-        let plan = MiningPlan { gpus: 0, cpu_threads: 1, cpu_fallback_threads: 0 };
+        let plan = MiningPlan { cpu_threads: 1, ..Default::default() };
         let shared = Arc::new(Shared::new(tx, plan));
         let mut job = easy_job("rate", PowAlgo::Bc3Hash);
         job.share_target = [0u8; 32]; // never a share: measure hashing only
@@ -484,17 +513,14 @@ mod tests {
         shared.clear_job();
     }
 
-    /// Which roles take which jobs, against each way main starts the workers.
+    /// A stand-in takes exactly what no GPU takes; an `All` thread takes
+    /// everything.
     #[test]
     fn roles_take_the_right_jobs() {
-        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 4 };
-        assert!(!CpuRole::GpuFallback.takes(PowAlgo::Sha3t, &auto));
-        assert!(CpuRole::GpuFallback.takes(PowAlgo::Bc3Hash, &auto));
-        assert!(CpuRole::All.takes(PowAlgo::Sha3t, &auto));
-        assert!(CpuRole::All.takes(PowAlgo::Bc3Hash, &auto));
-        // Without a GPU there is nothing to stand in for.
-        let cpu = MiningPlan { gpus: 0, cpu_threads: 0, cpu_fallback_threads: 4 };
-        assert!(CpuRole::GpuFallback.takes(PowAlgo::Sha3t, &cpu));
+        assert!(!CpuRole::GpuFallback.takes(true));
+        assert!(CpuRole::GpuFallback.takes(false));
+        assert!(CpuRole::All.takes(true));
+        assert!(CpuRole::All.takes(false));
     }
 
     /// A batch stays a few milliseconds long whatever the PoW, so a new block

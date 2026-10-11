@@ -20,6 +20,68 @@ extern "C" {
     fn bc3hash_hash(data: *const u8, len: usize, out32: *mut u8) -> i32;
     fn bc3hash_mix(data: *const u8, len: usize, out32: *mut u8) -> i32;
     fn bc3hash_table_bytes() -> usize;
+    fn bc3hash_gpu_part_u64(window: u32, part: i32) -> usize;
+    fn bc3hash_gpu_table_part(window: u32, part: i32, out: *mut u64, len: usize) -> i32;
+}
+
+/// The lookup tables the GPU kernel (src/kernels/bc3hash.cl in the miner)
+/// reads, for secp256k1 windows of `window` bits: the FixedPower tables of
+/// the node's g64, g128 and g256, then the four curve tables b * 2^(w*i) * P
+/// as affine x, y limbs - the kernel's BC3_TABLE_* layout. Built from the
+/// node's own constants with the same secp256k1 calls as its CPU tables, and
+/// independent of `configure`.
+///
+/// The four curves are built on four threads: window 16 (256 MiB) takes
+/// ~11 s on one thread, ~3 s this way; window 10 (6.8 MiB) a fraction of a
+/// second.
+pub fn gpu_tables(window: u32) -> Result<Vec<u64>, String> {
+    if !(2..=20).contains(&window) {
+        return Err(format!("no GPU tables for a window of {window} bits"));
+    }
+    // SAFETY: plain integer arguments, cannot throw.
+    let sizes: Vec<usize> = (0..5).map(|part| unsafe { bc3hash_gpu_part_u64(window, part) }).collect();
+    let mut out = vec![0u64; sizes.iter().sum()];
+    let mut rest: &mut [u64] = &mut out;
+    let mut parts = Vec::with_capacity(5);
+    for &size in &sizes {
+        let (part, tail) = rest.split_at_mut(size);
+        parts.push(part);
+        rest = tail;
+    }
+    let results: Vec<i32> = std::thread::scope(|s| {
+        let handles: Vec<_> = parts
+            .into_iter()
+            .enumerate()
+            .map(|(part, slice)| {
+                s.spawn(move || {
+                    // SAFETY: slice is exactly this part's length, and no
+                    // other thread touches it.
+                    unsafe { bc3hash_gpu_table_part(window, part as i32, slice.as_mut_ptr(), slice.len()) }
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(-1)).collect()
+    });
+    if results.iter().all(|&rc| rc == 0) {
+        Ok(out)
+    } else {
+        Err(format!("building the BC3Hash GPU tables (window {window}) failed"))
+    }
+}
+
+/// The node's header vectors among the self-test vectors: 80-byte BC3Hash
+/// headers and their digests, for checking other implementations (the GPU
+/// kernel) the same way `initialize` checks this one.
+pub fn header_vectors() -> Vec<([u8; 80], [u8; 32])> {
+    SELF_TEST
+        .iter()
+        .filter(|(input, _)| input.len() == 160)
+        .map(|(input, digest)| {
+            let header: [u8; 80] = from_hex(input).try_into().expect("80-byte header");
+            let digest: [u8; 32] = from_hex(digest).try_into().expect("32-byte digest");
+            (header, digest)
+        })
+        .collect()
 }
 
 /// How big the shared precomputed curve tables are. Both modes give identical
@@ -243,6 +305,48 @@ mod tests {
         }
         assert_eq!(initialize(), Ok(()));
         assert_eq!(status(), Some(Ok(())));
+    }
+
+    /// The GPU tables in the kernel's layout: the right size, and anchored to
+    /// values that are known independently - g^0 and g^1 at the start of each
+    /// power table, and the curve's own base point first in its table.
+    #[test]
+    fn gpu_tables_have_the_kernel_layout() {
+        let window = 10u32;
+        let points = 26 * 1023;
+        let t = gpu_tables(window).unwrap();
+        let (p64, p128, p256, curve) = (0, 2048, 2048 + 8192, 2048 + 8192 + 32768);
+        assert_eq!(t.len(), curve + 4 * points * 8, "BC3_TABLE_U64 at window {window}");
+        // Row 0: g^0 = 1, g^1 = g (the node's g64 / g128 low limb / g256 low limb).
+        assert_eq!(&t[p64..p64 + 2], &[1, 0x7b48_4f6c_1cf4_97f2]);
+        assert_eq!(&t[p128..p128 + 2], &[1, 0]);
+        assert_eq!(&t[p128 + 2..p128 + 4], &[0xb223_833f_64cd_ffc9, 0x77c6_0c1d_221a_0804]);
+        assert_eq!(t[p256 + 4], 0x43d7_82e9_b25a_ae2b);
+        // Curve 0 starts at H itself: x = 01f2a775...27dd1f51.
+        assert_eq!(t[curve], 0x9e37_6c27_27dd_1f51);
+        assert_eq!(t[curve + 3], 0x01f2_a775_8a89_4831);
+        // The last row of every curve is padded with zeros past 2^(256-250)-1.
+        let last_row = curve + (25 * 1023 + 63) * 8;
+        assert!(t[last_row..curve + points * 8].iter().all(|&v| v == 0));
+        assert!(t[last_row - 8..last_row].iter().any(|&v| v != 0));
+        assert!(gpu_tables(1).is_err());
+        assert_eq!(header_vectors().len(), 2);
+    }
+
+    /// How long the GPU tables take to build per window, and how big they are:
+    ///     cargo test --release -- --ignored gpu_table_build_times --nocapture
+    #[test]
+    #[ignore]
+    fn gpu_table_build_times() {
+        for window in [10u32, 12, 14, 16] {
+            let t0 = std::time::Instant::now();
+            let t = gpu_tables(window).unwrap();
+            println!(
+                "window {window}: {:.1} MiB in {:.2} s",
+                t.len() as f64 * 8.0 / (1u64 << 20) as f64,
+                t0.elapsed().as_secs_f64()
+            );
+        }
     }
 
     #[test]

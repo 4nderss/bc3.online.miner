@@ -320,8 +320,8 @@ impl HitBudget {
     }
 }
 
-/// Which PoW algorithms the GPU kernels implement. Both backends compile the
-/// same `sha3t.cl`, so they answer the same.
+/// Which PoW algorithms the shared `sha3t.cl` implements - the one kernel
+/// both backends compile, so they answer the same.
 ///
 /// The match is exhaustive on purpose: a new `PowAlgo` variant does not
 /// compile until someone decides here whether a kernel exists for it. Without
@@ -333,11 +333,9 @@ pub fn kernel_supports(algo: PowAlgo) -> bool {
         // The kernel always runs SHA3-256t; every hit would fail the CPU
         // re-check.
         PowAlgo::Sha256d => false,
-        // No kernel. BC3Hash is secp256k1 point multiplication from tables and
-        // modular inversion with 64-512-bit moduli - nothing like the
-        // keccak kernel - and costs about 1000 SHA3-256t hashes. When one is
-        // written: true here, and scan_range in cuda.rs and opencl.rs must
-        // launch it for this algo.
+        // Not this kernel's: BC3Hash has its own, bc3hash.cl, so far loaded by
+        // the CUDA backend only (`CudaBackend::has_kernel`). OpenCL answers
+        // false here and the CPU mines BC3Hash for it.
         PowAlgo::Bc3Hash => false,
     }
 }
@@ -346,9 +344,33 @@ pub trait MiningBackend {
     /// Human-readable name ("CUDA: NVIDIA GeForce RTX 3050 Ti ...").
     fn name(&self) -> String;
 
-    /// Can this backend hash `algo`? The GPU worker asks once per job and
-    /// sits out jobs it cannot do, so `scan_range` never sees them.
+    /// Does this backend have a kernel for `algo` at all? Fixed for its life;
+    /// whether the kernel is loaded and passed its self-test is `supports`.
+    fn has_kernel(&self, algo: PowAlgo) -> bool {
+        self.supports(algo)
+    }
+
+    /// Can this backend hash `algo` right now? The GPU worker asks once per
+    /// job and sits out jobs it cannot do, so `scan_range` never sees them.
     fn supports(&self, algo: PowAlgo) -> bool;
+
+    /// Make the BC3Hash kernel for a secp256k1 table window of `window` bits
+    /// current: load it, upload its tables, and check it against the CPU
+    /// reference. Ok carries how long that took.
+    fn prepare_bc3hash(&mut self, _window: u32) -> Result<std::time::Duration, String> {
+        Err("this backend has no BC3Hash kernel".into())
+    }
+
+    /// The window of the BC3Hash kernel in use, if one is.
+    fn bc3hash_window(&self) -> Option<u32> {
+        None
+    }
+
+    /// Launches of `algo` should be a whole number of this many nonces - the
+    /// card's wave - so that the last wave does not run on a mostly idle card.
+    fn launch_granule(&self, _algo: PowAlgo) -> u32 {
+        1
+    }
 
     /// Grind [start_nonce, start_nonce+count) for the header (nonce field
     /// excluded) and return the nonces whose `algo` hash is <= target.
@@ -393,6 +415,16 @@ impl GpuDevice {
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
+    }
+}
+
+/// Will a device of this kind have a kernel for `algo` once it is opened?
+/// The same answer its backend's `has_kernel` gives, known before opening it.
+pub fn device_has_kernel(dev: &GpuDevice, algo: PowAlgo) -> bool {
+    match (dev, algo) {
+        #[cfg(feature = "cuda")]
+        (GpuDevice::Cuda { .. }, PowAlgo::Bc3Hash) => cfg!(feature = "bc3hash"),
+        _ => kernel_supports(algo),
     }
 }
 

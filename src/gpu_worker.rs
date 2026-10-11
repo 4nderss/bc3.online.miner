@@ -8,7 +8,7 @@ use crate::consensus::{
     compact_to_target, hash_meets_target, hash_to_display, root_from_steps, sha256d, BlockHeader,
     PowAlgo, PowFn,
 };
-use crate::shared::{AlgoGate, FoundShare, MinerJob, Shared};
+use crate::shared::{AlgoGate, FoundShare, GpuCapability, MinerJob, Shared, BC3_SLOT_FAILED};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +31,25 @@ const START_BATCH: u32 = 1 << 20;
 /// to keep launch overhead down.
 const TARGET_LAUNCH: Duration = Duration::from_millis(100);
 
+/// The same for BC3Hash, which is ~1000 times SHA3-256t's work per hash -
+/// about 110 kH/s on an RTX 3050 Ti. A 16k start is ~0.15 s there and a few
+/// ms on a big card, from where the autotune doubles its way up, in whole
+/// waves of the card (`launch_granule`). 400 ms per launch is several waves -
+/// what runs short at the end of a launch is a small part of it - and stays
+/// far from the Windows TDR watchdog (2 s) on slow cards too.
+const BC3_MIN_BATCH: u32 = 1 << 10;
+const BC3_MAX_BATCH: u32 = 1 << 24;
+const BC3_START_BATCH: u32 = 1 << 14;
+const BC3_TARGET_LAUNCH: Duration = Duration::from_millis(400);
+
+/// Launch sizing per PoW: (min, max, start, target time per launch).
+fn tuning(algo: PowAlgo) -> (u32, u32, u32, Duration) {
+    match algo {
+        PowAlgo::Sha256d | PowAlgo::Sha3t => (MIN_BATCH, MAX_BATCH, START_BATCH, TARGET_LAUNCH),
+        PowAlgo::Bc3Hash => (BC3_MIN_BATCH, BC3_MAX_BATCH, BC3_START_BATCH, BC3_TARGET_LAUNCH),
+    }
+}
+
 /// `worker_index`/`total_workers` partition the extranonce2 space disjointly
 /// across all workers (CPU threads + GPUs), exactly as in worker.rs.
 /// How long to wait before trying to re-open a device that stopped answering.
@@ -48,9 +67,13 @@ const REOPEN_DELAY: Duration = Duration::from_secs(5);
 /// was written to fix, just with a fresh handle each time round.
 const MAX_REOPENS: u32 = 5;
 
+/// `slot` is the GPU's place in the detected list (per-device statistics);
+/// `worker_index`/`total_workers` partition the extranonce2 space across all
+/// workers, CPU threads included, exactly as in worker.rs.
 pub fn run_gpu_worker(
     shared: Arc<Shared>,
     device: GpuDevice,
+    slot: usize,
     worker_index: usize,
     total_workers: usize,
 ) {
@@ -67,7 +90,18 @@ pub fn run_gpu_worker(
     };
     crate::human!("[gpu] started: {}", backend.name());
 
-    let mut batch = START_BATCH;
+    // What this card can mine, as far as anyone can tell before trying. A
+    // kernel that later fails its self-test withdraws its claim; dropping
+    // this on any exit withdraws them all.
+    let mut caps = GpuCapability::new(&shared);
+    for algo in PowAlgo::ALL {
+        caps.set(algo, backend.has_kernel(algo) && crate::worker::cpu_may_support(algo));
+    }
+    // The BC3Hash window that last failed here, so it is not retried on
+    // every job; a different window still gets its chance.
+    let mut bc3_failed: Option<u32> = None;
+
+    let mut batch: [u32; 3] = PowAlgo::ALL.map(|a| tuning(a).2);
     // Position in the search space, carried across jobs that cover the same
     // space. See MinerJob::same_search_space.
     let mut prev: Option<MinerJob> = None;
@@ -83,6 +117,9 @@ pub fn run_gpu_worker(
             Some(seen) => shared.wait_for_job_after(seen),
             None => shared.wait_for_job(),
         };
+        if job.algo == PowAlgo::Bc3Hash && backend.has_kernel(PowAlgo::Bc3Hash) {
+            prepare_bc3(&shared, &mut *backend, slot, &mut caps, &mut bc3_failed);
+        }
         // Decided per job, so the launch loop below carries no dispatch. A
         // kernel without a CPU reference to re-check its hits against does
         // not mine at all - see AGENTS.md.
@@ -101,8 +138,8 @@ pub fn run_gpu_worker(
             nonce = 0;
         }
         let alive = mine_job(
-            &shared, &job, algo, verify, generation, total_workers, &mut backend, &mut batch,
-            &mut en2, &mut nonce,
+            &shared, &job, algo, verify, generation, slot, total_workers, &mut backend,
+            &mut batch[algo.index()], &mut en2, &mut nonce,
         );
         if !alive {
             // The device stopped answering. Re-open it - after a driver reset
@@ -129,6 +166,9 @@ pub fn run_gpu_worker(
                 Ok(b) => {
                     backend = b;
                     crate::human!("[gpu] reopened: {}", backend.name());
+                    // A fresh context loads its BC3Hash kernel afresh.
+                    bc3_failed = None;
+                    shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
                 }
                 Err(e) => {
                     eprintln!(
@@ -150,6 +190,67 @@ pub fn run_gpu_worker(
     }
 }
 
+/// Have the card's BC3Hash kernel at the window `Shared::bc3_window` asks for,
+/// self-tested, before it mines a BC3Hash job - or know that it cannot, and
+/// let the CPU have the job. Loading means building the tables (0.1-3 s), the
+/// driver's JIT of the PTX (slow the first time on a card, cached after) and
+/// the self-test against the CPU reference.
+fn prepare_bc3(
+    shared: &Shared,
+    backend: &mut dyn MiningBackend,
+    slot: usize,
+    caps: &mut GpuCapability,
+    failed: &mut Option<u32>,
+) {
+    let want = shared.bc3_window();
+    // Already there, or already known not to work: say so again, for a reader
+    // (the benchmark) that has reset the slot.
+    if backend.bc3hash_window() == Some(want) {
+        shared.gpu_slot_bc3[slot].store(want, Ordering::Relaxed);
+        return;
+    }
+    if *failed == Some(want) {
+        shared.gpu_slot_bc3[slot].store(BC3_SLOT_FAILED, Ordering::Relaxed);
+        return;
+    }
+    shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
+    // The self-test needs the CPU reference; so does every hit later. A CPU
+    // build that failed its own vectors leaves the GPU nothing to check
+    // against.
+    let result = if let Some(why) = crate::worker::cpu_unavailable(PowAlgo::Bc3Hash, true) {
+        Err(format!("no CPU reference to check it against: {why}"))
+    } else {
+        backend.prepare_bc3hash(want)
+    };
+    match result {
+        Ok(took) => {
+            *failed = None;
+            shared.gpu_slot_bc3[slot].store(want, Ordering::Relaxed);
+            crate::human!(
+                "[gpu] {}: BC3Hash kernel ready - window {want}, self-test passed ({:.1} s)",
+                backend.name(),
+                took.as_secs_f64()
+            );
+            caps.set(PowAlgo::Bc3Hash, true);
+        }
+        Err(e) => {
+            *failed = Some(want);
+            shared.gpu_slot_bc3[slot].store(BC3_SLOT_FAILED, Ordering::Relaxed);
+            let message = format!(
+                "{}: BC3Hash with window {want} is NOT usable on this GPU - {e}. It mines no \
+                 BC3Hash there; in --backend auto the CPU does instead. Report it.",
+                backend.name()
+            );
+            eprintln!("[gpu] {message}");
+            crate::ipc::emit(&crate::ipc::Event::Status {
+                state: crate::ipc::StatusState::Error,
+                message,
+            });
+            caps.set(PowAlgo::Bc3Hash, false);
+        }
+    }
+}
+
 /// How many launches in a row may fail before the device counts as gone.
 const MAX_SCAN_ERRORS: u32 = 5;
 
@@ -163,6 +264,7 @@ fn mine_job(
     // The CPU reference for `algo`, resolved once per job.
     verify: PowFn,
     generation: u64,
+    slot: usize,
     total_workers: usize,
     backend: &mut Box<dyn MiningBackend>,
     batch: &mut u32,
@@ -170,6 +272,12 @@ fn mine_job(
     nonce_start: &mut u32,
 ) -> bool {
     let block_target = compact_to_target(job.bits);
+    let (min_batch, max_batch, _, target_launch) = tuning(algo);
+    // Whole waves of the card only (see `launch_granule`); the autotune below
+    // keeps doubling and halving within them.
+    let granule = backend.launch_granule(algo).max(1);
+    let min_batch = min_batch.max(granule) / granule * granule;
+    *batch = ((*batch).clamp(min_batch, max_batch.max(min_batch)) / granule).max(1) * granule;
     // Starting point comes from the caller so it can survive a job that
     // covers the same space.
     loop {
@@ -252,16 +360,25 @@ fn mine_job(
 
             shared.stats.hashes.fetch_add(count as u64, Ordering::Relaxed);
             shared.stats.gpu_hashes.fetch_add(count as u64, Ordering::Relaxed);
+            if let (Some(hashes), Some(stamp)) =
+                (shared.gpu_slot_hashes.get(slot), shared.gpu_slot_stamp.get(slot))
+            {
+                // Stamp first: a reader that sees the new count also sees a
+                // stamp no older than it.
+                stamp.store(shared.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                hashes.fetch_add(count as u64, Ordering::Release);
+            }
 
             // Intensity < 100 % -> idle proportionally (keeps heat down and
             // the machine usable while mining).
             shared.throttle(elapsed);
 
-            // Simple autotune towards ~TARGET_LAUNCH per launch.
-            if elapsed < TARGET_LAUNCH / 2 && *batch < MAX_BATCH {
-                *batch = (*batch * 2).min(MAX_BATCH);
-            } else if elapsed > TARGET_LAUNCH * 5 / 2 && *batch > MIN_BATCH {
-                *batch = (*batch / 2).max(MIN_BATCH);
+            // Simple autotune towards the PoW's target time per launch, in
+            // whole waves.
+            if elapsed < target_launch / 2 && *batch < max_batch {
+                *batch = (*batch * 2).min(max_batch.max(granule)) / granule * granule;
+            } else if elapsed > target_launch * 5 / 2 && *batch > min_batch {
+                *batch = ((*batch / 2).max(min_batch) / granule).max(1) * granule;
             }
 
             // Where the batch we just finished ends - not where it began.

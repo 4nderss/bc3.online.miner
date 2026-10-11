@@ -6,6 +6,7 @@
 //! channel.
 
 mod backend;
+mod bench;
 mod consensus;
 mod gpu_worker;
 mod ipc;
@@ -46,8 +47,9 @@ struct Args {
     rig: Option<String>,
 
     /// Backend: auto = CUDA if possible, else OpenCL, else CPU. In auto the
-    /// CPU also mines whatever the GPU has no kernel for (BC3Hash); with cuda
-    /// or opencl it mines only if --threads asks it to.
+    /// CPU also mines whatever the GPU cannot (BC3Hash on OpenCL cards, or a
+    /// CUDA card whose BC3Hash kernel failed its self-test); with cuda or
+    /// opencl it mines only if --threads asks it to.
     #[arg(long, value_enum, default_value_t = BackendKind::Auto, env = "BC3_BACKEND")]
     backend: BackendKind,
 
@@ -62,11 +64,42 @@ struct Args {
     #[arg(long, env = "BC3_THREADS")]
     threads: Option<usize>,
 
-    /// BC3Hash lookup tables: fast (~256 MiB of RAM, the default) or compact
-    /// (~7 MiB, 10-20 % slower). Both find exactly the same shares.
+    /// BC3Hash lookup tables for the CPU: fast (~256 MiB of RAM) or compact
+    /// (~7 MiB, 10-20 % slower). Both find exactly the same shares. Default:
+    /// compact when a GPU mines BC3Hash and the CPU only checks its shares,
+    /// fast otherwise.
     #[cfg(feature = "bc3hash")]
-    #[arg(long, value_enum, default_value_t = Bc3HashMode::Fast, env = "BC3_BC3HASH_MODE")]
-    bc3hash_mode: Bc3HashMode,
+    #[arg(long, value_enum, env = "BC3_BC3HASH_MODE")]
+    bc3hash_mode: Option<Bc3HashMode>,
+
+    /// Table window of the GPU's BC3Hash kernel in bits: 10 (7 MiB), 12
+    /// (22 MiB), 14 (76 MiB) or 16 (256 MiB of GPU memory). Bigger is faster
+    /// as long as the card's L2 keeps up; `--benchmark` without it compares
+    /// all four. Default 16.
+    #[cfg(feature = "bc3hash")]
+    #[arg(long, env = "BC3_BC3HASH_WINDOW", value_parser = parse_bc3_window)]
+    bc3_window: Option<u32>,
+
+    /// Benchmark instead of mining: an in-process job source serves random
+    /// jobs to the normal workers - same dispatch, same kernels, every GPU
+    /// hit re-checked - and checks every share with the CPU reference. No
+    /// pool, no network, no address needed.
+    #[arg(long)]
+    benchmark: bool,
+
+    /// Benchmark: the PoW to measure.
+    #[arg(long, value_enum, default_value_t = BenchAlgo::Bc3hash)]
+    algo: BenchAlgo,
+
+    /// Benchmark: seconds to measure. Comparing the BC3Hash windows, each
+    /// window runs twice for this long (default 20); otherwise 60.
+    #[arg(long)]
+    seconds: Option<u64>,
+
+    /// Benchmark: share difficulty. By default it is set from the measured
+    /// hashrate so that a share comes every few seconds.
+    #[arg(long)]
+    difficulty: Option<f64>,
 
     /// Intensity 1-100 %. Below 100 the workers idle between passes, which
     /// lowers heat/power draw and keeps the machine usable while mining.
@@ -99,6 +132,34 @@ struct Args {
     #[arg(long)]
     probe: bool,
 }
+
+/// The PoW `--benchmark` measures.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
+enum BenchAlgo {
+    Bc3hash,
+    Sha3t,
+}
+
+impl From<BenchAlgo> for consensus::PowAlgo {
+    fn from(a: BenchAlgo) -> Self {
+        match a {
+            BenchAlgo::Bc3hash => consensus::PowAlgo::Bc3Hash,
+            BenchAlgo::Sha3t => consensus::PowAlgo::Sha3t,
+        }
+    }
+}
+
+#[cfg(feature = "bc3hash")]
+fn parse_bc3_window(s: &str) -> Result<u32, String> {
+    match s.parse::<u32>() {
+        Ok(w) if BC3_WINDOWS.contains(&w) => Ok(w),
+        _ => Err(format!("must be one of {BC3_WINDOWS:?}")),
+    }
+}
+
+/// The table windows there is a GPU kernel for (see build.rs).
+#[cfg(feature = "bc3hash")]
+const BC3_WINDOWS: [u32; 4] = [10, 12, 14, 16];
 
 /// Size of the BC3Hash tables - see `bc3hash::Mode`.
 #[cfg(feature = "bc3hash")]
@@ -145,9 +206,10 @@ impl Mode {
 /// Only our own BC3_* names are touched, and only when the canonical one is
 /// unset, so nothing else in the environment can be shadowed.
 fn normalise_env() {
-    const VARS: [&str; 10] = [
+    const VARS: [&str; 11] = [
         "BC3_WALLET", "BC3_WORKER", "BC3_USER", "BC3_MODE", "BC3_POOL",
         "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID", "BC3_BC3HASH_MODE",
+        "BC3_BC3HASH_WINDOW",
     ];
     let present: Vec<(String, String)> = std::env::vars().collect();
     for want in VARS {
@@ -218,16 +280,20 @@ fn main() {
     }
 
     // --user wins; otherwise build it from --wallet and --rig, which is the
-    // shape a container environment hands us.
-    let user = args.user.or_else(|| {
+    // shape a container environment hands us. The benchmark needs neither.
+    let user = args.user.clone().or_else(|| {
         args.wallet.as_ref().map(|w| match args.rig.as_deref() {
             Some(r) if !r.is_empty() => format!("{w}.{r}"),
             _ => w.clone(),
         })
     });
-    let Some(user) = user else {
-        eprintln!("bc3-miner: set --user <address[.rig]>, or --wallet with an optional --rig");
-        std::process::exit(2);
+    let user = match user {
+        Some(user) => user,
+        None if args.benchmark => String::new(),
+        None => {
+            eprintln!("bc3-miner: set --user <address[.rig]>, or --wallet with an optional --rig");
+            std::process::exit(2);
+        }
     };
     let pool = args.pool.clone().unwrap_or_else(|| args.mode.default_pool().to_string());
 
@@ -262,7 +328,17 @@ fn main() {
         gpus: gpus.len(),
         cpu_threads: if role == CpuRole::All { threads } else { 0 },
         cpu_fallback_threads: if role == CpuRole::GpuFallback { threads } else { 0 },
+        gpu_kernel: consensus::PowAlgo::ALL
+            .map(|a| gpus.iter().any(|g| backend::device_has_kernel(g, a))),
     };
+    let gpu_bc3 = plan.gpu_kernel[consensus::PowAlgo::Bc3Hash.index()];
+    #[cfg(not(feature = "bc3hash"))]
+    let _ = gpu_bc3;
+    let gpu_names: Vec<String> = gpus.iter().map(|g| g.describe()).collect();
+    let gpu_bc3_slots: Vec<bool> = gpus
+        .iter()
+        .map(|g| backend::device_has_kernel(g, consensus::PowAlgo::Bc3Hash))
+        .collect();
 
     human!(
         "bc3-miner {} - {} GPU(s), {} CPU thread(s)",
@@ -290,13 +366,20 @@ fn main() {
     // The BC3Hash tables are built now, on their own thread, rather than by
     // the first hash: the fast ones take ~11 s, which would otherwise land in
     // the middle of mining - at the fork, the moment it matters. The same call
-    // runs the build's self-test against the node's vectors. Without CPU
-    // threads nothing here ever hashes BC3Hash, so nothing is built.
+    // runs the build's self-test against the node's vectors. A GPU that mines
+    // BC3Hash needs them too: the CPU checks its self-test and every hit, a
+    // few hashes a second, which the compact tables do as well as the fast
+    // ones. Without CPU threads or such a GPU, nothing here ever hashes
+    // BC3Hash, so nothing is built.
     #[cfg(feature = "bc3hash")]
     {
-        bc3hash::configure(args.bc3hash_mode.into());
-        if threads > 0 {
-            let mode = args.bc3hash_mode;
+        let mode = args.bc3hash_mode.unwrap_or(if gpu_bc3 {
+            Bc3HashMode::Compact
+        } else {
+            Bc3HashMode::Fast
+        });
+        bc3hash::configure(mode.into());
+        if threads > 0 || gpu_bc3 {
             std::thread::Builder::new()
                 .name("bc3hash-init".into())
                 .spawn(move || {
@@ -340,6 +423,10 @@ fn main() {
     if args.intensity < 100 {
         human!("[miner] intensity {}%", args.intensity);
     }
+    #[cfg(feature = "bc3hash")]
+    if let Some(window) = args.bc3_window {
+        shared.set_bc3_window(window);
+    }
 
     // CPU threads and GPUs share one common disjoint extranonce2 partition.
     let total_workers = threads + gpus.len();
@@ -360,10 +447,10 @@ fn main() {
         let s = shared.clone();
         std::thread::Builder::new()
             .name(format!("gpu-{g}"))
-            .spawn(move || gpu_worker::run_gpu_worker(s, gpu, threads + g, total_workers))
+            .spawn(move || gpu_worker::run_gpu_worker(s, gpu, g, threads + g, total_workers))
             .expect("could not start a GPU thread");
     }
-    {
+    if !args.benchmark {
         let s = shared.clone();
         let interval = args.stats_interval;
         std::thread::spawn(move || stats::run_reporter(s, interval));
@@ -387,7 +474,7 @@ fn main() {
             // Before the first job the PoW is unknown, and any CPU thread
             // might turn out to be the one mining it.
             let cpu_mining = match algo {
-                Some(a) => s.plan.devices_for(a).cpu,
+                Some(a) => s.devices_for(a).cpu,
                 None => s.plan.cpu_threads + s.plan.cpu_fallback_threads > 0,
             };
             if cpu_mining {
@@ -401,6 +488,32 @@ fn main() {
             );
             std::process::exit(1);
         });
+    }
+
+    if args.benchmark {
+        #[cfg(feature = "bc3hash")]
+        let windows = match args.bc3_window {
+            Some(w) => vec![w],
+            None if args.algo == BenchAlgo::Bc3hash && gpu_bc3 => BC3_WINDOWS.to_vec(),
+            None => vec![shared.bc3_window()],
+        };
+        #[cfg(not(feature = "bc3hash"))]
+        let windows = vec![shared.bc3_window()];
+        let compare = windows.len() > 1;
+        let code = bench::run(
+            shared,
+            submit_rx,
+            bench::Config {
+                algo: args.algo.into(),
+                seconds: args.seconds.unwrap_or(if compare { 20 } else { 60 }),
+                difficulty: args.difficulty,
+                windows,
+                gpu_names,
+                gpu_bc3: gpu_bc3_slots,
+                cpu_threads: threads,
+            },
+        );
+        std::process::exit(code);
     }
 
     stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user });

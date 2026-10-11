@@ -88,8 +88,9 @@ directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
 - Native builds prefer `clang`/`clang++` when the environment names no
   compiler: ~10 % more hashrate than GCC 14, measured. The build warns when
   it has to fall back. -O3 stays: -O2 measured 20-25 % slower with either.
-- There is no GPU kernel for it, so in `--backend auto` the CPU threads stand
-  in for the GPU on BC3Hash jobs (`worker::CpuRole::GpuFallback`).
+- Where a card has no BC3Hash kernel, or its kernel failed the self-test, the
+  CPU threads stand in for it in `--backend auto`
+  (`worker::CpuRole::GpuFallback`). See "The BC3Hash GPU kernel" below.
 - The browser build (`wasm/`) shares `consensus.rs` but never has the
   `bc3hash` feature: no C++ in wasm32. It stays SHA3-256t only.
 - `BC3HASH_VENDOR` and `BC3HASH_VECTORS` point the build and the tests at the
@@ -107,6 +108,31 @@ directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
   either, and fails with `LNK1104: cannot open file 'msvcrt.lib'`.
 - If neither works, push and let CI build. `.github/workflows/build.yml` produces
   the Windows package as a zip artifact with `SHA256SUMS`.
+
+## The BC3Hash GPU kernel
+
+`src/kernels/bc3hash.cl` is generated outside this repository (the kernel lab,
+from the node's constants) - copy it in whole, never edit it here. It is the
+same CUDA/OpenCL macro scheme as `sha3t.cl`. Its secp256k1 tables come in four
+window sizes, chosen at run time (`--bc3-window`), so it is built four times:
+
+```
+for w in 10 12 14 16; do
+  nvcc --ptx -arch compute_52 -O3 -DBC3_WINDOW=$w -x cu \
+    src/kernels/bc3hash.cl -o src/kernels/bc3hash_w$w.ptx
+done
+```
+
+with the CUDA 12.0 toolkit, as for `sha3t.ptx`. The host builds the matching
+tables (`bc3hash::gpu_tables`), and every card self-tests every window before
+it mines with it: the node's header vectors, random headers against the CPU
+reference, and a scan range against the CPU's hit set. A card that fails
+mines no BC3Hash; the CPU takes over. Launches are whole waves of the card
+(`launch_granule`) - a partial last wave cost 14 % on an RTX 3050 Ti.
+
+`bc3-miner --benchmark` measures it through the real worker path with an
+in-process job source, compares the four windows on CUDA cards, and checks
+every share with the CPU reference.
 
 ## Changing the GPU kernel
 

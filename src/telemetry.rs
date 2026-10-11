@@ -44,6 +44,15 @@ impl Telemetry {
         Self {}
     }
 
+    /// The NVIDIA driver's version, where NVML is there to tell.
+    pub fn driver_version(&self) -> Option<String> {
+        #[cfg(feature = "cuda")]
+        if let Some(nvml) = &self.nvml {
+            return nvml.sys_driver_version().ok();
+        }
+        None
+    }
+
     /// Read current values. Errors are swallowed - telemetry must never
     /// disturb mining.
     pub fn read(&self, gpu_index: u32) -> Reading {

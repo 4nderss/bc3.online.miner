@@ -147,16 +147,79 @@ pub struct Shared {
     pub stats: Stats,
     /// Bounded on purpose - see `Shared::submit`.
     pub submit_tx: std::sync::mpsc::SyncSender<FoundShare>,
-    /// Which devices mine which PoW; fixed before the workers start.
+    /// Which devices were started for what; fixed before the workers start.
     pub plan: MiningPlan,
     /// The PoW of the latest job, so a change of PoW is announced once - not
     /// once per job.
     last_algo: Mutex<Option<PowAlgo>>,
+    /// GPU workers able to mine each PoW (by `PowAlgo::index`): raised when a
+    /// worker's backend has a kernel for it, lowered when that kernel fails
+    /// its self-test or the worker stops. The stand-in CPU threads go by it.
+    gpu_capable: [AtomicU32; 3],
+    /// The secp256k1 table window the GPUs' BC3Hash kernels should use; the
+    /// GPU workers switch to it before their next BC3Hash job.
+    bc3_window: AtomicU32,
+    /// Hashes per GPU (by the GPU's slot in the detected list), for the
+    /// benchmark's per-device rates.
+    pub gpu_slot_hashes: Vec<AtomicU64>,
+    /// Per GPU slot: the window its BC3Hash kernel is ready at, 0 while none
+    /// is (loading, or never needed), `BC3_SLOT_FAILED` after a failure.
+    pub gpu_slot_bc3: Vec<AtomicU32>,
+    /// Per GPU slot: when its hash counter last moved, in microseconds since
+    /// `started` - the end of a launch. Rates taken between two of these count
+    /// whole launches only, instead of whichever launches happened to land
+    /// inside a reporting interval (with 0.4 s launches, +-4 % per 10 s).
+    pub gpu_slot_stamp: Vec<AtomicU64>,
+    pub started: std::time::Instant,
 }
 
-/// Which devices mine what. Decided once in main from the backends that came
-/// up, and read per job: by the stand-in CPU threads to know whether they are
-/// needed, and by `publish_job` to tell the user where the hashing happens.
+/// The BC3Hash table window the GPUs use unless told otherwise (`--bc3-window`).
+pub const DEFAULT_BC3_WINDOW: u32 = 16;
+
+/// `Shared::gpu_slot_bc3` value for a GPU whose BC3Hash kernel failed to load
+/// or failed its self-test at the requested window.
+pub const BC3_SLOT_FAILED: u32 = 1;
+
+/// A GPU worker's claim on `Shared::gpu_capable`, released when dropped - on
+/// every exit path, like `GpuWorkerAlive`.
+pub struct GpuCapability {
+    shared: std::sync::Arc<Shared>,
+    held: [bool; 3],
+}
+
+impl GpuCapability {
+    pub fn new(shared: &std::sync::Arc<Shared>) -> Self {
+        Self { shared: shared.clone(), held: [false; 3] }
+    }
+
+    /// Claim or release `algo`; tells the user where the current PoW is
+    /// mined now if that changed anything.
+    pub fn set(&mut self, algo: PowAlgo, capable: bool) {
+        let i = algo.index();
+        if self.held[i] == capable {
+            return;
+        }
+        self.held[i] = capable;
+        if capable {
+            self.shared.gpu_capable[i].fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.shared.gpu_capable[i].fetch_sub(1, Ordering::Relaxed);
+        }
+        self.shared.capability_changed(algo);
+    }
+}
+
+impl Drop for GpuCapability {
+    fn drop(&mut self) {
+        for algo in PowAlgo::ALL {
+            self.set(algo, false);
+        }
+    }
+}
+
+/// Which devices were started for what. Decided once in main from the
+/// devices found; whether a GPU actually takes a PoW is decided at run time
+/// (`Shared::gpus_mine`), since a kernel can fail its self-test.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MiningPlan {
     /// GPU workers started.
@@ -166,6 +229,9 @@ pub struct MiningPlan {
     /// CPU threads that mine only what no GPU kernel can - see
     /// `worker::CpuRole::GpuFallback`.
     pub cpu_fallback_threads: usize,
+    /// Per PoW (`PowAlgo::index`): do the started GPUs have a kernel for it?
+    /// Only for telling "no kernel" apart from "not ready" in the status.
+    pub gpu_kernel: [bool; 3],
 }
 
 /// Where the jobs of one PoW are hashed.
@@ -188,17 +254,11 @@ impl PowDevices {
 }
 
 impl MiningPlan {
-    /// Do the GPUs take jobs of this PoW? Decided by what was started, not by
-    /// what is still alive: a GPU that dies is the watchdog's business in
-    /// main, not a reason to move its work to the stand-in CPU threads.
-    pub fn gpus_mine(&self, algo: PowAlgo) -> bool {
-        self.gpus > 0 && crate::backend::kernel_supports(algo)
-    }
-
-    /// Never waits: this runs on the stratum thread, and a BC3Hash still
-    /// building its tables counts as mining until it is known not to.
-    pub fn devices_for(&self, algo: PowAlgo) -> PowDevices {
-        let gpu = self.gpus_mine(algo);
+    /// Where jobs of `algo` are hashed, given whether the GPUs take them
+    /// (`Shared::gpus_mine`). Never waits: this runs on the stratum thread,
+    /// and a BC3Hash still building its tables counts as mining until it is
+    /// known not to.
+    pub fn devices_for(&self, algo: PowAlgo, gpu: bool) -> PowDevices {
         let cpu = crate::worker::cpu_may_support(algo)
             && (self.cpu_threads > 0 || (self.cpu_fallback_threads > 0 && !gpu));
         PowDevices { gpu, cpu }
@@ -206,12 +266,16 @@ impl MiningPlan {
 
     /// What the user is told when jobs of this PoW start arriving: whether
     /// anything is mining them, and where.
-    pub fn status(&self, algo: PowAlgo) -> (bool, String) {
+    pub fn status(&self, algo: PowAlgo, gpu: bool) -> (bool, String) {
         let name = algo.name();
-        let d = self.devices_for(algo);
+        let d = self.devices_for(algo, gpu);
         match (d.gpu, d.cpu) {
             (true, true) => (true, format!("{name}: mining on GPU and CPU")),
             (true, false) => (true, format!("{name}: mining on GPU")),
+            (false, true) if self.gpu_kernel[algo.index()] => (
+                true,
+                format!("{name}: mining on CPU - the GPU is not ready for it, or failed its self-test"),
+            ),
             (false, true) if self.gpus > 0 => {
                 (true, format!("{name}: mining on CPU (no GPU kernel yet)"))
             }
@@ -280,7 +344,64 @@ impl Shared {
             submit_tx,
             plan,
             last_algo: Mutex::new(None),
+            gpu_capable: Default::default(),
+            bc3_window: AtomicU32::new(DEFAULT_BC3_WINDOW),
+            gpu_slot_hashes: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
+            gpu_slot_bc3: (0..plan.gpus).map(|_| AtomicU32::new(0)).collect(),
+            gpu_slot_stamp: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
+            started: std::time::Instant::now(),
         }
+    }
+
+    /// Do GPUs take jobs of `algo` right now? A GPU counts from the moment
+    /// its backend has a kernel for it until that kernel fails its self-test
+    /// or the worker stops; a GPU that dies outright is the watchdog's
+    /// business in main, not a reason to move its work to the CPU.
+    pub fn gpus_mine(&self, algo: PowAlgo) -> bool {
+        self.gpu_capable[algo.index()].load(Ordering::Relaxed) > 0
+    }
+
+    pub fn devices_for(&self, algo: PowAlgo) -> PowDevices {
+        self.plan.devices_for(algo, self.gpus_mine(algo))
+    }
+
+    pub fn status(&self, algo: PowAlgo) -> (bool, String) {
+        self.plan.status(algo, self.gpus_mine(algo))
+    }
+
+    /// The BC3Hash table window the GPUs should use.
+    pub fn bc3_window(&self) -> u32 {
+        self.bc3_window.load(Ordering::Relaxed)
+    }
+
+    /// Ask the GPUs for another BC3Hash window; they switch before their next
+    /// BC3Hash job, so publish a job after this.
+    pub fn set_bc3_window(&self, window: u32) {
+        self.bc3_window.store(window, Ordering::Relaxed);
+    }
+
+    /// A GPU took on or gave up a PoW: if it is the current one, say where it
+    /// is mined now, and let every worker re-decide whether the job is theirs.
+    /// A stand-in CPU thread must not wait for the next job to take over from
+    /// a GPU whose kernel just failed.
+    fn capability_changed(&self, algo: PowAlgo) {
+        if self.current_algo() == Some(algo) {
+            self.announce(algo);
+            self.nudge();
+        }
+    }
+
+    /// Wake the workers as if a job had arrived, with the job they already
+    /// have. Their place in it carries over (`MinerJob::same_search_space`).
+    fn nudge(&self) {
+        {
+            let slot = self.job.lock().unwrap();
+            if slot.is_none() {
+                return;
+            }
+            self.generation.fetch_add(1, Ordering::Release);
+        }
+        self.job_cv.notify_all();
     }
 
     /// Record a submitted share: updates the best share (and the block
@@ -389,7 +510,11 @@ impl Shared {
             }
             *last = Some(algo);
         }
-        let (mining, message) = self.plan.status(algo);
+        self.announce(algo);
+    }
+
+    fn announce(&self, algo: PowAlgo) {
+        let (mining, message) = self.status(algo);
         if mining {
             crate::human!("[miner] {message}");
         } else {
@@ -397,7 +522,7 @@ impl Shared {
         }
         crate::ipc::emit(&crate::ipc::Event::Pow {
             algo: algo.name().into(),
-            devices: self.plan.devices_for(algo).label().into(),
+            devices: self.devices_for(algo).label().into(),
         });
         crate::ipc::emit(&crate::ipc::Event::Status {
             state: if mining {
@@ -551,40 +676,73 @@ mod tests {
     }
 
     /// Where each PoW is mined, for every way main can start the workers -
-    /// and what the user is told. The auto-mode fork case is the one that
-    /// matters: SHA3-256t on the GPU, BC3Hash on the stand-in CPU threads.
+    /// and what the user is told. `gpu` is whether a GPU takes the PoW right
+    /// now (`Shared::gpus_mine`).
     #[cfg(feature = "bc3hash")]
     #[test]
     fn the_plan_says_who_mines_each_pow() {
-        let devices = |plan: MiningPlan, algo| {
-            let d = plan.devices_for(algo);
+        let devices = |plan: MiningPlan, algo, gpu| {
+            let d = plan.devices_for(algo, gpu);
             (d.gpu, d.cpu)
         };
-        // --backend auto with a GPU: CPU threads stand by for BC3Hash.
-        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 20 };
-        assert_eq!(devices(auto, PowAlgo::Sha3t), (true, false));
-        assert_eq!(devices(auto, PowAlgo::Bc3Hash), (false, true));
-        assert_eq!(auto.status(PowAlgo::Sha3t), (true, "SHA3-256t: mining on GPU".into()));
+        let sha3_only = [false, true, false];
+        let both = [false, true, true];
+        // --backend auto with an OpenCL GPU: no BC3Hash kernel, so the CPU
+        // threads stand in for it.
+        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 20, gpu_kernel: sha3_only };
+        assert_eq!(devices(auto, PowAlgo::Sha3t, true), (true, false));
+        assert_eq!(devices(auto, PowAlgo::Bc3Hash, false), (false, true));
+        assert_eq!(auto.status(PowAlgo::Sha3t, true), (true, "SHA3-256t: mining on GPU".into()));
         assert_eq!(
-            auto.status(PowAlgo::Bc3Hash),
+            auto.status(PowAlgo::Bc3Hash, false),
             (true, "BC3Hash: mining on CPU (no GPU kernel yet)".into())
         );
-        // A forced GPU backend has no CPU threads: BC3Hash is not mined, and
-        // that must read as an error, not as "Mining".
-        let forced = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 0 };
-        assert_eq!(devices(forced, PowAlgo::Sha3t), (true, false));
-        assert_eq!(devices(forced, PowAlgo::Bc3Hash), (false, false));
-        let (mining, message) = forced.status(PowAlgo::Bc3Hash);
+        // With CUDA the GPU takes BC3Hash too, and the CPU stays out - unless
+        // the kernel is not ready or failed its self-test.
+        let cuda = MiningPlan { gpu_kernel: both, ..auto };
+        assert_eq!(devices(cuda, PowAlgo::Bc3Hash, true), (true, false));
+        assert_eq!(cuda.status(PowAlgo::Bc3Hash, true), (true, "BC3Hash: mining on GPU".into()));
+        assert_eq!(devices(cuda, PowAlgo::Bc3Hash, false), (false, true));
+        assert!(cuda.status(PowAlgo::Bc3Hash, false).1.contains("self-test"));
+        // A forced OpenCL backend has no CPU threads: BC3Hash is not mined,
+        // and that must read as an error, not as "Mining".
+        let forced = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 0, gpu_kernel: sha3_only };
+        assert_eq!(devices(forced, PowAlgo::Sha3t, true), (true, false));
+        assert_eq!(devices(forced, PowAlgo::Bc3Hash, false), (false, false));
+        let (mining, message) = forced.status(PowAlgo::Bc3Hash, false);
         assert!(!mining && message.contains("NOT mining"), "{message}");
         // GPU plus --threads: both on SHA3-256t, the CPU alone on BC3Hash.
-        let dual = MiningPlan { gpus: 1, cpu_threads: 4, cpu_fallback_threads: 0 };
-        assert_eq!(devices(dual, PowAlgo::Sha3t), (true, true));
-        assert_eq!(devices(dual, PowAlgo::Bc3Hash), (false, true));
+        let dual = MiningPlan { gpus: 1, cpu_threads: 4, cpu_fallback_threads: 0, gpu_kernel: sha3_only };
+        assert_eq!(devices(dual, PowAlgo::Sha3t, true), (true, true));
+        assert_eq!(devices(dual, PowAlgo::Bc3Hash, false), (false, true));
         // CPU only.
-        let cpu = MiningPlan { gpus: 0, cpu_threads: 8, cpu_fallback_threads: 0 };
-        assert_eq!(devices(cpu, PowAlgo::Bc3Hash), (false, true));
-        assert_eq!(cpu.status(PowAlgo::Bc3Hash), (true, "BC3Hash: mining on CPU".into()));
+        let cpu = MiningPlan { gpus: 0, cpu_threads: 8, cpu_fallback_threads: 0, gpu_kernel: [false; 3] };
+        assert_eq!(devices(cpu, PowAlgo::Bc3Hash, false), (false, true));
+        assert_eq!(cpu.status(PowAlgo::Bc3Hash, false), (true, "BC3Hash: mining on CPU".into()));
         assert_eq!(PowDevices { gpu: true, cpu: true }.label(), "gpu+cpu");
+    }
+
+    /// The stand-in CPU threads follow what the GPUs can do now: a GPU that
+    /// claims a PoW takes it from them, and gives it back when it lets go -
+    /// including when its worker stops.
+    #[test]
+    fn gpu_capability_comes_and_goes() {
+        let s = Arc::new(shared());
+        assert!(!s.gpus_mine(PowAlgo::Bc3Hash));
+        let mut a = GpuCapability::new(&s);
+        let mut b = GpuCapability::new(&s);
+        a.set(PowAlgo::Bc3Hash, true);
+        a.set(PowAlgo::Bc3Hash, true); // idempotent
+        b.set(PowAlgo::Bc3Hash, true);
+        assert!(s.gpus_mine(PowAlgo::Bc3Hash));
+        a.set(PowAlgo::Bc3Hash, false); // a failed its self-test
+        assert!(s.gpus_mine(PowAlgo::Bc3Hash), "b still mines it");
+        drop(b); // b's worker stopped
+        assert!(!s.gpus_mine(PowAlgo::Bc3Hash));
+        assert!(!s.gpus_mine(PowAlgo::Sha3t));
+        assert_eq!(s.bc3_window(), DEFAULT_BC3_WINDOW);
+        s.set_bc3_window(12);
+        assert_eq!(s.bc3_window(), 12);
     }
 
     /// A change of PoW is announced once, not once per job.
