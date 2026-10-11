@@ -101,6 +101,13 @@ struct Args {
     #[arg(long)]
     difficulty: Option<f64>,
 
+    /// Kernel launches each GPU keeps queued. 2 keeps the card busy while the
+    /// host collects and checks the previous launch; 1 is the old
+    /// one-at-a-time loop, kept to compare the two with --benchmark.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=2),
+          hide = true)]
+    gpu_queue: u32,
+
     /// Intensity 1-100 %. Below 100 the workers idle between passes, which
     /// lowers heat/power draw and keeps the machine usable while mining.
     #[arg(long, default_value_t = 100, env = "BC3_INTENSITY",
@@ -422,6 +429,10 @@ fn main() {
     shared.set_intensity(args.intensity);
     if args.intensity < 100 {
         human!("[miner] intensity {}%", args.intensity);
+    }
+    shared.set_gpu_queue(args.gpu_queue);
+    if !gpus.is_empty() && shared.gpu_queue() != backend::QUEUE_DEPTH {
+        human!("[gpu] {} kernel launch(es) queued per GPU", shared.gpu_queue());
     }
     #[cfg(feature = "bc3hash")]
     if let Some(window) = args.bc3_window {

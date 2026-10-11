@@ -28,6 +28,7 @@ pub type cl_handle = *mut c_void;
 
 pub const CL_SUCCESS: cl_int = 0;
 pub const CL_TRUE: cl_bool = 1;
+pub const CL_FALSE: cl_bool = 0;
 pub const CL_DEVICE_TYPE_GPU: cl_bitfield = 1 << 2;
 /// All device types - for tests only (pocl exposes a CPU device).
 pub const CL_DEVICE_TYPE_ALL: cl_bitfield = 0xFFFF_FFFF;
@@ -40,6 +41,12 @@ pub const CL_PROGRAM_BUILD_LOG: cl_uint = 0x1183;
 /// per-kernel limit, not a device one: register pressure decides it, and
 /// keccak is register-heavy.
 pub const CL_KERNEL_WORK_GROUP_SIZE: cl_uint = 0x11B0;
+/// Command-queue property list key, and the bit that turns on event timing.
+pub const CL_QUEUE_PROPERTIES: cl_bitfield = 0x1093;
+pub const CL_QUEUE_PROFILING_ENABLE: cl_bitfield = 1 << 1;
+/// When a command started and ended on the device, in nanoseconds.
+pub const CL_PROFILING_COMMAND_START: cl_uint = 0x1282;
+pub const CL_PROFILING_COMMAND_END: cl_uint = 0x1283;
 
 type FnGetPlatformIDs = unsafe extern "C" fn(cl_uint, *mut cl_handle, *mut cl_uint) -> cl_int;
 type FnGetDeviceIDs =
@@ -104,6 +111,9 @@ type FnEnqueueNDRange = unsafe extern "C" fn(
     *mut cl_handle,
 ) -> cl_int;
 type FnFinish = unsafe extern "C" fn(cl_handle) -> cl_int;
+type FnWaitForEvents = unsafe extern "C" fn(cl_uint, *const cl_handle) -> cl_int;
+type FnGetEventProfilingInfo =
+    unsafe extern "C" fn(cl_handle, cl_uint, usize, *mut c_void, *mut usize) -> cl_int;
 type FnRelease = unsafe extern "C" fn(cl_handle) -> cl_int;
 
 pub struct Cl {
@@ -126,6 +136,10 @@ pub struct Cl {
     pub enqueue_read_buffer: FnEnqueueBuffer,
     pub enqueue_nd_range_kernel: FnEnqueueNDRange,
     pub finish: FnFinish,
+    pub flush: FnFinish,
+    pub wait_for_events: FnWaitForEvents,
+    pub get_event_profiling_info: FnGetEventProfilingInfo,
+    pub release_event: FnRelease,
     pub release_mem_object: FnRelease,
     pub release_kernel: FnRelease,
     pub release_program: FnRelease,
@@ -203,6 +217,10 @@ fn build(lib: Library) -> Result<Cl, String> {
             enqueue_read_buffer: sym(&lib, b"clEnqueueReadBuffer\0")?,
             enqueue_nd_range_kernel: sym(&lib, b"clEnqueueNDRangeKernel\0")?,
             finish: sym(&lib, b"clFinish\0")?,
+            flush: sym(&lib, b"clFlush\0")?,
+            wait_for_events: sym(&lib, b"clWaitForEvents\0")?,
+            get_event_profiling_info: sym(&lib, b"clGetEventProfilingInfo\0")?,
+            release_event: sym(&lib, b"clReleaseEvent\0")?,
             release_mem_object: sym(&lib, b"clReleaseMemObject\0")?,
             release_kernel: sym(&lib, b"clReleaseKernel\0")?,
             release_program: sym(&lib, b"clReleaseProgram\0")?,
@@ -297,6 +315,11 @@ mod tests {
         assert_eq!(CL_MEM_READ_ONLY, 4);
         assert_eq!(CL_PROGRAM_BUILD_LOG, 0x1183);
         assert_eq!(CL_KERNEL_WORK_GROUP_SIZE, 0x11B0);
+        assert_eq!(CL_QUEUE_PROPERTIES, 0x1093);
+        assert_eq!(CL_QUEUE_PROFILING_ENABLE, 2);
+        assert_eq!(CL_PROFILING_COMMAND_START, 0x1282);
+        assert_eq!(CL_PROFILING_COMMAND_END, 0x1283);
+        assert_eq!(CL_FALSE, 0);
         assert_eq!(CL_SUCCESS, 0);
     }
 

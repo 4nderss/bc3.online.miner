@@ -3,10 +3,12 @@
 //! An in-process job source stands where the stratum client would: it
 //! publishes random jobs through `Shared::publish_job` to the ordinary
 //! workers, so the benchmark runs exactly the code a pool job runs - job
-//! dispatch, the GPU kernels through `scan_range`, the CPU re-check of every
-//! GPU hit - and then checks every share that comes out once more against
-//! the CPU reference, the way a pool would. Per-device hash rates are read
-//! from the same counters the miner keeps for its statistics.
+//! dispatch, the GPU kernels and their launch queue, the CPU re-check of
+//! every GPU hit - and then checks every share that comes out once more
+//! against the CPU reference, the way a pool would. Per-device hash rates are
+//! read from the same counters the miner keeps for its statistics, and so is
+//! how busy each GPU was: the device time of its launches (CUDA events,
+//! OpenCL profiling) over the wall time between them.
 //!
 //! For BC3Hash on a CUDA card it compares the GPU table windows (10, 12, 14
 //! and 16 bits) unless `--bc3-window` names one: which is fastest depends on
@@ -230,15 +232,20 @@ impl Run<'_> {
         }
     }
 
-    /// Hash counters: per GPU slot with the moment (us) it last moved, then
-    /// the CPU threads together with now.
+    /// Hash counters: per GPU slot with the moment (us) it last moved and its
+    /// device-busy total, then the CPU threads together with now.
     fn counters(&self) -> Counters {
         let s = self.shared;
         let gpus = s
             .gpu_slot_hashes
             .iter()
             .zip(&s.gpu_slot_stamp)
-            .map(|(h, t)| (h.load(Ordering::Acquire), t.load(Ordering::Relaxed)))
+            .zip(&s.gpu_slot_busy_us)
+            .map(|((h, t), b)| GpuCount {
+                hashes: h.load(Ordering::Acquire),
+                stamp_us: t.load(Ordering::Relaxed),
+                busy_us: b.load(Ordering::Relaxed),
+            })
             .collect();
         Counters {
             gpus,
@@ -302,10 +309,11 @@ impl Run<'_> {
             self.tick(step);
             let now = self.counters();
             let (gpu_rates, cpu_rate) = now.rates_since(&last);
+            let busy = now.busy_since(&last);
             let total: f64 = gpu_rates.iter().sum::<f64>() + cpu_rate;
             let mut line = format!("[bench] {label} {:>5.0} s |", t0.elapsed().as_secs_f64());
             for (i, r) in gpu_rates.iter().enumerate() {
-                line += &format!(" GPU{i} {} |", format_rate(*r));
+                line += &format!(" GPU{i} {} busy {} |", format_rate(*r), format_busy(busy[i]));
             }
             if self.cfg.cpu_threads > 0 {
                 line += &format!(" CPU {} |", format_rate(cpu_rate));
@@ -337,11 +345,14 @@ impl Run<'_> {
             }
             last = now;
         }
-        let (gpu, cpu) = self.counters().rates_since(&first);
+        let end = self.counters();
+        let (gpu, cpu) = end.rates_since(&first);
+        let busy = end.busy_since(&first);
         let shares = self.shares;
         Phase {
             window: 0,
             gpu,
+            busy,
             cpu,
             ok: shares.ok - shares0.ok,
             invalid: shares.invalid - shares0.invalid,
@@ -350,11 +361,20 @@ impl Run<'_> {
     }
 }
 
+/// One GPU's counters at a reading.
+#[derive(Clone, Copy, Default)]
+struct GpuCount {
+    hashes: u64,
+    /// When the count last moved - the end of a launch (us).
+    stamp_us: u64,
+    /// Device time of its launches so far (us).
+    busy_us: u64,
+}
+
 /// A reading of the hash counters - see `Run::counters`.
 #[derive(Clone)]
 struct Counters {
-    /// Per GPU slot: hashes, and when the count last moved (us).
-    gpus: Vec<(u64, u64)>,
+    gpus: Vec<GpuCount>,
     cpu: u64,
     now: u64,
 }
@@ -367,9 +387,9 @@ impl Counters {
             .gpus
             .iter()
             .zip(&earlier.gpus)
-            .map(|(&(h1, t1), &(h0, t0))| {
-                if t1 > t0 {
-                    (h1 - h0) as f64 / ((t1 - t0) as f64 / 1e6)
+            .map(|(g1, g0)| {
+                if g1.stamp_us > g0.stamp_us {
+                    (g1.hashes - g0.hashes) as f64 / ((g1.stamp_us - g0.stamp_us) as f64 / 1e6)
                 } else {
                     0.0
                 }
@@ -379,12 +399,39 @@ impl Counters {
         let cpu = if dt > 0.0 { (self.cpu - earlier.cpu) as f64 / dt } else { 0.0 };
         (gpus, cpu)
     }
+
+    /// Per GPU: the fraction of the time between the same two launch ends
+    /// that the device spent running launches. Below 1 by whatever the card
+    /// waited for the host between them. None where no launch ended, or the
+    /// device kept no time.
+    fn busy_since(&self, earlier: &Counters) -> Vec<Option<f64>> {
+        self.gpus
+            .iter()
+            .zip(&earlier.gpus)
+            .map(|(g1, g0)| {
+                let wall = g1.stamp_us.saturating_sub(g0.stamp_us);
+                let busy = g1.busy_us.saturating_sub(g0.busy_us);
+                (wall > 0 && busy > 0).then(|| busy as f64 / wall as f64)
+            })
+            .collect()
+    }
+}
+
+/// A busy fraction as the benchmark prints it. It can come out a hair above
+/// 100 %: the device's clock and the host's stamps are not the same clock.
+fn format_busy(busy: Option<f64>) -> String {
+    match busy {
+        Some(b) => format!("{:.1} %", 100.0 * b),
+        None => "n/a".into(),
+    }
 }
 
 struct Phase {
     /// The BC3Hash window; 0 for a run without one.
     window: u32,
     gpu: Vec<f64>,
+    /// Per GPU, see `Counters::busy_since`.
+    busy: Vec<Option<f64>>,
     cpu: f64,
     ok: u64,
     invalid: u64,
@@ -401,6 +448,12 @@ fn average(phases: &[Phase], window: u32) -> Phase {
     Phase {
         window,
         gpu: (0..gpus).map(|i| runs.iter().map(|p| p.gpu[i]).sum::<f64>() / n).collect(),
+        busy: (0..gpus)
+            .map(|i| {
+                let known: Vec<f64> = runs.iter().filter_map(|p| p.busy.get(i).copied().flatten()).collect();
+                (!known.is_empty()).then(|| known.iter().sum::<f64>() / known.len() as f64)
+            })
+            .collect(),
         cpu: runs.iter().map(|p| p.cpu).sum::<f64>() / n,
         ok: runs.iter().map(|p| p.ok).sum(),
         invalid: runs.iter().map(|p| p.invalid).sum(),
@@ -429,6 +482,9 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
     }
     if let Some(v) = telemetry.driver_version() {
         println!("[bench] NVIDIA driver {v}");
+    }
+    if !cfg.gpu_names.is_empty() {
+        println!("[bench] kernel launches queued per GPU: {}", shared.gpu_queue());
     }
     if cfg.cpu_threads > 0 {
         println!("[bench] CPU: {} thread(s)", cfg.cpu_threads);
@@ -513,7 +569,7 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
     }
     let mut header = format!("{:<8}", if gpu_bc3 { "window" } else { "" });
     for i in 0..cfg.gpu_names.len() {
-        header += &format!("{:>16}", format!("GPU{i}"));
+        header += &format!("{:>16}{:>9}", format!("GPU{i}"), "busy");
     }
     if cfg.cpu_threads > 0 {
         header += &format!("{:>14}", "CPU");
@@ -526,12 +582,10 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
         let mut line =
             format!("{:<8}", if p.window > 0 { p.window.to_string() } else { String::new() });
         for (i, r) in p.gpu.iter().enumerate() {
-            let cell = if p.failed.get(i).copied().unwrap_or(false) {
-                "FAILED".to_string()
-            } else {
-                format_rate(*r)
-            };
-            line += &format!("{cell:>16}");
+            let failed = p.failed.get(i).copied().unwrap_or(false);
+            let cell = if failed { "FAILED".to_string() } else { format_rate(*r) };
+            let busy = if failed { String::new() } else { format_busy(p.busy.get(i).copied().flatten()) };
+            line += &format!("{cell:>16}{busy:>9}");
         }
         if cfg.cpu_threads > 0 {
             line += &format!("{:>14}", format_rate(p.cpu));
@@ -544,6 +598,10 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
     if schedule.len() > rows.len() {
         println!("(each window: the mean of its run going up and its run coming back down)");
     }
+    println!(
+        "(busy: the share of the time the GPU ran kernels, by its own clock - the rest it \
+         waited for the host)"
+    );
     if gpu_bc3 && rows.len() > 1 {
         for i in 0..cfg.gpu_names.len() {
             let best = rows
@@ -586,33 +644,51 @@ mod tests {
     /// in the middle of a launch neither gains nor loses part of one.
     #[test]
     fn rates_count_whole_launches() {
-        let a = Counters { gpus: vec![(1_000, 1_000_000)], cpu: 0, now: 1_100_000 };
+        let g = |hashes, stamp_us, busy_us| GpuCount { hashes, stamp_us, busy_us };
+        let a = Counters { gpus: vec![g(1_000, 1_000_000, 0)], cpu: 0, now: 1_100_000 };
         // 4000 more hashes over launches that ended 2 s apart; read 2.3 s later.
-        let b = Counters { gpus: vec![(5_000, 3_000_000)], cpu: 2_300, now: 3_400_000 };
+        let b = Counters { gpus: vec![g(5_000, 3_000_000, 1_900_000)], cpu: 2_300, now: 3_400_000 };
         let (gpus, cpu) = b.rates_since(&a);
         assert_eq!(gpus, vec![2_000.0]);
         assert!((cpu - 1_000.0).abs() < 1e-6);
         // No launch finished in between: no rate rather than a division by 0.
         assert_eq!(a.rates_since(&a).0, vec![0.0]);
+        // 1.9 s of device time between launch ends 2 s apart: 95 % busy.
+        assert_eq!(b.busy_since(&a), vec![Some(0.95)]);
+        // No launch ended, or no device clock: no figure rather than 0 %.
+        assert_eq!(a.busy_since(&a), vec![None]);
+        let untimed = Counters { gpus: vec![g(5_000, 3_000_000, 0)], cpu: 0, now: 0 };
+        assert_eq!(untimed.busy_since(&a), vec![None]);
+        assert_eq!(format_busy(Some(0.9991)), "99.9 %");
+        assert_eq!(format_busy(None), "n/a");
     }
 
     /// Each window's line is the mean of its up and down runs; a failure in
     /// either marks it.
     #[test]
     fn windows_average_their_runs() {
-        let run = |window, rate, failed| Phase {
+        let run = |window, rate, busy, failed| Phase {
             window,
             gpu: vec![rate],
+            busy: vec![busy],
             cpu: 0.0,
             ok: 2,
             invalid: 0,
             failed: vec![failed],
         };
-        let phases = [run(10, 100.0, false), run(16, 130.0, false), run(16, 120.0, true), run(10, 110.0, false)];
+        let phases = [
+            run(10, 100.0, Some(0.9), false),
+            run(16, 130.0, None, false),
+            run(16, 120.0, Some(0.8), true),
+            run(10, 110.0, Some(1.0), false),
+        ];
         let w10 = average(&phases, 10);
         assert_eq!((w10.gpu[0], w10.ok, w10.failed[0]), (105.0, 4, false));
+        assert!((w10.busy[0].unwrap() - 0.95).abs() < 1e-12);
         let w16 = average(&phases, 16);
         assert_eq!((w16.gpu[0], w16.failed[0]), (125.0, true));
+        // A run without a device clock does not drag the mean to 0.
+        assert_eq!(w16.busy[0], Some(0.8));
     }
 
     /// The automatic difficulty puts a share every few seconds at the

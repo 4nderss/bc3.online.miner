@@ -25,21 +25,21 @@ pub const KERNEL_SOURCE: &str = include_str!("../kernels/sha3t.cl");
 
 /// Max number of hits per launch that the kernel reports (more than this in
 /// a single batch never happens in practice at sane share difficulties).
-#[allow(dead_code)]
 pub const MAX_HITS: usize = 64;
 
-/// Keeps a backend's launches inside what the kernel's hit buffer can hold.
+/// Keeps a GPU's launches inside what the kernel's hit buffer can hold - for
+/// every backend and PoW, in the GPU worker.
 ///
 /// The kernel writes at most `MAX_HITS` nonces plus a count. Anything past
 /// that is already gone by the time the buffer is read, and it used to be
 /// dropped with no log and no change of behaviour - so a pool that set the
 /// share difficulty low enough made the miner lose shares on every launch,
-/// with nothing anywhere to say so.
+/// with nothing anywhere to say so. Only OpenCL's SHA3-256t path had this
+/// guard; CUDA and both BC3Hash paths dropped the excess silently.
 ///
 /// "Never happens in practice" is not a bound: the pool picks the difficulty,
 /// and the batch size grows with the card.
 #[derive(Default)]
-#[allow(dead_code)]
 pub struct HitBudget {
     /// `None` until an overflow has been seen. Until then a scan runs exactly
     /// the range the worker asked for, in one launch - the fast path is not
@@ -260,7 +260,6 @@ mod hit_budget_tests {
     }
 }
 
-#[allow(dead_code)]
 impl HitBudget {
     /// How many nonces the next launch may cover, of `remaining` left to do.
     pub fn chunk(&self, remaining: u32) -> u32 {
@@ -341,6 +340,42 @@ pub fn kernel_supports(algo: PowAlgo) -> bool {
     }
 }
 
+/// Launches a backend keeps in flight at once.
+///
+/// One launch at a time left the card idle for every round trip through the
+/// host: wait for the kernel, read the hits back, re-check them on the CPU,
+/// queue the next launch. The re-check is the expensive part for BC3Hash -
+/// about a millisecond a hit with the compact CPU tables - and a pool's
+/// starting difficulty yields dozens of hits a launch on a fast card. With
+/// two, the next launch waits on the device behind the running one while the
+/// host does all of that.
+pub const QUEUE_DEPTH: usize = 2;
+
+/// One kernel launch: grind `[start, start + count)` for the header (nonce
+/// field excluded) and report the nonces whose `algo` hash is <= `target`.
+#[derive(Clone, Copy)]
+pub struct Launch<'a> {
+    pub algo: PowAlgo,
+    pub header76: &'a [u8; 76],
+    pub start: u32,
+    pub count: u32,
+    pub target: &'a Target,
+}
+
+/// What one launch found.
+#[derive(Debug, Default)]
+pub struct Scan {
+    /// The nonces the kernel stored - at most `MAX_HITS`.
+    pub hits: Vec<u32>,
+    /// How many hits the kernel counted. More than `hits.len()` means the
+    /// hit buffer overflowed and the rest were lost.
+    pub reported: usize,
+    /// How long the device ran the launch, by its own clock (CUDA events,
+    /// OpenCL profiling); None where the runtime could not say. The sum of
+    /// these over wall time is how busy the card was.
+    pub busy: Option<std::time::Duration>,
+}
+
 pub trait MiningBackend {
     /// Human-readable name ("CUDA: NVIDIA GeForce RTX 3050 Ti ...").
     fn name(&self) -> String;
@@ -373,9 +408,24 @@ pub trait MiningBackend {
         1
     }
 
-    /// Grind [start_nonce, start_nonce+count) for the header (nonce field
-    /// excluded) and return the nonces whose `algo` hash is <= target.
-    /// `algo` is per launch, not per nonce: it picks the kernel.
+    /// Queue a launch behind those already in flight and return at once.
+    /// At most `QUEUE_DEPTH` may be in flight; `count` must not be 0. `algo`
+    /// is per launch, not per nonce: it picks the kernel.
+    fn enqueue(&mut self, launch: &Launch) -> Result<(), String>;
+
+    /// Wait for the oldest launch in flight and return what it found.
+    fn collect(&mut self) -> Result<Scan, String>;
+
+    /// Launches queued and not yet collected.
+    fn in_flight(&self) -> usize;
+
+    /// Give up on everything in flight - after an error, when the results can
+    /// no longer be trusted or the device may be gone. Waits for the device
+    /// to stop working on them, so their buffers can be reused.
+    fn abandon(&mut self);
+
+    /// One launch from start to finish: the self-test's and the tests' view.
+    /// Only with nothing else in flight.
     fn scan_range(
         &mut self,
         algo: PowAlgo,
@@ -383,7 +433,16 @@ pub trait MiningBackend {
         start_nonce: u32,
         count: u32,
         target: &Target,
-    ) -> Result<Vec<u32>, String>;
+    ) -> Result<Vec<u32>, String> {
+        if count == 0 {
+            return Ok(vec![]);
+        }
+        if self.in_flight() > 0 {
+            return Err("scan_range with launches in flight".into());
+        }
+        self.enqueue(&Launch { algo, header76, start: start_nonce, count, target })?;
+        Ok(self.collect()?.hits)
+    }
 }
 
 /// A discovered GPU - data only (Send); the backend itself is opened in the

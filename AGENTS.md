@@ -134,7 +134,18 @@ mines no BC3Hash; the CPU takes over. Launches are whole waves of the card
 
 `bc3-miner --benchmark` measures it through the real worker path with an
 in-process job source, compares the four windows on every card with the
-kernel, and checks every share with the CPU reference.
+kernel, and checks every share with the CPU reference. It also prints how
+busy each GPU was: the device time of its launches (CUDA events, OpenCL
+profiling) over the wall time between them.
+
+Every GPU keeps two launches queued (`backend::QUEUE_DEPTH`), each with its
+own buffers: the next one waits on the device while the host collects the
+last and re-checks its hits - about a millisecond a BC3Hash hit. The hidden
+`--gpu-queue 1` brings back the one-at-a-time loop, to compare the two with
+`--benchmark`. BC3Hash launches stay long (~400 ms, 8 waves): the first waves
+of every launch run in lockstep and are slower, 8.4 us a hash at one or two
+waves a launch against 7.9 at eight on an RTX 3050 Ti
+(`cuda_bc3hash_launch_sizes`). A stream per launch did not change that.
 
 ## Changing the GPU kernel
 

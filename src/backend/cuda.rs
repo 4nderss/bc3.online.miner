@@ -7,13 +7,30 @@
 //! users do not have installed. libcuda is loaded dynamically, so the binary
 //! starts even with no NVIDIA driver at all (detection then returns an empty
 //! list).
+//!
+//! Launches are queued, not run one at a time (see `QUEUE_DEPTH`): every
+//! launch has its own buffers, a pinned buffer its hits are read back into,
+//! and two events - one before the kernel, one after the readback - which
+//! time it on the device and let the host sleep until it is done.
+//!
+//! All on one stream. A stream per launch, so the next kernel could start on
+//! SMs the previous one has finished with, was measured to change nothing
+//! (RTX 3050 Ti, Linux and Windows): what a short BC3Hash launch loses is
+//! its first waves running in lockstep, not a tail - and it put cudarc into
+//! its multi-stream event tracking for nothing.
 
-use super::{kernel_lanes, kernel_supports, kernel_target, MiningBackend, MAX_HITS};
+use super::{
+    kernel_lanes, kernel_supports, kernel_target, Launch, MiningBackend, Scan, MAX_HITS,
+    QUEUE_DEPTH,
+};
 use crate::consensus::{PowAlgo, Target};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    sys, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig,
+    PinnedHostSlice, PushKernelArg,
 };
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 const BLOCK_DIM: u32 = 256;
 
@@ -37,22 +54,76 @@ const BC3HASH_PTX: [(u32, &str); 4] = [
 const BC3_BLOCK_DIM: u32 = 64;
 
 /// One loaded BC3Hash kernel: its window, the two entry points, and the
-/// device buffers it reads - the tables (uploaded once) and the per-launch
-/// header and target.
+/// tables they read (uploaded once).
 #[cfg(feature = "bc3hash")]
 struct Bc3Kernel {
     window: u32,
     scan: CudaFunction,
     batch: CudaFunction,
     d_tables: CudaSlice<u64>,
-    d_header: CudaSlice<u8>,
-    d_target: CudaSlice<u64>,
     /// Nonces the card runs at once: SMs x resident blocks x block size.
     /// At 255 registers a thread only 4 blocks of 64 fit on an SM, so a
     /// launch that is not a whole number of these waves leaves most of the
     /// card idle for its last one - 16384 nonces on an RTX 3050 Ti is 3.2
     /// waves, which cost 14 %.
     wave: u32,
+}
+
+/// What one launch in flight owns, so that the next can be queued while it
+/// runs: the per-launch inputs, the hit buffer and the pinned memory it is
+/// read back into, and its two events.
+struct Slot {
+    /// SHA3-256t: the header as ten interleaved lanes.
+    lanes: CudaSlice<u64>,
+    /// BC3Hash: the header and the target limbs.
+    header: CudaSlice<u8>,
+    target: CudaSlice<u64>,
+    /// [count, nonce0, nonce1, ...]
+    hits: CudaSlice<u32>,
+    hits_host: PinnedHostSlice<u32>,
+    /// Recorded just before the kernel, and after the readback: the time
+    /// between them is the launch's time on the device.
+    start: CudaEvent,
+    /// Blocking: the host thread sleeps on it instead of spinning a core,
+    /// which on a laptop is power the GPU then does not get.
+    done: CudaEvent,
+    /// What `lanes`, `header` and `target` hold, so the copies that would
+    /// change nothing - nearly all of them - are skipped.
+    lanes_of: Option<[u64; 10]>,
+    header_of: Option<[u8; 76]>,
+    target_of: Option<[u64; 4]>,
+}
+
+impl Slot {
+    fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self, String> {
+        let alloc = |what: &str, e| format!("alloc {what}: {e}");
+        Ok(Self {
+            lanes: stream.alloc_zeros::<u64>(10).map_err(|e| alloc("lanes", e))?,
+            header: stream.alloc_zeros::<u8>(76).map_err(|e| alloc("header", e))?,
+            target: stream.alloc_zeros::<u64>(4).map_err(|e| alloc("target", e))?,
+            hits: stream.alloc_zeros::<u32>(1 + MAX_HITS).map_err(|e| alloc("hits", e))?,
+            // SAFETY: only ever read after a readback into it has completed.
+            hits_host: unsafe { ctx.alloc_pinned::<u32>(1 + MAX_HITS) }
+                .map_err(|e| alloc("pinned hits", e))?,
+            start: ctx
+                .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|e| alloc("event", e))?,
+            done: ctx
+                .new_event(Some(sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))
+                .map_err(|e| alloc("event", e))?,
+            lanes_of: None,
+            header_of: None,
+            target_of: None,
+        })
+    }
+
+    /// Forget what the device buffers hold - after a failed or abandoned
+    /// launch nobody knows.
+    fn forget(&mut self) {
+        self.lanes_of = None;
+        self.header_of = None;
+        self.target_of = None;
+    }
 }
 
 /// List CUDA devices; empty list if the driver or the devices are missing.
@@ -86,13 +157,23 @@ pub struct CudaBackend {
     stream: Arc<CudaStream>,
     func: CudaFunction,
     name: String,
-    /// Reused GPU buffers (hits: [counter, nonce0, nonce1, ...]).
-    d_hits: CudaSlice<u32>,
-    d_lanes: CudaSlice<u64>,
-    hits_reset: Vec<u32>,
+    /// One per launch that may be in flight, taken in turn.
+    slots: Vec<Slot>,
+    /// Slots of the launches in flight, oldest first.
+    queued: VecDeque<usize>,
+    /// The slot the next launch takes.
+    next_slot: usize,
     /// The BC3Hash kernel in use - loaded on demand, for one window at a time.
     #[cfg(feature = "bc3hash")]
     bc3: Option<Bc3Kernel>,
+}
+
+impl Drop for CudaBackend {
+    fn drop(&mut self) {
+        // A readback still in flight writes into pinned memory that the slots
+        // free when they drop; let the device finish first.
+        let _ = self.stream.synchronize();
+    }
 }
 
 impl CudaBackend {
@@ -110,12 +191,7 @@ impl CudaBackend {
             .load_function("sha3t_scan")
             .map_err(|e| format!("load_function: {e}"))?;
 
-        let d_hits = stream
-            .alloc_zeros::<u32>(1 + MAX_HITS)
-            .map_err(|e| format!("alloc hits: {e}"))?;
-        let d_lanes = stream
-            .alloc_zeros::<u64>(10)
-            .map_err(|e| format!("alloc lanes: {e}"))?;
+        let slots = (0..QUEUE_DEPTH).map(|_| Slot::new(&ctx, &stream)).collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             #[cfg(feature = "bc3hash")]
@@ -123,9 +199,9 @@ impl CudaBackend {
             stream,
             func,
             name,
-            d_hits,
-            d_lanes,
-            hits_reset: vec![0u32; 1 + MAX_HITS],
+            slots,
+            queued: VecDeque::new(),
+            next_slot: 0,
             #[cfg(feature = "bc3hash")]
             bc3: None,
         })
@@ -156,8 +232,6 @@ impl CudaBackend {
             .stream
             .clone_htod(&tables[..])
             .map_err(|e| format!("upload BC3Hash tables ({} MiB): {e}", (tables.len() * 8) >> 20))?;
-        let d_header = self.stream.alloc_zeros::<u8>(76).map_err(|e| format!("alloc header: {e}"))?;
-        let d_target = self.stream.alloc_zeros::<u64>(4).map_err(|e| format!("alloc target: {e}"))?;
         let sms = self
             .ctx
             .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
@@ -168,7 +242,7 @@ impl CudaBackend {
             .unwrap_or(1)
             .max(1);
         let wave = sms * per_sm * BC3_BLOCK_DIM;
-        Ok(Bc3Kernel { window, scan, batch, d_tables, d_header, d_target, wave })
+        Ok(Bc3Kernel { window, scan, batch, d_tables, wave })
     }
 
     /// BC3Hash of 80-byte headers on the GPU, through the kernel's batch
@@ -183,62 +257,102 @@ impl CudaBackend {
             .alloc_zeros::<u8>(headers.len() * 32)
             .map_err(|e| format!("alloc digests: {e}"))?;
         let count = headers.len() as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (count.div_ceil(BC3_BLOCK_DIM), 1, 1),
-            block_dim: (BC3_BLOCK_DIM, 1, 1),
-            shared_mem_bytes: 0,
-        };
         let mut launch = self.stream.launch_builder(&k.batch);
         launch.arg(&k.d_tables).arg(&d_in).arg(&count).arg(&mut d_out);
         unsafe {
-            launch.launch(cfg).map_err(|e| format!("bc3hash_batch launch: {e}"))?;
+            launch
+                .launch(launch_config(count, BC3_BLOCK_DIM))
+                .map_err(|e| format!("bc3hash_batch launch: {e}"))?;
         }
         let out = self.stream.clone_dtoh(&d_out).map_err(|e| format!("dtoh digests: {e}"))?;
         self.stream.synchronize().map_err(|e| format!("synchronize: {e}"))?;
         Ok(out.as_chunks::<32>().0.to_vec())
     }
 
-    #[cfg(feature = "bc3hash")]
-    fn scan_bc3(
-        &mut self,
-        header76: &[u8; 76],
-        start_nonce: u32,
-        count: u32,
-        target: &Target,
-    ) -> Result<Vec<u32>, String> {
-        let k = self.bc3.as_mut().ok_or("BC3Hash kernel not loaded")?;
-        self.stream
-            .memcpy_htod(&header76[..], &mut k.d_header)
-            .map_err(|e| format!("htod header: {e}"))?;
-        self.stream
-            .memcpy_htod(&super::bc3::target_limbs(target)[..], &mut k.d_target)
-            .map_err(|e| format!("htod target: {e}"))?;
-        self.stream
-            .memcpy_htod(&self.hits_reset, &mut self.d_hits)
-            .map_err(|e| format!("htod hits: {e}"))?;
-        let cfg = LaunchConfig {
-            grid_dim: (count.div_ceil(BC3_BLOCK_DIM), 1, 1),
-            block_dim: (BC3_BLOCK_DIM, 1, 1),
-            shared_mem_bytes: 0,
-        };
+    /// Queue the copies and the kernel of one launch on slot `i`.
+    fn queue_kernel(&mut self, i: usize, l: &Launch) -> Result<(), String> {
+        match l.algo {
+            PowAlgo::Bc3Hash => self.queue_bc3(i, l),
+            algo if kernel_supports(algo) => self.queue_sha3t(i, l),
+            algo => Err(format!("no kernel for {}", algo.name())),
+        }
+    }
+
+    fn queue_sha3t(&mut self, i: usize, l: &Launch) -> Result<(), String> {
+        let stream = &self.stream;
+        let slot = &mut self.slots[i];
+        let lanes = kernel_lanes(l.header76);
+        if slot.lanes_of != Some(lanes) {
+            slot.lanes_of = None;
+            stream.memcpy_htod(&lanes[..], &mut slot.lanes).map_err(|e| format!("htod lanes: {e}"))?;
+            slot.lanes_of = Some(lanes);
+        }
+        let t3 = kernel_target(l.target);
         let max_hits = MAX_HITS as u32;
-        let mut launch = self.stream.launch_builder(&k.scan);
+        stream
+            .memset_zeros(&mut slot.hits.slice_mut(0..1))
+            .map_err(|e| format!("reset hits: {e}"))?;
+        slot.start.record(stream).map_err(|e| format!("record: {e}"))?;
+        let mut launch = stream.launch_builder(&self.func);
+        launch
+            .arg(&slot.lanes)
+            .arg(&l.start)
+            .arg(&l.count)
+            .arg(&t3)
+            .arg(&mut slot.hits)
+            .arg(&max_hits);
+        unsafe { launch.launch(launch_config(l.count, BLOCK_DIM)) }
+            .map_err(|e| format!("kernel-launch: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "bc3hash")]
+    fn queue_bc3(&mut self, i: usize, l: &Launch) -> Result<(), String> {
+        let k = self.bc3.as_ref().ok_or("BC3Hash kernel not loaded")?;
+        let stream = &self.stream;
+        let slot = &mut self.slots[i];
+        if slot.header_of.as_ref() != Some(l.header76) {
+            slot.header_of = None;
+            stream
+                .memcpy_htod(&l.header76[..], &mut slot.header)
+                .map_err(|e| format!("htod header: {e}"))?;
+            slot.header_of = Some(*l.header76);
+        }
+        let limbs = super::bc3::target_limbs(l.target);
+        if slot.target_of != Some(limbs) {
+            slot.target_of = None;
+            stream.memcpy_htod(&limbs[..], &mut slot.target).map_err(|e| format!("htod target: {e}"))?;
+            slot.target_of = Some(limbs);
+        }
+        let max_hits = MAX_HITS as u32;
+        stream
+            .memset_zeros(&mut slot.hits.slice_mut(0..1))
+            .map_err(|e| format!("reset hits: {e}"))?;
+        slot.start.record(stream).map_err(|e| format!("record: {e}"))?;
+        let mut launch = stream.launch_builder(&k.scan);
         launch
             .arg(&k.d_tables)
-            .arg(&k.d_header)
-            .arg(&start_nonce)
-            .arg(&count)
-            .arg(&k.d_target)
-            .arg(&mut self.d_hits)
+            .arg(&slot.header)
+            .arg(&l.start)
+            .arg(&l.count)
+            .arg(&slot.target)
+            .arg(&mut slot.hits)
             .arg(&max_hits);
-        unsafe {
-            launch.launch(cfg).map_err(|e| format!("bc3hash_scan launch: {e}"))?;
-        }
-        let hits = self.stream.clone_dtoh(&self.d_hits).map_err(|e| format!("dtoh hits: {e}"))?;
-        self.stream.synchronize().map_err(|e| format!("synchronize: {e}"))?;
-        let n = (hits[0] as usize).min(MAX_HITS);
-        Ok(hits[1..1 + n].to_vec())
+        unsafe { launch.launch(launch_config(l.count, BC3_BLOCK_DIM)) }
+            .map_err(|e| format!("bc3hash_scan launch: {e}"))?;
+        Ok(())
     }
+
+    #[cfg(not(feature = "bc3hash"))]
+    fn queue_bc3(&mut self, _i: usize, _l: &Launch) -> Result<(), String> {
+        Err("this build has no BC3Hash kernel".into())
+    }
+}
+
+/// One thread per nonce, in blocks of `block`; the kernel ignores the threads
+/// past `count` in the last block.
+fn launch_config(count: u32, block: u32) -> LaunchConfig {
+    LaunchConfig { grid_dim: (count.div_ceil(block), 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 }
 }
 
 #[cfg(feature = "bc3hash")]
@@ -254,7 +368,7 @@ impl super::bc3::Bc3Ops for CudaBackend {
         count: u32,
         target: &Target,
     ) -> Result<Vec<u32>, String> {
-        self.scan_bc3(header76, start, count, target)
+        self.scan_range(PowAlgo::Bc3Hash, header76, start, count, target)
     }
 }
 
@@ -283,6 +397,8 @@ impl MiningBackend for CudaBackend {
     #[cfg(feature = "bc3hash")]
     fn prepare_bc3hash(&mut self, window: u32) -> Result<std::time::Duration, String> {
         let t0 = std::time::Instant::now();
+        // Nothing of the old kernel may still be running when its tables go.
+        self.abandon();
         // The old window's tables leave the card before the new ones arrive:
         // at 16 bits they are 256 MiB.
         self.bc3 = None;
@@ -308,64 +424,63 @@ impl MiningBackend for CudaBackend {
         }
     }
 
-    fn scan_range(
-        &mut self,
-        algo: PowAlgo,
-        header76: &[u8; 76],
-        start_nonce: u32,
-        count: u32,
-        target: &Target,
-    ) -> Result<Vec<u32>, String> {
-        #[cfg(feature = "bc3hash")]
-        if algo == PowAlgo::Bc3Hash {
-            if count == 0 {
-                return Ok(vec![]);
-            }
-            return self.scan_bc3(header76, start_nonce, count, target);
+    fn enqueue(&mut self, l: &Launch) -> Result<(), String> {
+        if l.count == 0 {
+            return Err("a launch of 0 nonces".into());
         }
-        if !kernel_supports(algo) {
-            return Err(format!("no kernel for {}", algo.name()));
+        if self.queued.len() >= QUEUE_DEPTH {
+            return Err("too many launches in flight".into());
         }
-        if count == 0 {
-            return Ok(vec![]);
+        let i = self.next_slot;
+        if let Err(e) = self.queue_kernel(i, l) {
+            self.slots[i].forget();
+            return Err(e);
         }
-        let lanes = kernel_lanes(header76);
-        let t3 = kernel_target(target);
-
-        self.stream
-            .memcpy_htod(&lanes, &mut self.d_lanes)
-            .map_err(|e| format!("htod lanes: {e}"))?;
-        self.stream
-            .memcpy_htod(&self.hits_reset, &mut self.d_hits)
-            .map_err(|e| format!("htod hits: {e}"))?;
-
-        let cfg = LaunchConfig {
-            grid_dim: (count.div_ceil(BLOCK_DIM), 1, 1),
-            block_dim: (BLOCK_DIM, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let max_hits = MAX_HITS as u32;
-        let mut launch = self.stream.launch_builder(&self.func);
-        launch
-            .arg(&self.d_lanes)
-            .arg(&start_nonce)
-            .arg(&count)
-            .arg(&t3)
-            .arg(&mut self.d_hits)
-            .arg(&max_hits);
-        unsafe {
-            launch.launch(cfg).map_err(|e| format!("kernel-launch: {e}"))?;
-        }
-
-        let hits = self
-            .stream
-            .clone_dtoh(&self.d_hits)
+        let stream = &self.stream;
+        let slot = &mut self.slots[i];
+        stream
+            .memcpy_dtoh(&slot.hits, &mut slot.hits_host)
             .map_err(|e| format!("dtoh hits: {e}"))?;
-        self.stream
-            .synchronize()
-            .map_err(|e| format!("synchronize: {e}"))?;
-        let n = (hits[0] as usize).min(MAX_HITS);
-        Ok(hits[1..1 + n].to_vec())
+        slot.done.record(stream).map_err(|e| format!("record: {e}"))?;
+        // WDDM (Windows) batches queued work in the driver until something
+        // makes it submit; without this the launch could sit there until the
+        // host waits for the one before it, which is exactly the gap the
+        // queue exists to close. A query flushes, and costs nothing here.
+        let _ = slot.done.is_complete();
+        self.queued.push_back(i);
+        self.next_slot = (i + 1) % QUEUE_DEPTH;
+        Ok(())
+    }
+
+    fn collect(&mut self) -> Result<Scan, String> {
+        let i = self.queued.pop_front().ok_or("no launch in flight")?;
+        let slot = &self.slots[i];
+        slot.done.synchronize().map_err(|e| format!("synchronize: {e}"))?;
+        let busy = slot
+            .start
+            .elapsed_ms(&slot.done)
+            .ok()
+            .filter(|ms| ms.is_finite() && *ms >= 0.0)
+            .map(|ms| Duration::from_secs_f64(f64::from(ms) / 1e3));
+        // The pinned slice's own event is never recorded with a single
+        // stream (cudarc only tracks it in multi-stream mode), so as_slice
+        // does not wait: the synchronize above is what makes this safe.
+        let hits = slot.hits_host.as_slice().map_err(|e| format!("read hits: {e}"))?;
+        let reported = hits[0] as usize;
+        let n = reported.min(MAX_HITS);
+        Ok(Scan { hits: hits[1..1 + n].to_vec(), reported, busy })
+    }
+
+    fn in_flight(&self) -> usize {
+        self.queued.len()
+    }
+
+    fn abandon(&mut self) {
+        let _ = self.stream.synchronize();
+        self.queued.clear();
+        for slot in &mut self.slots {
+            slot.forget();
+        }
     }
 }
 
@@ -525,5 +640,196 @@ mod tests {
             rate / 1e6,
             batch as u64 * rounds as u64
         );
+    }
+
+    /// The hashrate with launches queued two deep, as the GPU worker runs
+    /// them, next to the same launches one at a time - the gap between the
+    /// two is what the host round trip cost.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU - hashrate measurement, run with --nocapture"]
+    fn cuda_hashrate_queued() {
+        let mut backend = CudaBackend::new(0).expect("CUDA-backend");
+        let target = compact_to_target(0x1d00ffff).unwrap();
+        let header76 = [0x42u8; 76];
+        backend.scan_range(PowAlgo::Sha3t, &header76, 0, 1 << 20, &target).unwrap();
+        let batch = 1u32 << 24;
+        let rounds = 16u32;
+        let launch = |r: u32| Launch {
+            algo: PowAlgo::Sha3t,
+            header76: &header76,
+            start: r.wrapping_mul(batch),
+            count: batch,
+            target: &target,
+        };
+        let t0 = std::time::Instant::now();
+        let mut busy = Duration::ZERO;
+        for r in 0..rounds {
+            backend.enqueue(&launch(r)).unwrap();
+            if backend.in_flight() == QUEUE_DEPTH {
+                busy += backend.collect().unwrap().busy.unwrap();
+            }
+        }
+        while backend.in_flight() > 0 {
+            busy += backend.collect().unwrap().busy.unwrap();
+        }
+        let dt = t0.elapsed().as_secs_f64();
+        println!(
+            "{}: {:.2} MH/s queued, device busy {:.1} % of {dt:.2} s",
+            backend.name(),
+            (batch as f64 * rounds as f64) / dt / 1e6,
+            100.0 * busy.as_secs_f64() / dt
+        );
+    }
+
+    /// Launches queued behind each other must each come back with their own
+    /// hits - their own header, range and target - in order, with the slot
+    /// buffers reused round-robin and their copies skipped when unchanged.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU (run inside a --gpus all container)"]
+    fn cuda_queued_launches_keep_their_own_inputs() {
+        let mut backend = CudaBackend::new(0).expect("CUDA-backend");
+        let mut seed = 0x51ab_0bc3_u64;
+        let mut header = || {
+            let mut h = [0u8; 76];
+            for b in h.iter_mut() {
+                *b = xorshift(&mut seed) as u8;
+            }
+            h
+        };
+        let (a, b) = (header(), header());
+        // About 32 and 8 hits per 2^16 nonces.
+        let easy = crate::consensus::target_for_difficulty(1.0 / (1u64 << 21) as f64);
+        let hard = crate::consensus::target_for_difficulty(1.0 / (1u64 << 19) as f64);
+        // Two slots in turn: slot 0 gets a, b, a and slot 1 b, a, a. Copies
+        // over another header, a skipped copy (slot 1's second a) and a
+        // change of target alone.
+        let plan = [
+            (a, easy, 0u32),
+            (b, easy, 5000),
+            (b, easy, 10_000),
+            (a, easy, 15_000),
+            (a, hard, 20_000),
+            (a, hard, 25_000),
+        ];
+        let mut results = Vec::new();
+        for (h, t, start) in &plan {
+            backend
+                .enqueue(&Launch { algo: PowAlgo::Sha3t, header76: h, start: *start, count: 1 << 16, target: t })
+                .unwrap();
+            if backend.in_flight() == QUEUE_DEPTH {
+                results.push(backend.collect().unwrap());
+            }
+        }
+        while backend.in_flight() > 0 {
+            results.push(backend.collect().unwrap());
+        }
+        assert!(backend.collect().is_err(), "nothing left to collect");
+        for ((h, t, start), scan) in plan.iter().zip(&results) {
+            let mut gpu = scan.hits.clone();
+            gpu.sort_unstable();
+            let cpu = cpu_hits(h, *start, 1 << 16, t);
+            assert_eq!(gpu, cpu, "launch at {start}");
+            assert!(!cpu.is_empty() && cpu.len() <= MAX_HITS, "{} hits", cpu.len());
+            assert_eq!(scan.reported, cpu.len());
+            assert!(scan.busy.is_some_and(|d| d > Duration::ZERO), "no device time");
+        }
+    }
+
+    /// Device time per BC3Hash at different launch sizes, interleaved in one
+    /// process so the card's clock drifts the same for all of them. A launch
+    /// ends when its slowest block does; if that tail were costly, short
+    /// launches would come out slower per hash.
+    ///     BC3_WINDOW=16 cargo test --release -- --ignored cuda_bc3hash_launch_sizes --nocapture
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    #[ignore = "needs an NVIDIA GPU - measurement, run with --nocapture"]
+    fn cuda_bc3hash_launch_sizes() {
+        let window = std::env::var("BC3_WINDOW").ok().and_then(|w| w.parse().ok()).unwrap_or(16);
+        let mut backend = CudaBackend::new(0).expect("CUDA-backend");
+        backend.prepare_bc3hash(window).expect("BC3Hash passes the self-test");
+        let wave = backend.launch_granule(PowAlgo::Bc3Hash);
+        let header = [7u8; 76];
+        let target = [0u8; 32];
+        let sizes = [1u32, 2, 4, 8, 16];
+        let mut busy = vec![Duration::ZERO; sizes.len()];
+        let mut launches = vec![0u64; sizes.len()];
+        let mut start = 0u32;
+        for _round in 0..6 {
+            for (i, &waves) in sizes.iter().enumerate() {
+                // Two in flight, as the worker runs them.
+                for _ in 0..3 {
+                    let l = Launch { algo: PowAlgo::Bc3Hash, header76: &header, start, count: waves * wave, target: &target };
+                    start = start.wrapping_add(waves * wave);
+                    backend.enqueue(&l).unwrap();
+                    if backend.in_flight() == QUEUE_DEPTH {
+                        busy[i] += backend.collect().unwrap().busy.unwrap();
+                        launches[i] += 1;
+                    }
+                }
+                while backend.in_flight() > 0 {
+                    busy[i] += backend.collect().unwrap().busy.unwrap();
+                    launches[i] += 1;
+                }
+            }
+        }
+        println!("{} window {window}, wave {wave} nonces:", backend.name());
+        for (i, &waves) in sizes.iter().enumerate() {
+            let total = f64::from(waves * wave) * launches[i] as f64;
+            println!(
+                "  {waves:>2} waves/launch: {:>8.1} ms a launch, {:.3} us a hash ({:.1} kH/s)",
+                busy[i].as_secs_f64() * 1e3 / launches[i] as f64,
+                busy[i].as_secs_f64() * 1e6 / total,
+                total / busy[i].as_secs_f64() / 1e3
+            );
+        }
+    }
+
+    /// The same for BC3Hash, through the window-10 kernel - its header and
+    /// target live in the slots too.
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    #[ignore = "needs an NVIDIA GPU (run inside a --gpus all container)"]
+    fn cuda_bc3hash_queued_launches_match_the_cpu() {
+        let mut backend = CudaBackend::new(0).expect("CUDA-backend");
+        backend.prepare_bc3hash(10).expect("BC3Hash window 10 passes the self-test");
+        let mut header80 = [0u8; 80];
+        header80[..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+        let mut a = header80;
+        a[4] = 0xa1;
+        let mut b = header80;
+        b[4] = 0xb2;
+        let mut eighth: Target = [0xff; 32];
+        eighth[0] = 0x1f;
+        let mut half: Target = [0xff; 32];
+        half[0] = 0x7f;
+        // Two slots in turn: slot 1 gets b twice, the second time with a new
+        // target - the slot's own target buffer, for BC3Hash.
+        let plan = [(a, eighth, 100u32), (b, eighth, 300), (a, eighth, 500), (b, half, 700), (a, half, 100)];
+        let mut results = Vec::new();
+        for (h, t, start) in &plan {
+            let h76: [u8; 76] = h[..76].try_into().unwrap();
+            backend
+                .enqueue(&Launch { algo: PowAlgo::Bc3Hash, header76: &h76, start: *start, count: 96, target: t })
+                .unwrap();
+            if backend.in_flight() == QUEUE_DEPTH {
+                results.push(backend.collect().unwrap());
+            }
+        }
+        while backend.in_flight() > 0 {
+            results.push(backend.collect().unwrap());
+        }
+        for ((h, t, start), scan) in plan.iter().zip(&results) {
+            let mut h = *h;
+            let cpu: Vec<u32> = (*start..*start + 96)
+                .filter(|&n| {
+                    h[76..80].copy_from_slice(&n.to_le_bytes());
+                    hash_meets_target(&bc3hash::bc3hash(&h), t)
+                })
+                .collect();
+            let mut gpu = scan.hits.clone();
+            gpu.sort_unstable();
+            assert_eq!(gpu, cpu, "launch at {start}");
+            assert!(!cpu.is_empty());
+        }
     }
 }

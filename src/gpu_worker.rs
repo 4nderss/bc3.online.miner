@@ -2,13 +2,22 @@
 //! grinding happens on the GPU in batches. Coinbase -> merkle root is built on
 //! the CPU per extranonce2 (cheap), and every GPU hit is verified on the CPU
 //! before submit.
+//!
+//! Launches are queued `QUEUE_DEPTH` deep: the next one waits on the device
+//! behind the one running, and the host re-checks a launch's hits while the
+//! card is already on the next. One at a time, the card sat idle for every
+//! round trip - collect, re-check, queue - and a BC3Hash re-check costs about
+//! a millisecond a hit on the CPU.
 
-use crate::backend::{open_backend_with_fallback, GpuDevice, MiningBackend};
+use crate::backend::{
+    open_backend_with_fallback, GpuDevice, HitBudget, Launch, MiningBackend, Scan,
+};
 use crate::consensus::{
     compact_to_target, hash_meets_target, hash_to_display, root_from_steps, sha256d, BlockHeader,
-    PowAlgo, PowFn,
+    PowAlgo, PowFn, Target,
 };
 use crate::shared::{AlgoGate, FoundShare, GpuCapability, MinerJob, Shared, BC3_SLOT_FAILED};
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,8 +46,12 @@ const TARGET_LAUNCH: Duration = Duration::from_millis(100);
 /// integrated GPU through OpenCL that may manage a few hundred hashes a
 /// second - a 16k start would have been seconds there. From the floor the
 /// autotune doubles its way up, in whole waves of the card (`launch_granule`;
-/// on CUDA the floor is one wave). 400 ms per launch is several waves - what
-/// runs short at the end of a launch is a small part of it.
+/// on CUDA the floor is one wave). Short launches cost more than their launch
+/// overhead: the first waves of every launch run in lockstep and are slower.
+/// Interleaved in one process on an RTX 3050 Ti at window 16, the device time
+/// per hash was 8.42 us at 1 and 2 waves a launch, 8.18 at 4 and 7.95 at 8,
+/// no better at 16 - so 400 ms, which settles at 8 waves there (and on an RTX
+/// 4090), and not shorter for the sake of a faster switch to a new job.
 const BC3_MIN_BATCH: u32 = 1 << 8;
 const BC3_MAX_BATCH: u32 = 1 << 24;
 const BC3_START_BATCH: u32 = 1 << 8;
@@ -52,8 +65,6 @@ fn tuning(algo: PowAlgo) -> (u32, u32, u32, Duration) {
     }
 }
 
-/// `worker_index`/`total_workers` partition the extranonce2 space disjointly
-/// across all workers (CPU threads + GPUs), exactly as in worker.rs.
 /// How long to wait before trying to re-open a device that stopped answering.
 /// A driver reset (TDR) or a hung card usually clears in seconds.
 const REOPEN_DELAY: Duration = Duration::from_secs(5);
@@ -68,6 +79,9 @@ const REOPEN_DELAY: Duration = Duration::from_secs(5);
 /// itself healthy while hashing nothing. That is the exact symptom the reopen
 /// was written to fix, just with a fresh handle each time round.
 const MAX_REOPENS: u32 = 5;
+
+/// How many launches in a row may fail before the device counts as gone.
+const MAX_SCAN_ERRORS: u32 = 5;
 
 /// `slot` is the GPU's place in the detected list (per-device statistics);
 /// `worker_index`/`total_workers` partition the extranonce2 space across all
@@ -92,23 +106,21 @@ pub fn run_gpu_worker(
     };
     crate::human!("[gpu] started: {}", backend.name());
 
-    // What this card can mine, as far as anyone can tell before trying. A
-    // kernel that later fails its self-test withdraws its claim; dropping
-    // this on any exit withdraws them all.
+    // What this card can mine right now. BC3Hash only counts once its kernel
+    // is loaded and has passed its self-test (`prepare_bc3`): until then the
+    // stand-in CPU threads mine it. Claiming it up front left nothing mining
+    // BC3Hash at the fork for as long as the driver took to JIT the kernel -
+    // 10 to 60 s, longer on a slow CPU. Dropping this on any exit withdraws
+    // every claim.
     let mut caps = GpuCapability::new(&shared);
     for algo in PowAlgo::ALL {
-        caps.set(algo, backend.has_kernel(algo) && crate::worker::cpu_may_support(algo));
+        caps.set(algo, backend.supports(algo) && crate::worker::cpu_may_support(algo));
     }
     // The BC3Hash window that last failed here, so it is not retried on
     // every job; a different window still gets its chance.
     let mut bc3_failed: Option<u32> = None;
 
-    let mut batch: [u32; 3] = PowAlgo::ALL.map(|a| tuning(a).2);
-    // Position in the search space, carried across jobs that cover the same
-    // space. See MinerJob::same_search_space.
-    let mut prev: Option<MinerJob> = None;
-    let mut en2 = worker_index as u64;
-    let mut nonce: u32 = 0;
+    let mut w = Worker::new(&shared, slot, worker_index, total_workers);
     let mut reopens: u32 = 0;
     let mut gate = AlgoGate::default();
     // Generation of a job this worker sat out; wait for the next one instead
@@ -130,66 +142,497 @@ pub fn run_gpu_worker(
             .check(job.algo, Some(backend.name().as_str()), supported)
             .and_then(|a| Some((a, a.hash_fn()?)))
         else {
-            // BC3Hash since the fork: in --backend auto the CPU threads take
-            // it over, and this worker sleeps until SHA3-256t comes back.
+            // BC3Hash on a card whose kernel is not usable: in --backend
+            // auto the CPU threads take it over, and this worker sleeps
+            // until a job it can do.
             sat_out = Some(generation);
             continue;
         };
-        if prev.as_ref().is_none_or(|p| !p.same_search_space(&job)) {
-            en2 = worker_index as u64;
-            nonce = 0;
+        let end = w.mine_job(&mut *backend, &job, generation, algo, verify);
+        // Launches came back, so the card works again and the reopen budget is
+        // spent, not consumed. A job change alone proves nothing: a card that
+        // fails every launch still sees jobs come and go.
+        if std::mem::take(&mut w.collected) > 0 {
+            reopens = 0;
         }
-        let alive = mine_job(
-            &shared, &job, algo, verify, generation, slot, total_workers, &mut backend,
-            &mut batch[algo.index()], &mut en2, &mut nonce,
-        );
-        if !alive {
-            // The device stopped answering. Re-open it - after a driver reset
-            // the old context is dead for good, and every later launch on it
-            // fails the same way. The old loop slept and retried on that dead
-            // handle for ever: no hashrate, no exit, and nothing in the logs
-            // after the first few lines.
-            reopens += 1;
-            if reopens > MAX_REOPENS {
+        match end {
+            JobEnd::Changed => {}
+            JobEnd::Exhausted => {
                 eprintln!(
-                    "[gpu] {} has failed {reopens} times after reopening - giving up on it. \
-                     The card or its driver needs attention.",
-                    device.describe()
+                    "[gpu] {}: searched all {}-byte extranonce2 values of this job - idle \
+                     until the next one",
+                    backend.name(),
+                    job.extranonce2_size
                 );
-                return;
+                sat_out = Some(generation);
             }
-            eprintln!(
-                "[gpu] {} stopped answering - reopening in {} s ({reopens}/{MAX_REOPENS})",
-                device.describe(),
-                REOPEN_DELAY.as_secs()
-            );
-            std::thread::sleep(REOPEN_DELAY);
-            match open_backend_with_fallback(&device) {
-                Ok(b) => {
-                    backend = b;
-                    crate::human!("[gpu] reopened: {}", backend.name());
-                    // A fresh context loads its BC3Hash kernel afresh.
-                    bc3_failed = None;
-                    shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
-                }
-                Err(e) => {
+            JobEnd::DeviceGone => {
+                // The device stopped answering. Re-open it - after a driver
+                // reset the old context is dead for good, and every later
+                // launch on it fails the same way. The old loop slept and
+                // retried on that dead handle for ever: no hashrate, no exit,
+                // and nothing in the logs after the first few lines.
+                reopens += 1;
+                if reopens > MAX_REOPENS {
                     eprintln!(
-                        "[gpu] {} could not be reopened: {e} - this worker stops",
+                        "[gpu] {} has failed {reopens} times after reopening - giving up on it. \
+                         The card or its driver needs attention.",
                         device.describe()
                     );
                     return;
                 }
+                eprintln!(
+                    "[gpu] {} stopped answering - reopening in {} s ({reopens}/{MAX_REOPENS})",
+                    device.describe(),
+                    REOPEN_DELAY.as_secs()
+                );
+                // Its kernels went with the context; the CPU stands in until
+                // the new one has passed its self-test again.
+                caps.set(PowAlgo::Bc3Hash, false);
+                std::thread::sleep(REOPEN_DELAY);
+                // The old backend goes first. CUDA hands every opener the
+                // device's primary context, and only resets it when the last
+                // reference goes: opened while the old one still held it, the
+                // "new" backend got the same broken context back - a TDR
+                // loop the reopen could never leave.
+                drop(std::mem::replace(&mut backend, Box::new(Closed)));
+                match open_backend_with_fallback(&device) {
+                    Ok(b) => {
+                        backend = b;
+                        crate::human!("[gpu] reopened: {}", backend.name());
+                        // A fresh context loads its BC3Hash kernel afresh.
+                        bc3_failed = None;
+                        shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[gpu] {} could not be reopened: {e} - this worker stops",
+                            device.describe()
+                        );
+                        return;
+                    }
+                }
+                // A new context means a new search space position is fine, and
+                // the job may well have moved on while we waited.
+                w.prev = None;
             }
-            // A new context means a new search space position is fine, and the
-            // job may well have moved on while we waited.
-            prev = None;
-            continue;
         }
-        // `mine_job` returning true means at least one scan came back, so the
-        // card is working again and the budget above is spent, not consumed.
-        reopens = 0;
-        prev = Some(job);
     }
+}
+
+/// How a job ended for this worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobEnd {
+    /// A new job, or the same one again after a capability change.
+    Changed,
+    /// Every extranonce2 the job's size allows has been searched.
+    Exhausted,
+    /// The device stopped answering; the caller must re-open it.
+    DeviceGone,
+}
+
+/// Where the next launch starts in this worker's part of the search space:
+/// the extranonce2 counter (this worker's index, then every
+/// `total_workers`-th) and the nonce within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    en2: u64,
+    nonce: u32,
+}
+
+impl Cursor {
+    /// The next launch of at most `max` nonces (`max` > 0): (extranonce2
+    /// counter, first nonce, count). Moves past it - to the next
+    /// extranonce2 of this worker when the nonce space runs out. A launch
+    /// never crosses the end of the nonce space: the kernel's nonces wrap,
+    /// but the header's extranonce2 cannot change in the middle of one.
+    fn take(&mut self, max: u32, stride: u64) -> (u64, u32, u32) {
+        let left = (1u64 << 32) - u64::from(self.nonce);
+        let count = u64::from(max.max(1)).min(left) as u32;
+        let taken = (self.en2, self.nonce, count);
+        let (next, wrapped) = self.nonce.overflowing_add(count);
+        if wrapped {
+            self.en2 = self.en2.saturating_add(stride);
+            self.nonce = 0;
+        } else {
+            self.nonce = next;
+        }
+        taken
+    }
+}
+
+/// Does extranonce2 counter `en2` fit the job's extranonce2 size? Past that
+/// the encoding wraps onto values already searched - by this worker or by
+/// another one - and every share found there is a duplicate. A pool that asks
+/// for one byte hands out 256 values, which a fast card on a long job can run
+/// through.
+pub fn en2_fits(en2: u64, size: usize) -> bool {
+    size >= 8 || en2 < 1u64 << (8 * size)
+}
+
+/// A launch in flight, with what its hits need to become shares.
+struct InFlight {
+    en2: u64,
+    extranonce2: Vec<u8>,
+    /// The header with nonce 0.
+    header: BlockHeader,
+    start: u32,
+    count: u32,
+    queued: Instant,
+}
+
+/// One GPU's state across jobs.
+struct Worker<'a> {
+    shared: &'a Shared,
+    slot: usize,
+    worker_index: usize,
+    stride: u64,
+    /// The job last mined, and where it stopped: a job that covers the same
+    /// space continues there. See MinerJob::same_search_space.
+    prev: Option<MinerJob>,
+    cursor: Cursor,
+    /// Autotuned nonces per launch, per PoW.
+    batch: [u32; 3],
+    /// Hit-buffer guard per PoW - their hit rates differ by a factor of 1000.
+    budget: [HitBudget; 3],
+    errors: u32,
+    /// Launches that came back since the caller last looked.
+    collected: u64,
+    /// When the last launch came back, for timing launches by the host
+    /// clock where the device has none.
+    last_collect: Option<Instant>,
+}
+
+/// The header of one extranonce2, built once and used by all its launches.
+struct En2Header {
+    en2: u64,
+    extranonce2: Vec<u8>,
+    header: BlockHeader,
+    header76: [u8; 76],
+}
+
+fn en2_header(job: &MinerJob, en2: u64) -> En2Header {
+    let extranonce2 = crate::worker::encode_extranonce2(en2, job.extranonce2_size);
+    // Coinbase -> txid -> merkle root (once per extranonce2).
+    let mut coinbase = Vec::with_capacity(
+        job.coinb1.len() + job.extranonce1.len() + extranonce2.len() + job.coinb2.len(),
+    );
+    coinbase.extend_from_slice(&job.coinb1);
+    coinbase.extend_from_slice(&job.extranonce1);
+    coinbase.extend_from_slice(&extranonce2);
+    coinbase.extend_from_slice(&job.coinb2);
+    let merkle_root = root_from_steps(&sha256d(&coinbase), &job.merkle_steps);
+    let header = BlockHeader {
+        version: job.version,
+        prev_hash: job.prev_hash,
+        merkle_root,
+        time: job.ntime,
+        bits: job.bits,
+        nonce: 0,
+    };
+    let header76 = header.serialize()[..76].try_into().unwrap();
+    En2Header { en2, extranonce2, header, header76 }
+}
+
+/// One job on this GPU, while it runs.
+struct JobRun<'j> {
+    job: &'j MinerJob,
+    generation: u64,
+    algo: PowAlgo,
+    verify: PowFn,
+    block_target: Option<Target>,
+    depth: usize,
+    granule: u32,
+    min_batch: u32,
+    max_batch: u32,
+    target_launch: Duration,
+    inflight: VecDeque<InFlight>,
+    /// Set once no more launches may be queued for the job.
+    ending: Option<JobEnd>,
+    header: Option<En2Header>,
+}
+
+impl<'a> Worker<'a> {
+    fn new(shared: &'a Shared, slot: usize, worker_index: usize, total_workers: usize) -> Self {
+        Self {
+            shared,
+            slot,
+            worker_index,
+            stride: total_workers.max(1) as u64,
+            prev: None,
+            cursor: Cursor { en2: worker_index as u64, nonce: 0 },
+            batch: PowAlgo::ALL.map(|a| tuning(a).2),
+            budget: Default::default(),
+            errors: 0,
+            collected: 0,
+            last_collect: None,
+        }
+    }
+
+    /// Grind `job` until it changes, its extranonce2 space runs out, or the
+    /// device fails. Whatever is in flight when the job changes is collected
+    /// and its hits submitted before this returns.
+    fn mine_job(
+        &mut self,
+        backend: &mut dyn MiningBackend,
+        job: &MinerJob,
+        generation: u64,
+        algo: PowAlgo,
+        // The CPU reference for `algo`, resolved once per job.
+        verify: PowFn,
+    ) -> JobEnd {
+        if self.prev.as_ref().is_none_or(|p| !p.same_search_space(job)) {
+            self.cursor = Cursor { en2: self.worker_index as u64, nonce: 0 };
+        }
+        let (min_batch, max_batch, _, target_launch) = tuning(algo);
+        // Whole waves of the card only (see `launch_granule`); the autotune
+        // below keeps doubling and halving within them.
+        let granule = backend.launch_granule(algo).max(1);
+        let min_batch = (min_batch.max(granule) / granule) * granule;
+        let max_batch = max_batch.max(min_batch);
+        let b = &mut self.batch[algo.index()];
+        *b = ((*b).clamp(min_batch, max_batch) / granule).max(1) * granule;
+        let mut run = JobRun {
+            job,
+            generation,
+            algo,
+            verify,
+            block_target: compact_to_target(job.bits),
+            depth: self.shared.gpu_queue(),
+            granule,
+            min_batch,
+            max_batch,
+            target_launch,
+            inflight: VecDeque::new(),
+            ending: None,
+            header: None,
+        };
+        let end = self.pump(backend, &mut run);
+        self.prev = Some(job.clone());
+        end
+    }
+
+    /// The launch loop of one job.
+    fn pump(&mut self, backend: &mut dyn MiningBackend, run: &mut JobRun) -> JobEnd {
+        loop {
+            if let Err(gone) = self.top_up(backend, run) {
+                return gone;
+            }
+            let Some(done) = run.inflight.pop_front() else {
+                return run.ending.unwrap_or(JobEnd::Changed);
+            };
+            let scan = match backend.collect() {
+                Ok(scan) => scan,
+                Err(e) => {
+                    let restart = Cursor { en2: done.en2, nonce: done.start };
+                    if let Err(gone) = self.device_error(backend, run, &e, restart) {
+                        return gone;
+                    }
+                    continue;
+                }
+            };
+            self.errors = 0;
+            // The next launch goes in behind the running one before the CPU
+            // spends any time on this one's hits.
+            if run.depth > 1 {
+                if let Err(gone) = self.top_up(backend, run) {
+                    return gone;
+                }
+            }
+            let elapsed = self.finish(run, done, scan);
+            // Intensity < 100 % -> idle proportionally (keeps heat down and
+            // the machine usable while mining).
+            self.shared.throttle(elapsed);
+        }
+    }
+
+    /// Queue launches until `run.depth` are in flight, unless the job is
+    /// over. Err only when the device is gone.
+    fn top_up(&mut self, backend: &mut dyn MiningBackend, run: &mut JobRun) -> Result<(), JobEnd> {
+        while run.ending.is_none() && run.inflight.len() < run.depth {
+            if self.shared.generation.load(Ordering::Acquire) != run.generation {
+                run.ending = Some(JobEnd::Changed);
+                break;
+            }
+            if !en2_fits(self.cursor.en2, run.job.extranonce2_size) {
+                run.ending = Some(JobEnd::Exhausted);
+                break;
+            }
+            let max = self.budget[run.algo.index()].chunk(self.batch[run.algo.index()]).max(1);
+            let restart = self.cursor;
+            let (en2, start, count) = self.cursor.take(max, self.stride);
+            if run.header.as_ref().is_none_or(|h| h.en2 != en2) {
+                run.header = Some(en2_header(run.job, en2));
+            }
+            let h = run.header.as_ref().expect("built above");
+            let launch = Launch {
+                algo: run.algo,
+                header76: &h.header76,
+                start,
+                count,
+                target: &run.job.share_target,
+            };
+            match backend.enqueue(&launch) {
+                Ok(()) => run.inflight.push_back(InFlight {
+                    en2,
+                    extranonce2: h.extranonce2.clone(),
+                    header: h.header,
+                    start,
+                    count,
+                    queued: Instant::now(),
+                }),
+                Err(e) => {
+                    // The oldest launch not done is where to start again.
+                    let restart = run
+                        .inflight
+                        .front()
+                        .map(|l| Cursor { en2: l.en2, nonce: l.start })
+                        .unwrap_or(restart);
+                    self.device_error(backend, run, &e, restart)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A launch failed to queue or to come back. Everything in flight is
+    /// given up and done again from `restart`, so no range is skipped - and
+    /// since none of it was collected, none of it was submitted either. Err
+    /// once the device counts as gone.
+    fn device_error(
+        &mut self,
+        backend: &mut dyn MiningBackend,
+        run: &mut JobRun,
+        e: &str,
+        restart: Cursor,
+    ) -> Result<(), JobEnd> {
+        self.errors += 1;
+        eprintln!("[gpu] {}: scan error: {e}", backend.name());
+        backend.abandon();
+        run.inflight.clear();
+        self.cursor = restart;
+        self.last_collect = None;
+        if self.errors >= MAX_SCAN_ERRORS {
+            eprintln!(
+                "[gpu] {}: {} launches in a row failed - treating the device as gone",
+                backend.name(),
+                self.errors
+            );
+            self.errors = 0;
+            return Err(JobEnd::DeviceGone);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        Ok(())
+    }
+
+    /// Everything a launch that came back is owed: its hits re-checked and
+    /// submitted, the counters, the launch size. Returns how long it ran.
+    fn finish(&mut self, run: &JobRun, done: InFlight, scan: Scan) -> Duration {
+        let now = Instant::now();
+        // The device's own clock where it has one. Otherwise the host's: from
+        // when the launch could start - queued, and the one before it back -
+        // to now.
+        let host = now.duration_since(self.last_collect.map_or(done.queued, |t| t.max(done.queued)));
+        let elapsed = scan.busy.unwrap_or(host);
+        self.last_collect = Some(now);
+        self.collected += 1;
+
+        if let Some(warning) = self.budget[run.algo.index()].overflowed(done.count, scan.reported) {
+            eprintln!("{warning}");
+        }
+        // Verify every hit on the CPU before submit - guards against kernel
+        // bugs. A nonce reported twice would be a duplicate share.
+        let mut hits = scan.hits;
+        hits.sort_unstable();
+        hits.dedup();
+        let mut header = done.header;
+        for &nonce in &hits {
+            // A nonce outside the launch's range is a kernel bug, whatever
+            // the hash says: it would be a share for some other launch.
+            if nonce.wrapping_sub(done.start) >= done.count {
+                eprintln!("[gpu] WARNING: the kernel reported nonce {nonce:08x} outside its range - ignored");
+                continue;
+            }
+            header.nonce = nonce;
+            let hash = (run.verify)(&header.serialize());
+            if !hash_meets_target(&hash, &run.job.share_target) {
+                eprintln!("[gpu] WARNING: false hit from the kernel, nonce={nonce:08x} - ignored");
+                continue;
+            }
+            let is_block = run.block_target.is_some_and(|t| hash_meets_target(&hash, &t));
+            self.shared.record_share(crate::consensus::difficulty_of_hash(&hash), is_block);
+            self.shared.submit(FoundShare {
+                job_id: run.job.job_id.clone(),
+                extranonce2: done.extranonce2.clone(),
+                ntime: run.job.ntime,
+                nonce,
+                hash_display: hash_to_display(&hash),
+                is_block_candidate: is_block,
+            });
+        }
+
+        let s = self.shared;
+        s.stats.hashes.fetch_add(u64::from(done.count), Ordering::Relaxed);
+        s.stats.gpu_hashes.fetch_add(u64::from(done.count), Ordering::Relaxed);
+        if let (Some(hashes), Some(stamp), Some(busy)) = (
+            s.gpu_slot_hashes.get(self.slot),
+            s.gpu_slot_stamp.get(self.slot),
+            s.gpu_slot_busy_us.get(self.slot),
+        ) {
+            // Stamp and busy time first: a reader that sees the new count
+            // also sees a stamp and a busy total no older than it.
+            stamp.store(s.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            if let Some(b) = scan.busy {
+                busy.fetch_add(b.as_micros() as u64, Ordering::Relaxed);
+            }
+            hashes.fetch_add(u64::from(done.count), Ordering::Release);
+        }
+
+        // Autotune toward the PoW's target time per launch, in whole waves.
+        // Judged by what a full-size launch would take, so the short launch at
+        // the end of an extranonce2 does not look like a fast card.
+        let batch = &mut self.batch[run.algo.index()];
+        let projected = elapsed.mul_f64(f64::from(*batch) / f64::from(done.count.max(1)));
+        *batch = autotune(*batch, projected, run.target_launch, run.granule, run.min_batch, run.max_batch);
+        elapsed
+    }
+}
+
+/// The next batch size: double below half the target time, halve above two
+/// and a half times it, in whole multiples of `granule`, within [min, max].
+fn autotune(batch: u32, took: Duration, target: Duration, granule: u32, min: u32, max: u32) -> u32 {
+    let granule = granule.max(1);
+    let next = if took < target / 2 && batch < max {
+        batch.saturating_mul(2).min(max)
+    } else if took > target * 5 / 2 && batch > min {
+        (batch / 2).max(min)
+    } else {
+        batch
+    };
+    ((next / granule).max(1) * granule).clamp(min.min(max), max)
+}
+
+/// The backend a worker holds for the moment between dropping a failed one
+/// and opening its replacement.
+struct Closed;
+
+impl MiningBackend for Closed {
+    fn name(&self) -> String {
+        "closed".into()
+    }
+    fn supports(&self, _: PowAlgo) -> bool {
+        false
+    }
+    fn enqueue(&mut self, _: &Launch) -> Result<(), String> {
+        Err("the device is closed".into())
+    }
+    fn collect(&mut self) -> Result<Scan, String> {
+        Err("the device is closed".into())
+    }
+    fn in_flight(&self) -> usize {
+        0
+    }
+    fn abandon(&mut self) {}
 }
 
 /// Have the card's BC3Hash kernel at the window `Shared::bc3_window` asks for,
@@ -216,6 +659,8 @@ fn prepare_bc3(
         return;
     }
     shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
+    // Not ready until the new kernel has passed: the CPU stands in meanwhile.
+    caps.set(PowAlgo::Bc3Hash, false);
     // The self-test needs the CPU reference; so does every hit later. A CPU
     // build that failed its own vectors leaves the GPU nothing to check
     // against.
@@ -248,167 +693,346 @@ fn prepare_bc3(
                 state: crate::ipc::StatusState::Error,
                 message,
             });
-            caps.set(PowAlgo::Bc3Hash, false);
         }
     }
 }
 
-/// How many launches in a row may fail before the device counts as gone.
-const MAX_SCAN_ERRORS: u32 = 5;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::QUEUE_DEPTH;
+    use crate::shared::{MiningPlan, SUBMIT_QUEUE};
+    use std::collections::HashSet;
 
-/// Grind until the job changes. `false` = the device stopped answering and the
-/// caller must re-open it; `true` = ordinary job change.
-#[allow(clippy::too_many_arguments)]
-fn mine_job(
-    shared: &Shared,
-    job: &MinerJob,
-    algo: PowAlgo,
-    // The CPU reference for `algo`, resolved once per job.
-    verify: PowFn,
-    generation: u64,
-    slot: usize,
-    total_workers: usize,
-    backend: &mut Box<dyn MiningBackend>,
-    batch: &mut u32,
-    en2_counter: &mut u64,
-    nonce_start: &mut u32,
-) -> bool {
-    let block_target = compact_to_target(job.bits);
-    let (min_batch, max_batch, _, target_launch) = tuning(algo);
-    // Whole waves of the card only (see `launch_granule`); the autotune below
-    // keeps doubling and halving within them.
-    let granule = backend.launch_granule(algo).max(1);
-    let min_batch = min_batch.max(granule) / granule * granule;
-    *batch = ((*batch).clamp(min_batch, max_batch.max(min_batch)) / granule).max(1) * granule;
-    // Starting point comes from the caller so it can survive a job that
-    // covers the same space.
-    loop {
-        let extranonce2 =
-            crate::worker::encode_extranonce2(*en2_counter, job.extranonce2_size);
-
-        // Coinbase -> txid -> merkle root (once per extranonce2).
-        let mut coinbase = Vec::with_capacity(
-            job.coinb1.len() + job.extranonce1.len() + extranonce2.len() + job.coinb2.len(),
-        );
-        coinbase.extend_from_slice(&job.coinb1);
-        coinbase.extend_from_slice(&job.extranonce1);
-        coinbase.extend_from_slice(&extranonce2);
-        coinbase.extend_from_slice(&job.coinb2);
-        let cb_txid = sha256d(&coinbase);
-        let merkle_root = root_from_steps(&cb_txid, &job.merkle_steps);
-
-        let mut header = BlockHeader {
-            version: job.version,
-            prev_hash: job.prev_hash,
-            merkle_root,
-            time: job.ntime,
-            bits: job.bits,
-            nonce: 0,
-        };
-        let header76: [u8; 76] = header.serialize()[..76].try_into().unwrap();
-
-        // Grind the whole nonce space in batches.
-        let mut start: u32 = *nonce_start;
-        let mut errors = 0u32;
-        loop {
-            let remaining = (u32::MAX - start).saturating_add(1).max(1);
-            let count = (*batch).min(remaining);
-
-            let t0 = Instant::now();
-            let hits = match backend.scan_range(algo, &header76, start, count, &job.share_target) {
-                Ok(h) => h,
-                Err(e) => {
-                    errors += 1;
-                    eprintln!("[gpu] {}: scan error: {e}", backend.name());
-                    if errors >= MAX_SCAN_ERRORS {
-                        eprintln!(
-                            "[gpu] {}: {errors} launches in a row failed - treating the device as gone",
-                            backend.name()
-                        );
-                        return false;
-                    }
-                    std::thread::sleep(Duration::from_secs(1));
-                    continue;
-                }
-            };
-            let elapsed = t0.elapsed();
-            errors = 0;
-
-            // Verify every hit on the CPU before submit - guards against
-            // kernel bugs.
-            for nonce in hits {
-                header.nonce = nonce;
-                let hash = verify(&header.serialize());
-                if !hash_meets_target(&hash, &job.share_target) {
-                    eprintln!(
-                        "[gpu] WARNING: {} reported a false hit, nonce={nonce:08x} - ignored",
-                        backend.name()
-                    );
-                    continue;
-                }
-                let is_block = block_target
-                    .map(|t| hash_meets_target(&hash, &t))
-                    .unwrap_or(false);
-                shared.record_share(crate::consensus::difficulty_of_hash(&hash), is_block);
-                shared.submit(FoundShare {
-                    job_id: job.job_id.clone(),
-                    extranonce2: extranonce2.clone(),
-                    ntime: job.ntime,
-                    nonce,
-                    hash_display: hash_to_display(&hash),
-                    is_block_candidate: is_block,
-                });
-            }
-
-            shared.stats.hashes.fetch_add(count as u64, Ordering::Relaxed);
-            shared.stats.gpu_hashes.fetch_add(count as u64, Ordering::Relaxed);
-            if let (Some(hashes), Some(stamp)) =
-                (shared.gpu_slot_hashes.get(slot), shared.gpu_slot_stamp.get(slot))
-            {
-                // Stamp first: a reader that sees the new count also sees a
-                // stamp no older than it.
-                stamp.store(shared.started.elapsed().as_micros() as u64, Ordering::Relaxed);
-                hashes.fetch_add(count as u64, Ordering::Release);
-            }
-
-            // Intensity < 100 % -> idle proportionally (keeps heat down and
-            // the machine usable while mining).
-            shared.throttle(elapsed);
-
-            // Simple autotune towards the PoW's target time per launch, in
-            // whole waves.
-            if elapsed < target_launch / 2 && *batch < max_batch {
-                *batch = (*batch * 2).min(max_batch.max(granule)) / granule * granule;
-            } else if elapsed > target_launch * 5 / 2 && *batch > min_batch {
-                *batch = ((*batch / 2).max(min_batch) / granule).max(1) * granule;
-            }
-
-            // Where the batch we just finished ends - not where it began.
-            // Saving `start` re-hashed the whole batch on the next job, up to
-            // 2^29 nonces, and the shares found in it came back as duplicates.
-            // That is the very waste this bookkeeping exists to avoid.
-            let (next, wrapped) = start.overflowing_add(count);
-
-            if shared.generation.load(Ordering::Acquire) != generation {
-                // Remember where we stopped: if the next job covers the same
-                // space we continue here instead of re-hashing it.
-                let (e, n) = crate::worker::resume_point(
-                    *en2_counter,
-                    next,
-                    wrapped,
-                    total_workers as u64,
-                );
-                *en2_counter = e;
-                *nonce_start = n;
-                return true;
-            }
-            if wrapped {
-                break; // nonce space exhausted for this extranonce2
-            }
-            start = next;
+    /// Launches taken from a cursor tile this worker's space exactly: no
+    /// nonce twice, none skipped, never across the end of a nonce space, and
+    /// on to the worker's next extranonce2 after it.
+    #[test]
+    fn launches_tile_the_space_without_gaps_or_overlap() {
+        let stride = 3;
+        let mut c = Cursor { en2: 1, nonce: u32::MAX - 1000 };
+        let mut covered: Vec<(u64, u64, u64)> = Vec::new();
+        for max in [300u32, 300, 300, 300, 300, 7, 1 << 20, 1] {
+            let (en2, start, count) = c.take(max, stride);
+            assert!(count >= 1 && count <= max);
+            assert!(u64::from(start) + u64::from(count) <= 1 << 32, "crossed the end");
+            covered.push((en2, u64::from(start), u64::from(count)));
         }
-        // Done with this extranonce2 - next one, from the top of its nonces.
-        *en2_counter += total_workers as u64;
-        *nonce_start = 0;
+        // 1001 nonces left in en2 1: 300, 300, 300, 101 - then en2 4.
+        assert_eq!(covered[3], (1, u64::from(u32::MAX - 100), 101));
+        assert_eq!(covered[4], (4, 0, 300));
+        assert_eq!(covered[5], (4, 300, 7));
+        assert_eq!(covered[6], (4, 307, 1 << 20));
+        assert_eq!(covered[7], (4, 307 + (1 << 20), 1));
+        for pair in covered.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a.0 == b.0 {
+                assert_eq!(a.1 + a.2, b.1, "gap or overlap within an extranonce2");
+            } else {
+                assert_eq!(a.1 + a.2, 1 << 32, "left an extranonce2 before its end");
+                assert_eq!((b.0 - a.0, b.1), (stride, 0));
+            }
+        }
+    }
+
+    /// A launch that ends exactly at 2^32 moves the cursor on, and a full
+    /// 2^32 space in one launch is impossible (counts are u32) but a cursor
+    /// at 0 with a huge max takes what fits.
+    #[test]
+    fn the_cursor_wraps_exactly_at_the_end() {
+        let mut c = Cursor { en2: 5, nonce: u32::MAX };
+        assert_eq!(c.take(10, 2), (5, u32::MAX, 1));
+        assert_eq!(c, Cursor { en2: 7, nonce: 0 });
+        let mut c = Cursor { en2: 0, nonce: 0 };
+        assert_eq!(c.take(u32::MAX, 1), (0, 0, u32::MAX));
+        assert_eq!(c.take(u32::MAX, 1), (0, u32::MAX, 1));
+        assert_eq!(c, Cursor { en2: 1, nonce: 0 });
+        // max 0 is treated as 1 rather than a launch of nothing.
+        let mut c = Cursor { en2: 0, nonce: 9 };
+        assert_eq!(c.take(0, 1), (0, 9, 1));
+    }
+
+    /// The extranonce2 counter must stay inside what its encoding can hold.
+    #[test]
+    fn extranonce2_counters_fit_their_size() {
+        assert!(en2_fits(255, 1));
+        assert!(!en2_fits(256, 1));
+        assert!(en2_fits(65_535, 2));
+        assert!(!en2_fits(65_536, 2));
+        assert!(en2_fits(u64::MAX, 8));
+        assert!(en2_fits(u64::MAX, 16));
+        // What the encoding does past the limit: it wraps - the reason for
+        // the check.
+        assert_eq!(
+            crate::worker::encode_extranonce2(256, 1),
+            crate::worker::encode_extranonce2(0, 1)
+        );
+    }
+
+    /// The autotune doubles towards the target, halves well above it, stays
+    /// in whole granules and inside its limits.
+    #[test]
+    fn the_autotune_moves_in_whole_granules() {
+        let t = BC3_TARGET_LAUNCH;
+        let ms = Duration::from_millis;
+        // An RTX 3050 Ti at window 16: one wave of 5120 is 44 ms, and the
+        // autotune settles at eight.
+        assert_eq!(autotune(5120, ms(44), t, 5120, 5120, 1 << 24), 10_240);
+        assert_eq!(autotune(20_480, ms(178), t, 5120, 5120, 1 << 24), 40_960);
+        assert_eq!(autotune(40_960, ms(356), t, 5120, 5120, 1 << 24), 40_960);
+        assert_eq!(autotune(40_960, ms(1100), t, 5120, 5120, 1 << 24), 20_480);
+        // Never below one granule, never past the ceiling.
+        assert_eq!(autotune(5120, ms(5000), t, 5120, 5120, 1 << 24), 5120);
+        assert_eq!(autotune(1 << 24, ms(1), t, 32_768, 32_768, 1 << 24), 1 << 24);
+        // A granule that does not divide the ceiling.
+        assert_eq!(autotune(3 * 1000, ms(1), t, 1000, 1000, 5500), 5000);
+    }
+
+    /// A scripted backend: every launch "finds" the nonces at `hits_at`
+    /// (offsets into the launch) and took 50 ms of device time. It records
+    /// what was queued, can fail one collect, and moves the job on (bumps
+    /// the generation, as a new job from the pool would) after `bump_after`
+    /// collects.
+    struct Scripted<'a> {
+        queue: VecDeque<(u32, u32)>,
+        log: Vec<(u32, u32)>,
+        hits_at: Vec<u32>,
+        fail_collect_at: Option<usize>,
+        bump_after: (usize, &'a Shared),
+        collects: usize,
+    }
+
+    impl<'a> Scripted<'a> {
+        fn new(shared: &'a Shared, hits_at: Vec<u32>, fail_collect_at: Option<usize>, bump_after: usize) -> Self {
+            Self {
+                queue: VecDeque::new(),
+                log: vec![],
+                hits_at,
+                fail_collect_at,
+                bump_after: (bump_after, shared),
+                collects: 0,
+            }
+        }
+    }
+
+    impl MiningBackend for Scripted<'_> {
+        fn name(&self) -> String {
+            "scripted".into()
+        }
+        fn supports(&self, algo: PowAlgo) -> bool {
+            algo == PowAlgo::Sha3t
+        }
+        fn enqueue(&mut self, l: &Launch) -> Result<(), String> {
+            assert!(self.queue.len() < QUEUE_DEPTH, "more than QUEUE_DEPTH in flight");
+            self.queue.push_back((l.start, l.count));
+            self.log.push((l.start, l.count));
+            Ok(())
+        }
+        fn collect(&mut self) -> Result<Scan, String> {
+            self.collects += 1;
+            if self.collects == self.bump_after.0 {
+                self.bump_after.1.generation.fetch_add(1, Ordering::Release);
+            }
+            let (start, count) = self.queue.pop_front().ok_or("empty")?;
+            if self.fail_collect_at == Some(self.collects) {
+                return Err("scripted failure".into());
+            }
+            let hits: Vec<u32> = self.hits_at.iter().filter(|&&o| o < count).map(|o| start + o).collect();
+            Ok(Scan { reported: hits.len(), hits, busy: Some(Duration::from_millis(50)) })
+        }
+        fn in_flight(&self) -> usize {
+            self.queue.len()
+        }
+        fn abandon(&mut self) {
+            self.queue.clear();
+        }
+    }
+
+    fn job(target: Target) -> MinerJob {
+        MinerJob {
+            job_id: "j".into(),
+            extranonce1: vec![1, 2, 3, 4],
+            extranonce2_size: 4,
+            coinb1: vec![9; 50],
+            coinb2: vec![8; 20],
+            merkle_steps: vec![],
+            version: 0x2000_1000,
+            prev_hash: [6u8; 32],
+            bits: 0x1d00_ffff,
+            ntime: 1_700_000_000,
+            share_target: target,
+            height: None,
+            algo: PowAlgo::Sha3t,
+        }
+    }
+
+    fn shared_with_job(j: &MinerJob) -> (Shared, std::sync::mpsc::Receiver<FoundShare>, u64) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let shared = Shared::new(tx, MiningPlan { gpus: 1, ..Default::default() });
+        shared.publish_job(j.clone());
+        let (generation, _) = shared.wait_for_job();
+        (shared, rx, generation)
+    }
+
+    /// The pipeline end to end on a scripted device: launches queue two deep
+    /// and tile the space, hits are re-checked and submitted, and a job
+    /// change stops the queueing, drains what is in flight and leaves the
+    /// cursor just past it.
+    #[test]
+    fn the_pipeline_queues_ahead_and_drains_on_a_job_change() {
+        // Every hash meets an all-ones target, so each reported hit is real.
+        let j = job([0xff; 32]);
+        let (shared, rx, generation) = shared_with_job(&j);
+        let mut backend = Scripted::new(&shared, vec![0, 3], None, 5);
+        let mut w = Worker::new(&shared, 0, 0, 1);
+        let verify = PowAlgo::Sha3t.hash_fn().unwrap();
+        assert_eq!(w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, verify), JobEnd::Changed);
+        assert_eq!(backend.queue.len(), 0, "everything in flight was collected");
+        // Five collects, then the job changed: the sixth launch was already
+        // queued behind the fifth and is the last.
+        assert_eq!(backend.log.len(), 6);
+        let mut next = 0u32;
+        for &(start, count) in &backend.log {
+            assert_eq!(start, next, "launches must be contiguous");
+            next = start + count;
+        }
+        assert_eq!(w.cursor, Cursor { en2: 0, nonce: next });
+        let shares: Vec<FoundShare> = rx.try_iter().collect();
+        assert_eq!(shares.len(), 2 * backend.log.len());
+        let unique: HashSet<u32> = shares.iter().map(|s| s.nonce).collect();
+        assert_eq!(unique.len(), shares.len(), "a nonce submitted twice");
+        assert!(shares.iter().all(|s| s.job_id == "j" && s.extranonce2 == vec![0, 0, 0, 0]));
+        assert_eq!(shared.stats.gpu_hashes.load(Ordering::Relaxed), u64::from(next));
+        assert_eq!(shared.gpu_slot_busy_us[0].load(Ordering::Relaxed), 6 * 50_000);
+        assert_eq!(std::mem::take(&mut w.collected), 6);
+
+        // The same space again (a retarget): the next launch starts right
+        // where the last one ended.
+        let mut retarget = j.clone();
+        retarget.job_id = "k".into();
+        shared.publish_job(retarget.clone());
+        let (generation, _) = shared.wait_for_job();
+        let mut backend = Scripted::new(&shared, vec![], None, 1);
+        w.mine_job(&mut backend, &retarget, generation, PowAlgo::Sha3t, verify);
+        assert_eq!(backend.log[0].0, next);
+    }
+
+    /// A hit the CPU does not confirm is dropped.
+    #[test]
+    fn hits_are_checked_before_they_are_submitted() {
+        // An impossible target: no hash meets it, so every hit is false.
+        let j = job([0; 32]);
+        let (shared, rx, generation) = shared_with_job(&j);
+        let mut backend = Scripted::new(&shared, vec![0, 1, 2], None, 3);
+        let mut w = Worker::new(&shared, 0, 0, 1);
+        w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        assert_eq!(rx.try_iter().count(), 0, "a false hit was submitted");
+    }
+
+    /// A nonce the kernel reports twice is still one share.
+    #[test]
+    fn a_hit_reported_twice_is_submitted_once() {
+        let j = job([0xff; 32]);
+        let (shared, rx, generation) = shared_with_job(&j);
+        let mut backend = Scripted::new(&shared, vec![5, 5, 9], None, 1);
+        let mut w = Worker::new(&shared, 0, 0, 1);
+        w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        let nonces: Vec<u32> = rx.try_iter().map(|s| s.nonce).collect();
+        // Two launches (one queued behind the first): 5 and 9 from each.
+        let (a, b) = (backend.log[0].0, backend.log[1].0);
+        assert_eq!(nonces, vec![a + 5, a + 9, b + 5, b + 9]);
+    }
+
+    /// A failed collect gives up what is in flight and starts again from the
+    /// oldest launch that did not come back: nothing skipped, nothing
+    /// submitted twice.
+    #[test]
+    fn a_failed_launch_is_done_again() {
+        let j = job([0xff; 32]);
+        let (shared, rx, generation) = shared_with_job(&j);
+        let mut backend = Scripted::new(&shared, vec![1], Some(3), 6);
+        let mut w = Worker::new(&shared, 0, 0, 1);
+        let verify = PowAlgo::Sha3t.hash_fn().unwrap();
+        assert_eq!(w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, verify), JobEnd::Changed);
+        // Launches 1 and 2 came back; 3 failed with 4 queued behind it, and
+        // both were queued again from 3's start.
+        let starts: Vec<u32> = backend.log.iter().map(|l| l.0).collect();
+        assert_eq!(starts[4], starts[2], "launch 3 was not redone: {starts:?}");
+        assert_eq!(starts[5], starts[3], "launch 4 was not redone: {starts:?}");
+        let nonces: Vec<u32> = rx.try_iter().map(|s| s.nonce).collect();
+        let unique: HashSet<u32> = nonces.iter().copied().collect();
+        assert_eq!(unique.len(), nonces.len(), "a nonce submitted twice: {nonces:?}");
+        assert!(!nonces.is_empty());
+    }
+
+    /// Five failures in a row and the device counts as gone.
+    #[test]
+    fn a_device_that_keeps_failing_is_given_up() {
+        struct Broken;
+        impl MiningBackend for Broken {
+            fn name(&self) -> String {
+                "broken".into()
+            }
+            fn supports(&self, _: PowAlgo) -> bool {
+                true
+            }
+            fn enqueue(&mut self, _: &Launch) -> Result<(), String> {
+                Err("lost".into())
+            }
+            fn collect(&mut self) -> Result<Scan, String> {
+                Err("lost".into())
+            }
+            fn in_flight(&self) -> usize {
+                0
+            }
+            fn abandon(&mut self) {}
+        }
+        let j = job([0xff; 32]);
+        let (shared, _rx, generation) = shared_with_job(&j);
+        let mut w = Worker::new(&shared, 0, 0, 1);
+        let t0 = Instant::now();
+        let end = w.mine_job(&mut Broken, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        assert_eq!(end, JobEnd::DeviceGone);
+        assert!(t0.elapsed() >= Duration::from_secs(4), "it must retry, with a pause, before giving up");
+        assert_eq!(w.cursor, Cursor { en2: 0, nonce: 0 }, "nothing was done, nothing skipped");
+        // Nothing came back, so nothing may reset the reopen budget.
+        assert_eq!(w.collected, 0);
+    }
+
+    /// A job whose extranonce2 space this worker has used up is not ground
+    /// on through wrapped values.
+    #[test]
+    fn an_exhausted_extranonce2_space_ends_the_job() {
+        let mut j = job([0xff; 32]);
+        j.extranonce2_size = 1;
+        let (shared, _rx, generation) = shared_with_job(&j);
+        let mut backend = Scripted::new(&shared, vec![], None, 1000);
+        let mut w = Worker::new(&shared, 0, 0, 1);
+        w.prev = Some(j.clone());
+        w.cursor = Cursor { en2: 255, nonce: u32::MAX - 10 };
+        let end = w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        assert_eq!(end, JobEnd::Exhausted);
+        assert_eq!(backend.log, vec![(u32::MAX - 10, 11)]);
+    }
+
+    /// A hit buffer that overflows shrinks the next launches until the hits
+    /// fit, and says so.
+    #[test]
+    fn an_overflowing_hit_buffer_shrinks_the_launches() {
+        let mut budget = HitBudget::default();
+        assert_eq!(budget.chunk(1 << 20), 1 << 20);
+        assert!(budget.overflowed(1 << 20, crate::backend::MAX_HITS + 10).is_some());
+        assert_eq!(budget.chunk(1 << 20), 1 << 19);
+    }
+
+    /// The backend that stands in while a device is reopened can do nothing.
+    #[test]
+    fn a_closed_backend_refuses_everything() {
+        let mut c = Closed;
+        let t = [0u8; 32];
+        let h = [0u8; 76];
+        assert!(c.enqueue(&Launch { algo: PowAlgo::Sha3t, header76: &h, start: 0, count: 1, target: &t }).is_err());
+        assert!(c.collect().is_err());
+        assert!(!c.supports(PowAlgo::Sha3t));
     }
 }

@@ -142,6 +142,9 @@ pub struct Shared {
     /// between work passes so the card/CPU does not run hot and the machine
     /// stays usable. Read by the workers on every batch.
     intensity: AtomicU32,
+    /// Kernel launches a GPU keeps queued (`--gpu-queue`), at most
+    /// `backend::QUEUE_DEPTH`.
+    gpu_queue: AtomicU32,
     /// Bumped on every new job - the worker threads poll it cheaply.
     pub generation: AtomicU64,
     pub stats: Stats,
@@ -170,6 +173,10 @@ pub struct Shared {
     /// whole launches only, instead of whichever launches happened to land
     /// inside a reporting interval (with 0.4 s launches, +-4 % per 10 s).
     pub gpu_slot_stamp: Vec<AtomicU64>,
+    /// Per GPU slot: microseconds its launches ran on the device, by the
+    /// device's own clock. Against the stamps above it says how much of the
+    /// time the card was actually working.
+    pub gpu_slot_busy_us: Vec<AtomicU64>,
     pub started: std::time::Instant,
 }
 
@@ -339,6 +346,7 @@ impl Shared {
             job: Mutex::new(None),
             job_cv: Condvar::new(),
             intensity: AtomicU32::new(100),
+            gpu_queue: AtomicU32::new(u32::MAX),
             generation: AtomicU64::new(0),
             stats: Stats::default(),
             submit_tx,
@@ -349,6 +357,7 @@ impl Shared {
             gpu_slot_hashes: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
             gpu_slot_bc3: (0..plan.gpus).map(|_| AtomicU32::new(0)).collect(),
             gpu_slot_stamp: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
+            gpu_slot_busy_us: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
             started: std::time::Instant::now(),
         }
     }
@@ -452,6 +461,22 @@ impl Shared {
 
     pub fn intensity(&self) -> u32 {
         self.intensity.load(Ordering::Relaxed)
+    }
+
+    /// Cap the launches a GPU keeps queued; the default is as many as the
+    /// backends allow.
+    pub fn set_gpu_queue(&self, launches: u32) {
+        self.gpu_queue.store(launches.max(1), Ordering::Relaxed);
+    }
+
+    /// Launches a GPU worker should keep queued: one below 100 % intensity,
+    /// where the card has to idle between launches and a queued one would
+    /// not let it.
+    pub fn gpu_queue(&self) -> usize {
+        if self.intensity() < 100 {
+            return 1;
+        }
+        (self.gpu_queue.load(Ordering::Relaxed) as usize).clamp(1, crate::backend::QUEUE_DEPTH)
     }
 
     /// Idle in proportion to the last work pass so that the duty cycle ends

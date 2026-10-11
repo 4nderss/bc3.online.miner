@@ -4,18 +4,26 @@
 //!
 //! The runtime is loaded dynamically (see `cl_sys`) - the binary starts and
 //! falls back to the CPU even on machines with no OpenCL at all.
+//!
+//! Launches are queued like CUDA's (see `QUEUE_DEPTH`): non-blocking copies
+//! and an event per kernel and per readback, on a queue with profiling on so
+//! the kernel's own start and end can be read back.
 
 use super::cl_sys::{
-    check, cl, cl_handle, cl_int, cl_uint, cstr, err_str, info_string, CL_DEVICE_NAME,
-    CL_DEVICE_TYPE_GPU, CL_DEVICE_VENDOR, CL_KERNEL_WORK_GROUP_SIZE, CL_MEM_READ_ONLY,
-    CL_MEM_READ_WRITE, CL_PROGRAM_BUILD_LOG, CL_SUCCESS, CL_TRUE,
+    check, cl, cl_handle, cl_int, cl_uint, cstr, err_str, info_string, Cl, CL_DEVICE_NAME,
+    CL_DEVICE_TYPE_GPU, CL_DEVICE_VENDOR, CL_FALSE, CL_KERNEL_WORK_GROUP_SIZE, CL_MEM_READ_ONLY,
+    CL_MEM_READ_WRITE, CL_PROFILING_COMMAND_END, CL_PROFILING_COMMAND_START, CL_PROGRAM_BUILD_LOG,
+    CL_QUEUE_PROFILING_ENABLE, CL_QUEUE_PROPERTIES, CL_SUCCESS, CL_TRUE,
 };
 use super::{
-    kernel_lanes, kernel_supports, kernel_target, HitBudget, MiningBackend, KERNEL_SOURCE, MAX_HITS,
+    kernel_lanes, kernel_supports, kernel_target, Launch, MiningBackend, Scan, KERNEL_SOURCE,
+    MAX_HITS, QUEUE_DEPTH,
 };
 use crate::consensus::{PowAlgo, Target};
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ptr;
+use std::time::Duration;
 
 /// Preferred work-group size. Only an upper bound now: the real one comes from
 /// CL_KERNEL_WORK_GROUP_SIZE for the built kernel. See `clamp_local_size`.
@@ -94,13 +102,15 @@ pub struct OpenClBackend {
     queue: cl_handle,
     program: cl_handle,
     kernel: cl_handle,
-    d_lanes: cl_handle,
-    d_hits: cl_handle,
     /// Work-group size this device accepts for this kernel, <= LOCAL_SIZE.
     local_size: usize,
     name: String,
-    hits_reset: Vec<u32>,
-    budget: HitBudget,
+    /// One per launch that may be in flight.
+    slots: Vec<ClSlot>,
+    /// Slots of the launches in flight, oldest first.
+    queued: VecDeque<usize>,
+    /// The slot the next launch takes.
+    next_slot: usize,
     /// The device itself, for building the BC3Hash program later.
     #[cfg(feature = "bc3hash")]
     device: cl_handle,
@@ -109,14 +119,102 @@ pub struct OpenClBackend {
     bc3: Option<Bc3Program>,
 }
 
+/// What one launch in flight owns - the counterpart of the CUDA backend's
+/// `Slot`: its inputs, its hit buffer, and the events of its kernel (the
+/// device time) and of its readback (done).
+struct ClSlot {
+    /// SHA3-256t: the header as ten interleaved lanes.
+    lanes: cl_handle,
+    /// BC3Hash: the header and the target limbs.
+    header: cl_handle,
+    target: cl_handle,
+    hits: cl_handle,
+    /// Host memory the non-blocking copies read from and write to after the
+    /// enqueue has returned - boxed, so it stays put while they are pending.
+    host: Box<ClHost>,
+    kernel_done: cl_handle,
+    read_done: cl_handle,
+    /// What `lanes`, `header` and `target` hold, so unchanged ones are not
+    /// written again.
+    lanes_of: Option<[u64; 10]>,
+    header_of: Option<[u8; 76]>,
+    target_of: Option<[u64; 4]>,
+}
+
+struct ClHost {
+    lanes: [u64; 10],
+    header: [u8; 76],
+    target: [u64; 4],
+    zero: u32,
+    hits: [u32; 1 + MAX_HITS],
+}
+
+impl ClSlot {
+    fn new(context: cl_handle) -> Result<Self, String> {
+        let mut slot = Self {
+            lanes: ptr::null_mut(),
+            header: ptr::null_mut(),
+            target: ptr::null_mut(),
+            hits: ptr::null_mut(),
+            host: Box::new(ClHost { lanes: [0; 10], header: [0; 76], target: [0; 4], zero: 0, hits: [0; 1 + MAX_HITS] }),
+            kernel_done: ptr::null_mut(),
+            read_done: ptr::null_mut(),
+            lanes_of: None,
+            header_of: None,
+            target_of: None,
+        };
+        // Owned from here on: a failure below releases what exists (Drop).
+        unsafe {
+            slot.lanes = create_buffer(context, CL_MEM_READ_ONLY, 80, "lanes")?;
+            slot.header = create_buffer(context, CL_MEM_READ_ONLY, 76, "header")?;
+            slot.target = create_buffer(context, CL_MEM_READ_ONLY, 32, "target")?;
+            slot.hits = create_buffer(context, CL_MEM_READ_WRITE, (1 + MAX_HITS) * 4, "hits")?;
+        }
+        Ok(slot)
+    }
+
+    fn release_events(&mut self) {
+        let Ok(cl) = cl() else { return };
+        for event in [&mut self.kernel_done, &mut self.read_done] {
+            if !event.is_null() {
+                unsafe {
+                    let _ = (cl.release_event)(*event);
+                }
+                *event = ptr::null_mut();
+            }
+        }
+    }
+
+    /// After a failed or abandoned launch nobody knows what the buffers hold.
+    fn forget(&mut self) {
+        self.lanes_of = None;
+        self.header_of = None;
+        self.target_of = None;
+    }
+}
+
+impl Drop for ClSlot {
+    fn drop(&mut self) {
+        self.release_events();
+        let Ok(cl) = cl() else { return };
+        for buffer in [self.lanes, self.header, self.target, self.hits] {
+            if !buffer.is_null() {
+                unsafe {
+                    let _ = (cl.release_mem_object)(buffer);
+                }
+            }
+        }
+    }
+}
+
 /// Work-group size for BC3Hash: the kernel needs ~255 registers a work-item,
 /// and 64 is what it was measured with (32-256 the same on CUDA).
 #[cfg(feature = "bc3hash")]
 const BC3_LOCAL_SIZE: usize = 64;
 
-/// One built BC3Hash program: its window, both kernels, and the buffers they
-/// read - the tables (written once) and the per-launch header and target.
-/// Every handle is released on drop, however far the build got.
+/// One built BC3Hash program: its window, both kernels, and the tables they
+/// read (written once). Every handle is released on drop, however far the
+/// build got.
 #[cfg(feature = "bc3hash")]
 struct Bc3Program {
     window: u32,
@@ -124,8 +222,6 @@ struct Bc3Program {
     scan: cl_handle,
     batch: cl_handle,
     d_tables: cl_handle,
-    d_header: cl_handle,
-    d_target: cl_handle,
     local: usize,
 }
 
@@ -135,8 +231,6 @@ impl Drop for Bc3Program {
         let Ok(cl) = cl() else { return };
         unsafe {
             for (release, handle) in [
-                (cl.release_mem_object, self.d_target),
-                (cl.release_mem_object, self.d_header),
                 (cl.release_mem_object, self.d_tables),
                 (cl.release_kernel, self.batch),
                 (cl.release_kernel, self.scan),
@@ -171,6 +265,97 @@ fn clamp_local_size(device_max: usize) -> usize {
     1usize << (usize::BITS - 1 - n.leading_zeros())
 }
 
+/// A buffer on `context`; never a null handle on Ok.
+unsafe fn create_buffer(context: cl_handle, flags: u64, bytes: usize, what: &str) -> Result<cl_handle, String> {
+    let cl = cl()?;
+    let mut err: cl_int = CL_SUCCESS;
+    let buffer = (cl.create_buffer)(context, flags, bytes, ptr::null_mut(), &mut err);
+    check(&format!("clCreateBuffer({what})"), err)?;
+    if buffer.is_null() {
+        return Err(format!("clCreateBuffer({what}) returned null"));
+    }
+    Ok(buffer)
+}
+
+/// A command queue, with event profiling if `profiling`: the old entry point
+/// works everywhere, the new one is required on runtimes that dropped it
+/// (OpenCL 2.0+ without backwards compatibility).
+unsafe fn create_queue(cl: &Cl, context: cl_handle, device: cl_handle, profiling: bool) -> Result<cl_handle, String> {
+    let mut err: cl_int = CL_SUCCESS;
+    let props = if profiling { CL_QUEUE_PROFILING_ENABLE } else { 0 };
+    let queue = if let Some(f) = cl.create_command_queue {
+        f(context, device, props, &mut err)
+    } else {
+        let list = [CL_QUEUE_PROPERTIES, props, 0];
+        (cl.create_command_queue_with_properties.unwrap())(context, device, list.as_ptr(), &mut err)
+    };
+    if err != CL_SUCCESS || queue.is_null() {
+        if !queue.is_null() {
+            let _ = (cl.release_command_queue)(queue);
+        }
+        return Err(format!("clCreateCommandQueue: {}", err_str(err)));
+    }
+    Ok(queue)
+}
+
+/// A non-blocking write: `data` must stay valid and unchanged until the queue
+/// has executed it.
+unsafe fn write_async(queue: cl_handle, buffer: cl_handle, data: *const c_void, bytes: usize, what: &str) -> Result<(), String> {
+    let cl = cl()?;
+    check(
+        &format!("write {what}"),
+        (cl.enqueue_write_buffer)(queue, buffer, CL_FALSE, 0, bytes, data as *mut c_void, 0, ptr::null(), ptr::null_mut()),
+    )
+}
+
+/// How long the command behind `event` ran on the device; None without
+/// profiling.
+fn device_time(cl: &Cl, event: cl_handle) -> Option<Duration> {
+    let read = |param: cl_uint| {
+        let mut ns: u64 = 0;
+        let code = unsafe {
+            (cl.get_event_profiling_info)(event, param, 8, &mut ns as *mut u64 as *mut c_void, ptr::null_mut())
+        };
+        (code == CL_SUCCESS).then_some(ns)
+    };
+    let (start, end) = (read(CL_PROFILING_COMMAND_START)?, read(CL_PROFILING_COMMAND_END)?);
+    (start > 0 && end >= start).then(|| Duration::from_nanos(end - start))
+}
+
+/// A kernel argument for `set_args`.
+enum Arg {
+    Mem(cl_handle),
+    U32(u32),
+    U64(u64),
+}
+
+/// Set a kernel's arguments, in order: buffers by handle, numbers by value.
+/// The runtime copies them; the kernel is launched with what they are at the
+/// time of the enqueue.
+unsafe fn set_args(kernel: cl_handle, args: &[Arg]) -> Result<(), String> {
+    let cl = cl()?;
+    for (i, arg) in args.iter().enumerate() {
+        let (size, p) = match arg {
+            Arg::Mem(h) => (std::mem::size_of::<cl_handle>(), h as *const cl_handle as *const c_void),
+            Arg::U32(v) => (4, v as *const u32 as *const c_void),
+            Arg::U64(v) => (8, v as *const u64 as *const c_void),
+        };
+        check(&format!("set arg {i}"), (cl.set_kernel_arg)(kernel, i as cl_uint, size, p))?;
+    }
+    Ok(())
+}
+
+/// One work-item per nonce; global rounds up to a multiple of local, and the
+/// kernel ignores the items past its count.
+unsafe fn launch(queue: cl_handle, kernel: cl_handle, items: u32, local: usize, event: *mut cl_handle) -> Result<(), String> {
+    let cl = cl()?;
+    let global = (items as usize).div_ceil(local) * local;
+    check(
+        "clEnqueueNDRangeKernel",
+        (cl.enqueue_nd_range_kernel)(queue, kernel, 1, ptr::null(), &global, &local, 0, ptr::null(), event),
+    )
+}
+
 impl OpenClBackend {
     pub fn new(platform_idx: usize, device_idx: usize) -> Result<Self, String> {
         Self::new_typed(platform_idx, device_idx, CL_DEVICE_TYPE_GPU)
@@ -201,12 +386,11 @@ impl OpenClBackend {
             queue: ptr::null_mut(),
             program: ptr::null_mut(),
             kernel: ptr::null_mut(),
-            d_lanes: ptr::null_mut(),
-            d_hits: ptr::null_mut(),
             local_size: LOCAL_SIZE,
             name,
-            hits_reset: vec![0u32; 1 + MAX_HITS],
-            budget: HitBudget::default(),
+            slots: Vec::new(),
+            queued: VecDeque::new(),
+            next_slot: 0,
             #[cfg(feature = "bc3hash")]
             device,
             #[cfg(feature = "bc3hash")]
@@ -228,23 +412,13 @@ impl OpenClBackend {
                 return Err("clCreateContext returned null".into());
             }
 
-            // The queue: the old variant works everywhere, the new one is
-            // required on runtimes that dropped it (OpenCL 2.0+ without
-            // backwards compatibility).
-            me.queue = if let Some(f) = cl.create_command_queue {
-                f(me.context, device, 0, &mut err)
-            } else {
-                let props = [0u64; 1]; // empty, nul-terminated property list
-                (cl.create_command_queue_with_properties.unwrap())(
-                    me.context,
-                    device,
-                    props.as_ptr(),
-                    &mut err,
-                )
+            // Profiling gives each launch's device time (the benchmark's
+            // "busy" figure, and the autotune's measure). Every device must
+            // support it, but a runtime that refuses still gets a queue.
+            me.queue = match create_queue(cl, me.context, device, true) {
+                Ok(q) => q,
+                Err(_) => create_queue(cl, me.context, device, false)?,
             };
-            if err != CL_SUCCESS || me.queue.is_null() {
-                return Err(format!("clCreateCommandQueue: {}", err_str(err)));
-            }
 
             let src = cstr(KERNEL_SOURCE);
             let src_ptr = src.as_ptr();
@@ -317,41 +491,127 @@ impl OpenClBackend {
                     me.name, me.local_size
                 );
             }
-
-            me.d_lanes = (cl.create_buffer)(
-                me.context,
-                CL_MEM_READ_ONLY,
-                10 * std::mem::size_of::<u64>(),
-                ptr::null_mut(),
-                &mut err,
-            );
-            check("clCreateBuffer(lanes)", err)?;
-            if me.d_lanes.is_null() {
-                return Err("clCreateBuffer(lanes) returned null".into());
-            }
-            me.d_hits = (cl.create_buffer)(
-                me.context,
-                CL_MEM_READ_WRITE,
-                (1 + MAX_HITS) * std::mem::size_of::<u32>(),
-                ptr::null_mut(),
-                &mut err,
-            );
-            check("clCreateBuffer(hits)", err)?;
-            if me.d_hits.is_null() {
-                return Err("clCreateBuffer(hits) returned null".into());
-            }
+        }
+        for _ in 0..QUEUE_DEPTH {
+            let slot = ClSlot::new(me.context)?;
+            me.slots.push(slot);
         }
 
         Ok(me)
+    }
+
+    /// Queue the writes, the kernel and the readback of one launch on slot
+    /// `i`, and submit them.
+    fn queue_launch(&mut self, i: usize, l: &Launch) -> Result<(), String> {
+        let (kernel, local, args) = match l.algo {
+            PowAlgo::Bc3Hash => self.bc3_inputs(i, l)?,
+            algo if kernel_supports(algo) => self.sha3t_inputs(i, l)?,
+            algo => return Err(format!("no kernel for {}", algo.name())),
+        };
+        let cl = cl()?;
+        let queue = self.queue;
+        let slot = &mut self.slots[i];
+        unsafe {
+            slot.host.zero = 0;
+            write_async(queue, slot.hits, &slot.host.zero as *const u32 as *const c_void, 4, "hit count")?;
+            set_args(kernel, &args)?;
+            launch(queue, kernel, l.count, local, &mut slot.kernel_done)?;
+            check(
+                "read hits",
+                (cl.enqueue_read_buffer)(
+                    queue,
+                    slot.hits,
+                    CL_FALSE,
+                    0,
+                    std::mem::size_of_val(&slot.host.hits),
+                    slot.host.hits.as_mut_ptr() as *mut c_void,
+                    0,
+                    ptr::null(),
+                    &mut slot.read_done,
+                ),
+            )?;
+            // Submit now: a runtime may otherwise hold the commands back until
+            // the host waits, which is the gap the queue is there to close.
+            check("clFlush", (cl.flush)(queue))?;
+        }
+        Ok(())
+    }
+
+    /// SHA3-256t: the header lanes into slot `i`, and the kernel arguments.
+    fn sha3t_inputs(&mut self, i: usize, l: &Launch) -> Result<(cl_handle, usize, Vec<Arg>), String> {
+        let queue = self.queue;
+        let slot = &mut self.slots[i];
+        let lanes = kernel_lanes(l.header76);
+        if slot.lanes_of != Some(lanes) {
+            slot.lanes_of = None;
+            slot.host.lanes = lanes;
+            unsafe { write_async(queue, slot.lanes, slot.host.lanes.as_ptr() as *const c_void, 80, "lanes")? };
+            slot.lanes_of = Some(lanes);
+        }
+        // The argument order must match sha3t_scan in sha3t.cl.
+        let args = vec![
+            Arg::Mem(slot.lanes),
+            Arg::U32(l.start),
+            Arg::U32(l.count),
+            Arg::U64(kernel_target(l.target)),
+            Arg::Mem(slot.hits),
+            Arg::U32(MAX_HITS as u32),
+        ];
+        Ok((self.kernel, self.local_size, args))
+    }
+
+    /// BC3Hash: the header and target into slot `i`, and the kernel arguments.
+    #[cfg(feature = "bc3hash")]
+    fn bc3_inputs(&mut self, i: usize, l: &Launch) -> Result<(cl_handle, usize, Vec<Arg>), String> {
+        let k = self.bc3.as_ref().ok_or("BC3Hash program not built")?;
+        let queue = self.queue;
+        let slot = &mut self.slots[i];
+        if slot.header_of.as_ref() != Some(l.header76) {
+            slot.header_of = None;
+            slot.host.header = *l.header76;
+            unsafe { write_async(queue, slot.header, slot.host.header.as_ptr() as *const c_void, 76, "header")? };
+            slot.header_of = Some(*l.header76);
+        }
+        let limbs = super::bc3::target_limbs(l.target);
+        if slot.target_of != Some(limbs) {
+            slot.target_of = None;
+            slot.host.target = limbs;
+            unsafe { write_async(queue, slot.target, slot.host.target.as_ptr() as *const c_void, 32, "target")? };
+            slot.target_of = Some(limbs);
+        }
+        // The argument order must match bc3hash_scan in bc3hash.cl.
+        let args = vec![
+            Arg::Mem(k.d_tables),
+            Arg::Mem(slot.header),
+            Arg::U32(l.start),
+            Arg::U32(l.count),
+            Arg::Mem(slot.target),
+            Arg::Mem(slot.hits),
+            Arg::U32(MAX_HITS as u32),
+        ];
+        Ok((k.scan, k.local, args))
+    }
+
+    #[cfg(not(feature = "bc3hash"))]
+    fn bc3_inputs(&mut self, _i: usize, _l: &Launch) -> Result<(cl_handle, usize, Vec<Arg>), String> {
+        Err("this build has no BC3Hash kernel".into())
     }
 }
 
 impl Drop for OpenClBackend {
     fn drop(&mut self) {
+        let Ok(cl) = cl() else { return };
+        // Pending copies read and write the slots' host memory: let the queue
+        // finish before anything is freed.
+        if !self.queue.is_null() {
+            unsafe {
+                let _ = (cl.finish)(self.queue);
+            }
+        }
+        self.slots.clear();
         // The BC3Hash program and buffers belong to the context: first.
         #[cfg(feature = "bc3hash")]
         drop(self.bc3.take());
-        let Ok(cl) = cl() else { return };
         // Reverse of creation order; error codes are of no interest here.
         //
         // The null checks are not decoration: `new_typed` builds Self with
@@ -360,8 +620,6 @@ impl Drop for OpenClBackend {
         // that safe.
         unsafe {
             for (release, handle) in [
-                (cl.release_mem_object, self.d_hits),
-                (cl.release_mem_object, self.d_lanes),
                 (cl.release_kernel, self.kernel),
                 (cl.release_program, self.program),
                 (cl.release_command_queue, self.queue),
@@ -400,6 +658,8 @@ impl MiningBackend for OpenClBackend {
     #[cfg(feature = "bc3hash")]
     fn prepare_bc3hash(&mut self, window: u32) -> Result<std::time::Duration, String> {
         let t0 = std::time::Instant::now();
+        // Nothing of the old program may still run when its buffers go.
+        self.abandon();
         // The old window's buffers leave the device before the new ones come.
         self.bc3 = None;
         let program = self.build_bc3(window)?;
@@ -416,150 +676,55 @@ impl MiningBackend for OpenClBackend {
         self.bc3.as_ref().map(|k| k.window)
     }
 
-    fn scan_range(
-        &mut self,
-        algo: PowAlgo,
-        header76: &[u8; 76],
-        start_nonce: u32,
-        count: u32,
-        target: &Target,
-    ) -> Result<Vec<u32>, String> {
-        #[cfg(feature = "bc3hash")]
-        if algo == PowAlgo::Bc3Hash {
-            if count == 0 {
-                return Ok(vec![]);
-            }
-            return super::bc3::Bc3Ops::bc3_scan(self, header76, start_nonce, count, target);
+    fn enqueue(&mut self, l: &Launch) -> Result<(), String> {
+        if l.count == 0 {
+            return Err("a launch of 0 nonces".into());
         }
-        if !kernel_supports(algo) {
-            return Err(format!("no kernel for {}", algo.name()));
+        if self.queued.len() >= QUEUE_DEPTH {
+            return Err("too many launches in flight".into());
         }
-        if count == 0 {
-            return Ok(vec![]);
+        let i = self.next_slot;
+        if let Err(e) = self.queue_launch(i, l) {
+            // Whatever made it into the queue may still run; abandon() is
+            // what waits for it.
+            let slot = &mut self.slots[i];
+            slot.release_events();
+            slot.forget();
+            return Err(e);
         }
-        let cl = cl()?;
-        let lanes = kernel_lanes(header76);
-        let t3 = kernel_target(target);
-
-        // The header does not change across the chunks below, so it is written
-        // once rather than per launch.
-        unsafe {
-            check(
-                "write lanes",
-                (cl.enqueue_write_buffer)(
-                    self.queue,
-                    self.d_lanes,
-                    CL_TRUE,
-                    0,
-                    std::mem::size_of_val(&lanes),
-                    lanes.as_ptr() as *mut c_void,
-                    0,
-                    ptr::null(),
-                    ptr::null_mut(),
-                ),
-            )?;
-        }
-
-        // Normally one pass over the whole range: the budget only starts
-        // splitting after the kernel has overflowed its hit buffer once.
-        let mut out = Vec::new();
-        let mut done = 0u32;
-        while done < count {
-            let chunk = self.budget.chunk(count - done);
-            let (mut hits, reported) =
-                self.scan_chunk(t3, start_nonce.wrapping_add(done), chunk)?;
-            out.append(&mut hits);
-            done += chunk;
-            if let Some(warning) = self.budget.overflowed(chunk, reported) {
-                eprintln!("{warning}");
-            }
-        }
-        Ok(out)
+        self.queued.push_back(i);
+        self.next_slot = (i + 1) % QUEUE_DEPTH;
+        Ok(())
     }
-}
 
-impl OpenClBackend {
-    /// One kernel launch. Returns the hits it could read back, and the count
-    /// the kernel reported - which can exceed MAX_HITS, and is what the caller
-    /// needs in order to notice that hits were lost.
-    fn scan_chunk(
-        &self,
-        t3: u64,
-        start_nonce: u32,
-        count: u32,
-    ) -> Result<(Vec<u32>, usize), String> {
+    fn collect(&mut self) -> Result<Scan, String> {
         let cl = cl()?;
-        let max_hits = MAX_HITS as u32;
+        let i = self.queued.pop_front().ok_or("no launch in flight")?;
+        let slot = &mut self.slots[i];
+        let waited = unsafe { (cl.wait_for_events)(1, &slot.read_done) };
+        let busy = if waited == CL_SUCCESS { device_time(cl, slot.kernel_done) } else { None };
+        slot.release_events();
+        check("clWaitForEvents", waited)?;
+        let reported = slot.host.hits[0] as usize;
+        let n = reported.min(MAX_HITS);
+        Ok(Scan { hits: slot.host.hits[1..1 + n].to_vec(), reported, busy })
+    }
 
-        unsafe {
-            check(
-                "reset hits",
-                (cl.enqueue_write_buffer)(
-                    self.queue,
-                    self.d_hits,
-                    CL_TRUE,
-                    0,
-                    std::mem::size_of_val(&self.hits_reset[..]),
-                    self.hits_reset.as_ptr() as *mut c_void,
-                    0,
-                    ptr::null(),
-                    ptr::null_mut(),
-                ),
-            )?;
+    fn in_flight(&self) -> usize {
+        self.queued.len()
+    }
 
-            // The argument order must match sha3t_scan in sha3t.cl exactly.
-            let set = |i: cl_uint, size: usize, p: *const c_void| -> Result<(), String> {
-                check(&format!("set arg {i}"), (cl.set_kernel_arg)(self.kernel, i, size, p))
-            };
-            let hsz = std::mem::size_of::<cl_handle>();
-            set(0, hsz, &self.d_lanes as *const _ as *const c_void)?;
-            set(1, 4, &start_nonce as *const _ as *const c_void)?;
-            set(2, 4, &count as *const _ as *const c_void)?;
-            set(3, 8, &t3 as *const _ as *const c_void)?;
-            set(4, hsz, &self.d_hits as *const _ as *const c_void)?;
-            set(5, 4, &max_hits as *const _ as *const c_void)?;
-
-            // Global rounds up to a multiple of local; the kernel guards count.
-            let local = self.local_size;
-            let global = (count as usize).div_ceil(local) * local;
-            check(
-                "clEnqueueNDRangeKernel",
-                (cl.enqueue_nd_range_kernel)(
-                    self.queue,
-                    self.kernel,
-                    1,
-                    ptr::null(),
-                    &global,
-                    &local,
-                    0,
-                    ptr::null(),
-                    ptr::null_mut(),
-                ),
-            )?;
-
-            let mut hits = vec![0u32; 1 + MAX_HITS];
-            check(
-                "read hits",
-                (cl.enqueue_read_buffer)(
-                    self.queue,
-                    self.d_hits,
-                    CL_TRUE,
-                    0,
-                    std::mem::size_of_val(&hits[..]),
-                    hits.as_mut_ptr() as *mut c_void,
-                    0,
-                    ptr::null(),
-                    ptr::null_mut(),
-                ),
-            )?;
-            check("clFinish", (cl.finish)(self.queue))?;
-
-            // hits[0] is what the kernel COUNTED, which can be more than it
-            // had room to store. The caller needs the raw number to see that.
-            let reported = hits[0] as usize;
-            let n = reported.min(MAX_HITS);
-            Ok((hits[1..1 + n].to_vec(), reported))
+    fn abandon(&mut self) {
+        if let Ok(cl) = cl() {
+            unsafe {
+                let _ = (cl.finish)(self.queue);
+            }
         }
+        for slot in &mut self.slots {
+            slot.release_events();
+            slot.forget();
+        }
+        self.queued.clear();
     }
 }
 
@@ -577,8 +742,6 @@ impl OpenClBackend {
             scan: ptr::null_mut(),
             batch: ptr::null_mut(),
             d_tables: ptr::null_mut(),
-            d_header: ptr::null_mut(),
-            d_target: ptr::null_mut(),
             local: BC3_LOCAL_SIZE,
         };
         unsafe {
@@ -639,113 +802,26 @@ impl OpenClBackend {
             }
             let tables = super::bc3::host_tables(window)?;
             let bytes = tables.len() * std::mem::size_of::<u64>();
-            k.d_tables = self.bc3_buffer(CL_MEM_READ_ONLY, bytes, "tables")?;
-            self.bc3_write(k.d_tables, tables.as_ptr() as *const c_void, bytes, "tables")?;
-            k.d_header = self.bc3_buffer(CL_MEM_READ_ONLY, 76, "header")?;
-            k.d_target = self.bc3_buffer(CL_MEM_READ_ONLY, 32, "target")?;
+            k.d_tables = create_buffer(self.context, CL_MEM_READ_ONLY, bytes, "tables")?;
+            self.write_blocking(k.d_tables, tables.as_ptr() as *const c_void, bytes, "tables")?;
         }
         Ok(k)
     }
 
-    unsafe fn bc3_buffer(&self, flags: u64, bytes: usize, what: &str) -> Result<cl_handle, String> {
-        let cl = cl()?;
-        let mut err: cl_int = CL_SUCCESS;
-        let buffer = (cl.create_buffer)(self.context, flags, bytes, ptr::null_mut(), &mut err);
-        check(&format!("clCreateBuffer({what})"), err)?;
-        if buffer.is_null() {
-            return Err(format!("clCreateBuffer({what}) returned null"));
-        }
-        Ok(buffer)
-    }
-
-    unsafe fn bc3_write(
-        &self,
-        buffer: cl_handle,
-        data: *const c_void,
-        bytes: usize,
-        what: &str,
-    ) -> Result<(), String> {
+    unsafe fn write_blocking(&self, buffer: cl_handle, data: *const c_void, bytes: usize, what: &str) -> Result<(), String> {
         let cl = cl()?;
         check(
             &format!("write {what}"),
-            (cl.enqueue_write_buffer)(
-                self.queue,
-                buffer,
-                CL_TRUE,
-                0,
-                bytes,
-                data as *mut c_void,
-                0,
-                ptr::null(),
-                ptr::null_mut(),
-            ),
+            (cl.enqueue_write_buffer)(self.queue, buffer, CL_TRUE, 0, bytes, data as *mut c_void, 0, ptr::null(), ptr::null_mut()),
         )
     }
-
-    /// Set a kernel's arguments, in order: buffers by handle, numbers by value.
-    unsafe fn bc3_args(&self, kernel: cl_handle, args: &[Arg]) -> Result<(), String> {
-        let cl = cl()?;
-        for (i, arg) in args.iter().enumerate() {
-            let (size, p) = match arg {
-                Arg::Mem(h) => (std::mem::size_of::<cl_handle>(), h as *const cl_handle as *const c_void),
-                Arg::U32(v) => (4, v as *const u32 as *const c_void),
-            };
-            check(&format!("set arg {i}"), (cl.set_kernel_arg)(kernel, i as cl_uint, size, p))?;
-        }
-        Ok(())
-    }
-
-    unsafe fn bc3_launch(&self, kernel: cl_handle, items: u32, local: usize) -> Result<(), String> {
-        let cl = cl()?;
-        // Global rounds up to a multiple of local; the kernel guards its count.
-        let global = (items as usize).div_ceil(local) * local;
-        check(
-            "clEnqueueNDRangeKernel (BC3Hash)",
-            (cl.enqueue_nd_range_kernel)(
-                self.queue,
-                kernel,
-                1,
-                ptr::null(),
-                &global,
-                &local,
-                0,
-                ptr::null(),
-                ptr::null_mut(),
-            ),
-        )
-    }
-
-    unsafe fn bc3_read(&self, buffer: cl_handle, out: *mut c_void, bytes: usize) -> Result<(), String> {
-        let cl = cl()?;
-        check(
-            "read (BC3Hash)",
-            (cl.enqueue_read_buffer)(
-                self.queue,
-                buffer,
-                CL_TRUE,
-                0,
-                bytes,
-                out,
-                0,
-                ptr::null(),
-                ptr::null_mut(),
-            ),
-        )?;
-        check("clFinish", (cl.finish)(self.queue))
-    }
-}
-
-/// A kernel argument for `bc3_args`.
-#[cfg(feature = "bc3hash")]
-enum Arg {
-    Mem(cl_handle),
-    U32(u32),
 }
 
 #[cfg(feature = "bc3hash")]
 impl super::bc3::Bc3Ops for OpenClBackend {
     fn bc3_batch(&mut self, headers: &[[u8; 80]]) -> Result<Vec<[u8; 32]>, String> {
         let k = self.bc3.as_ref().ok_or("BC3Hash program not built")?;
+        let api = cl()?;
         let flat: Vec<u8> = headers.iter().flatten().copied().collect();
         let count = headers.len() as u32;
         let mut out = vec![0u8; headers.len() * 32];
@@ -763,15 +839,26 @@ impl super::bc3::Bc3Ops for OpenClBackend {
             }
         }
         unsafe {
-            let d_in = Temp(self.bc3_buffer(CL_MEM_READ_ONLY, flat.len(), "headers")?);
-            let d_out = Temp(self.bc3_buffer(CL_MEM_READ_WRITE, out.len(), "digests")?);
-            self.bc3_write(d_in.0, flat.as_ptr() as *const c_void, flat.len(), "headers")?;
-            self.bc3_args(
-                k.batch,
-                &[Arg::Mem(k.d_tables), Arg::Mem(d_in.0), Arg::U32(count), Arg::Mem(d_out.0)],
+            let d_in = Temp(create_buffer(self.context, CL_MEM_READ_ONLY, flat.len(), "headers")?);
+            let d_out = Temp(create_buffer(self.context, CL_MEM_READ_WRITE, out.len(), "digests")?);
+            self.write_blocking(d_in.0, flat.as_ptr() as *const c_void, flat.len(), "headers")?;
+            set_args(k.batch, &[Arg::Mem(k.d_tables), Arg::Mem(d_in.0), Arg::U32(count), Arg::Mem(d_out.0)])?;
+            launch(self.queue, k.batch, count, k.local, ptr::null_mut())?;
+            check(
+                "read digests",
+                (api.enqueue_read_buffer)(
+                    self.queue,
+                    d_out.0,
+                    CL_TRUE,
+                    0,
+                    out.len(),
+                    out.as_mut_ptr() as *mut c_void,
+                    0,
+                    ptr::null(),
+                    ptr::null_mut(),
+                ),
             )?;
-            self.bc3_launch(k.batch, count, k.local)?;
-            self.bc3_read(d_out.0, out.as_mut_ptr() as *mut c_void, out.len())?;
+            check("clFinish", (api.finish)(self.queue))?;
         }
         Ok(out.as_chunks::<32>().0.to_vec())
     }
@@ -783,40 +870,7 @@ impl super::bc3::Bc3Ops for OpenClBackend {
         count: u32,
         target: &Target,
     ) -> Result<Vec<u32>, String> {
-        let k = self.bc3.as_ref().ok_or("BC3Hash program not built")?;
-        let limbs = super::bc3::target_limbs(target);
-        let mut hits = vec![0u32; 1 + MAX_HITS];
-        unsafe {
-            self.bc3_write(k.d_header, header76.as_ptr() as *const c_void, 76, "header")?;
-            self.bc3_write(k.d_target, limbs.as_ptr() as *const c_void, 32, "target")?;
-            self.bc3_write(
-                self.d_hits,
-                self.hits_reset.as_ptr() as *const c_void,
-                std::mem::size_of_val(&self.hits_reset[..]),
-                "hits",
-            )?;
-            // The argument order must match bc3hash_scan in bc3hash.cl.
-            self.bc3_args(
-                k.scan,
-                &[
-                    Arg::Mem(k.d_tables),
-                    Arg::Mem(k.d_header),
-                    Arg::U32(start),
-                    Arg::U32(count),
-                    Arg::Mem(k.d_target),
-                    Arg::Mem(self.d_hits),
-                    Arg::U32(MAX_HITS as u32),
-                ],
-            )?;
-            self.bc3_launch(k.scan, count, k.local)?;
-            self.bc3_read(
-                self.d_hits,
-                hits.as_mut_ptr() as *mut c_void,
-                std::mem::size_of_val(&hits[..]),
-            )?;
-        }
-        let n = (hits[0] as usize).min(MAX_HITS);
-        Ok(hits[1..1 + n].to_vec())
+        self.scan_range(PowAlgo::Bc3Hash, header76, start, count, target)
     }
 }
 
@@ -971,63 +1025,89 @@ mod tests {
         }
     }
 
-    /// Once the hit budget has split a scan, the launches must together cover
-    /// exactly the range that was asked for - no gap between chunks, no
-    /// overlap. Nothing reaches that path on its own (it needs the kernel to
-    /// overflow its hit buffer first), so the overflow is forced here. A wrong
-    /// per-chunk offset would show up as missing or duplicated nonces.
+
+    /// Launches queued behind each other must each come back with their own
+    /// hits - their own header, range and target - in order, and with the
+    /// time the device spent on them. Slot 0 gets a, b, a and slot 1 gets
+    /// b, b, a: copies over another header, a skipped copy, a new target.
     #[test]
     #[ignore = "requires an OpenCL runtime"]
-    fn a_split_scan_covers_the_same_range_as_one_launch() {
+    fn opencl_queued_launches_keep_their_own_inputs() {
         let mut backend =
             OpenClBackend::new_typed(0, 0, CL_DEVICE_TYPE_ALL).expect("OpenCL backend");
-
-        let mut header76 = [0u8; 76];
-        for (i, b) in header76.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        let mut seed = 0x0c1_0bc3_u64;
+        let mut header = || {
+            let mut h = [0u8; 76];
+            for b in h.iter_mut() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                *b = seed as u8;
+            }
+            h
+        };
+        let (a, b) = (header(), header());
+        // About 16 and 4 hits per 2^14 nonces.
+        let easy = crate::consensus::target_for_difficulty(1.0 / (1u64 << 22) as f64);
+        let hard = crate::consensus::target_for_difficulty(1.0 / (1u64 << 20) as f64);
+        let count = 1u32 << 14;
+        let plan = [
+            (a, easy, 0xffff_0000u32),
+            (b, easy, 7),
+            (b, easy, 50_000),
+            (b, easy, 100_000),
+            (a, hard, 150_000),
+            (a, hard, 200_000),
+        ];
+        let mut results = Vec::new();
+        for (h, t, start) in &plan {
+            backend
+                .enqueue(&Launch { algo: PowAlgo::Sha3t, header76: h, start: *start, count, target: t })
+                .unwrap();
+            if backend.in_flight() == QUEUE_DEPTH {
+                results.push(backend.collect().unwrap());
+            }
         }
-        // Deliberately near the top of the space, so a chunk offset that
-        // wraps differently from the kernel's would be caught.
-        let start = 0xffff_f000u32;
-        let count = 4096u32;
+        while backend.in_flight() > 0 {
+            results.push(backend.collect().unwrap());
+        }
+        assert!(backend.collect().is_err(), "nothing left to collect");
+        for ((h, t, start), scan) in plan.iter().zip(&results) {
+            let mut header80 = [0u8; 80];
+            header80[..76].copy_from_slice(h);
+            let cpu: Vec<u32> = (0..count)
+                .map(|i| start.wrapping_add(i))
+                .filter(|&n| {
+                    header80[76..80].copy_from_slice(&n.to_le_bytes());
+                    hash_meets_target(&sha3t(&header80), t)
+                })
+                .collect();
+            let mut gpu = scan.hits.clone();
+            gpu.sort_unstable();
+            let mut cpu = cpu;
+            cpu.sort_unstable();
+            assert_eq!(gpu, cpu, "launch at {start}");
+            assert!(!cpu.is_empty() && cpu.len() <= MAX_HITS, "{} hits", cpu.len());
+            assert!(scan.busy.is_some_and(|d| d > Duration::ZERO), "no device time from profiling");
+        }
+    }
 
-        let mut header80 = [0u8; 80];
-        header80[..76].copy_from_slice(&header76);
-        let mut keys: Vec<(u32, crate::consensus::Target)> = (0..count)
-            .map(|i| {
-                let nonce = start.wrapping_add(i);
-                header80[76..80].copy_from_slice(&nonce.to_le_bytes());
-                let mut key = sha3t(&header80);
-                key.reverse();
-                (nonce, key)
-            })
-            .collect();
-        keys.sort_by(|a, b| a.1.cmp(&b.1));
-        // The 5th smallest: several guaranteed hits, spread over the range,
-        // so a lost chunk cannot pass unnoticed.
-        let target = keys[4].1;
-
-        let mut cpu: Vec<u32> = (0..count)
-            .filter_map(|i| {
-                let nonce = start.wrapping_add(i);
-                header80[76..80].copy_from_slice(&nonce.to_le_bytes());
-                hash_meets_target(&sha3t(&header80), &target).then_some(nonce)
-            })
-            .collect();
-        cpu.sort_unstable();
-        assert!(cpu.len() >= 5, "the test target must give several hits, got {}", cpu.len());
-
-        // Baseline: one launch over the whole range.
-        let mut whole = backend.scan_range(PowAlgo::Sha3t, &header76, start, count, &target).unwrap();
-        whole.sort_unstable();
-        assert_eq!(whole, cpu, "the unsplit scan already disagrees with the CPU");
-
-        // Force the budget to split, then scan the identical range again.
-        backend.budget.overflowed(count, MAX_HITS + 1);
-        assert!(backend.budget.chunk(count) < count, "the budget did not split");
-
-        let mut split = backend.scan_range(PowAlgo::Sha3t, &header76, start, count, &target).unwrap();
-        split.sort_unstable();
-        assert_eq!(split, cpu, "the split scan lost or duplicated part of the range");
+    /// A launch the caller gave up on leaves nothing behind: the next one
+    /// starts on a clean queue and reports only its own hits.
+    #[test]
+    #[ignore = "requires an OpenCL runtime"]
+    fn opencl_abandon_clears_the_queue() {
+        let mut backend =
+            OpenClBackend::new_typed(0, 0, CL_DEVICE_TYPE_ALL).expect("OpenCL backend");
+        let target: Target = [0xff; 32];
+        let header = [3u8; 76];
+        let launch = Launch { algo: PowAlgo::Sha3t, header76: &header, start: 0, count: 32, target: &target };
+        backend.enqueue(&launch).unwrap();
+        backend.enqueue(&launch).unwrap();
+        assert!(backend.enqueue(&launch).is_err(), "a third launch must not fit");
+        backend.abandon();
+        assert_eq!(backend.in_flight(), 0);
+        let hits = backend.scan_range(PowAlgo::Sha3t, &header, 0, 32, &target).unwrap();
+        assert_eq!(hits.len(), 32, "every nonce meets an all-ones target");
     }
 }
