@@ -48,8 +48,9 @@ const BC3HASH_PTX: [(u32, &str); 4] = [
     (16, include_str!(env!("BC3_BC3HASH_W16_PTX"))),
 ];
 
-/// Threads per block for BC3Hash. 32 to 256 measured the same; a small
-/// block keeps the tail of a launch short.
+/// Threads per block for BC3Hash. Must stay 64: the kernel declares
+/// `__launch_bounds__(64, 6)` - its register budget - and a larger block does
+/// not launch. A small block also keeps the tail of a launch short.
 #[cfg(feature = "bc3hash")]
 const BC3_BLOCK_DIM: u32 = 64;
 
