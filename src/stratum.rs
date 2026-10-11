@@ -114,6 +114,59 @@ impl Outstanding {
     }
 }
 
+/// How long repeats of one reject reason are held back before they are
+/// counted in one line.
+const REJECT_SUMMARY_EVERY: Duration = Duration::from_secs(10);
+
+/// Says why shares are rejected once per reason, and then how many more
+/// every `REJECT_SUMMARY_EVERY` while it goes on - not a line per share.
+///
+/// Right after the fork the pool starts every connection at a share
+/// difficulty an RTX 4090 beats ~145 times a second, and answers all but 4
+/// (then 40) per 10 s with "too many shares per second" until vardiff has
+/// caught up. A line each buried everything else said at the fork - and in
+/// the GUI, whose log keeps 300 lines, the kernel and PoW lines were gone
+/// within a second.
+#[derive(Default)]
+struct RejectLog {
+    /// Per reason: when its window started, and the rejects held back in it.
+    open: Vec<(String, Instant, u64)>,
+}
+
+impl RejectLog {
+    /// A share was rejected for `reason`: the line to print now, if any.
+    fn reject(&mut self, reason: &str, now: Instant) -> Option<String> {
+        if let Some(open) = self.open.iter_mut().find(|(r, _, _)| r == reason) {
+            open.2 += 1;
+            return None;
+        }
+        self.open.push((reason.to_string(), now, 0));
+        Some(format!("[pool] share rejected: {reason}"))
+    }
+
+    /// The counts of the windows that are over. A reason that went quiet
+    /// for a whole window is forgotten, so its next reject is said at once.
+    fn due(&mut self, now: Instant) -> Vec<String> {
+        let mut lines = Vec::new();
+        self.open.retain_mut(|(reason, since, held)| {
+            let window = now.duration_since(*since);
+            if window < REJECT_SUMMARY_EVERY {
+                return true;
+            }
+            if *held == 0 {
+                return false;
+            }
+            lines.push(format!(
+                "[pool] share rejected: {reason} - {held} more in the last {} s",
+                window.as_secs()
+            ));
+            (*since, *held) = (now, 0);
+            true
+        });
+        lines
+    }
+}
+
 /// How long a session must have been authorized to count as healthy: the
 /// next failure after one starts the reconnect backoff from the bottom.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
@@ -224,8 +277,12 @@ fn session(
     // Kept across reads so a message split by a timeout is not lost.
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
     let mut last_rx = Instant::now();
+    let mut rejects = RejectLog::default();
 
     loop {
+        for line in rejects.due(Instant::now()) {
+            eprintln!("{line}");
+        }
         // 1) Submit pending shares.
         while let Ok(share) = submit_rx.try_recv() {
             if share.is_block_candidate {
@@ -330,7 +387,9 @@ fn session(
                     shared.stats.accepted.fetch_add(1, Ordering::Relaxed);
                 } else {
                     shared.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[pool] share rejected: {}", msg["error"]);
+                    if let Some(line) = rejects.reject(&msg["error"].to_string(), Instant::now()) {
+                        eprintln!("{line}");
+                    }
                 }
                 crate::ipc::emit(&crate::ipc::Event::Share { accepted });
                 continue;
@@ -628,6 +687,33 @@ mod tests {
         assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60]);
         assert_eq!(b.after(true), 1, "a healthy session must reset the ladder");
         assert_eq!(b.after(false), 2);
+    }
+
+    /// Rejects are said once per reason and then counted every ten seconds,
+    /// the way the fork's burst of rate-limited shares should read: one line
+    /// at once, one count, and no line per share.
+    #[test]
+    fn rejects_are_said_once_per_reason_and_then_counted() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut log = RejectLog::default();
+        let limited = r#"[20,"too many shares per second - difficulty will be raised",null]"#;
+        let stale = r#"[21,"stale: the proof of work has changed",null]"#;
+        assert_eq!(log.reject(limited, at(0)).as_deref(), Some(&*format!("[pool] share rejected: {limited}")));
+        for i in 1..=140 {
+            assert_eq!(log.reject(limited, at(i * 7)), None, "a line per share");
+        }
+        assert!(log.reject(stale, at(1_000)).is_some(), "another reason is said at once");
+        assert!(log.due(at(9_999)).is_empty());
+        let lines = log.due(at(10_000));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("140 more in the last 10 s") && lines[0].contains("too many shares"));
+        // The stale reason had nothing held back: no line, and forgotten.
+        assert!(log.due(at(11_000)).is_empty());
+        assert!(log.reject(stale, at(12_000)).is_some(), "said again after a quiet window");
+        // The rate limit went quiet for a whole window: forgotten too.
+        assert!(log.due(at(20_000)).is_empty());
+        assert!(log.reject(limited, at(21_000)).is_some());
     }
 
     /// The pool's end of a test connection.
