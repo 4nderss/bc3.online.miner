@@ -118,11 +118,24 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize, rol
             nonce = 0;
         }
         let batch = batch_size(job.algo);
-        mine_job(&shared, &job, pow, batch, generation, num_threads, &mut en2, &mut nonce);
+        let exhausted =
+            mine_job(&shared, &job, pow, batch, generation, num_threads, &mut en2, &mut nonce);
+        if exhausted {
+            if let Some(label) = label {
+                eprintln!(
+                    "[miner] {label}: searched all {}-byte extranonce2 values of this job - idle \
+                     until the next one",
+                    job.extranonce2_size
+                );
+            }
+            sat_out = Some(generation);
+        }
         prev = Some(job);
     }
 }
 
+/// Grind `job` until it changes; true when instead every extranonce2 this
+/// thread may use under the job's size has been searched.
 #[allow(clippy::too_many_arguments)]
 fn mine_job(
     shared: &Shared,
@@ -136,12 +149,15 @@ fn mine_job(
     num_threads: usize,
     en2_counter: &mut u64,
     nonce_start: &mut u32,
-) {
+) -> bool {
     let block_target = compact_to_target(job.bits);
     // Each thread takes every Nth extranonce2 - disjoint search spaces with
     // no coordination. The starting point comes from the caller so it can
     // survive a job that covers the same space.
     loop {
+        if !en2_fits(*en2_counter, job.extranonce2_size) {
+            return true;
+        }
         let extranonce2 = encode_extranonce2(*en2_counter, job.extranonce2_size);
 
         // Coinbase -> txid -> merkle root (once per extranonce2).
@@ -215,7 +231,7 @@ fn mine_job(
                 let (e, n) = resume_point(*en2_counter, nonce, nonce == 0, num_threads as u64);
                 *en2_counter = e;
                 *nonce_start = n;
-                return;
+                return false;
             }
             if nonce == 0 {
                 break;
@@ -241,6 +257,15 @@ pub fn resume_point(en2: u64, next_nonce: u32, wrapped: bool, stride: u64) -> (u
     } else {
         (en2, next_nonce)
     }
+}
+
+/// Does extranonce2 counter `en2` fit the job's extranonce2 size? Past that
+/// the encoding wraps onto values already searched - by this worker or by
+/// another one - and every share found there is a duplicate. A pool that asks
+/// for one byte hands out 256 values, which a fast card on a long job can run
+/// through.
+pub fn en2_fits(en2: u64, size: usize) -> bool {
+    size >= 8 || en2 < 1u64 << (8 * size)
 }
 
 /// Shared with the GPU worker (same partitioning of the extranonce2 space).
@@ -300,7 +325,7 @@ mod tests {
         let mut batches = 0;
         loop {
             batches += 1;
-            assert!(batches < 10, "loopen avslutas inte - livelock");
+            assert!(batches < 10, "the loop does not end - livelock");
             let mut done: u32 = 0;
             let mut wrapped_out = false;
             while done < CHECK_INTERVAL {
@@ -413,6 +438,7 @@ mod tests {
             cpu_threads: 0,
             cpu_fallback_threads: 1,
             gpu_kernel: [false, true, true],
+            compile_ahead: false,
         };
         let shared = Arc::new(Shared::new(tx, plan));
         // The GPU worker's claim: SHA3-256t, for now.
@@ -513,6 +539,40 @@ mod tests {
         shared.clear_job();
     }
 
+    /// A thread that has searched the last extranonce2 the job's size can
+    /// hold stops, instead of wrapping onto values already searched.
+    #[test]
+    fn a_thread_stops_at_the_end_of_the_extranonce2_space() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(crate::shared::SUBMIT_QUEUE);
+        let shared = Shared::new(tx, crate::shared::MiningPlan::default());
+        let job = MinerJob {
+            job_id: "j".into(),
+            extranonce1: vec![1, 2, 3, 4],
+            extranonce2_size: 1,
+            coinb1: vec![9; 50],
+            coinb2: vec![8; 20],
+            merkle_steps: vec![],
+            version: 0x2000_1000,
+            prev_hash: [6u8; 32],
+            bits: 0x1d00_ffff,
+            ntime: 1_700_000_000,
+            share_target: [0; 32],
+            height: None,
+            algo: PowAlgo::Sha3t,
+        };
+        shared.publish_job(job.clone());
+        let (generation, _) = shared.wait_for_job();
+        let pow = PowAlgo::Sha3t.hash_fn().unwrap();
+        // The last four nonces of extranonce2 255 - the last one a byte holds.
+        let (mut en2, mut nonce) = (255u64, u32::MAX - 3);
+        assert!(mine_job(&shared, &job, pow, 16, generation, 1, &mut en2, &mut nonce));
+        assert_eq!(en2, 256);
+        assert_eq!(shared.stats.cpu_hashes.load(Ordering::Relaxed), 4);
+        // Already past the end: nothing hashed at all.
+        assert!(mine_job(&shared, &job, pow, 16, generation, 1, &mut en2, &mut nonce));
+        assert_eq!(shared.stats.cpu_hashes.load(Ordering::Relaxed), 4);
+    }
+
     /// A stand-in takes exactly what no GPU takes; an `All` thread takes
     /// everything.
     #[test]
@@ -569,7 +629,7 @@ mod tests {
                 let en2 = encode_extranonce2(counter, 4);
                 assert!(
                     seen.insert(en2.clone()),
-                    "arbetare {worker_index} fick en extranonce2 nagon annan redan hade: {en2:02x?}"
+                    "worker {worker_index} got an extranonce2 another worker already had: {en2:02x?}"
                 );
                 counter += total_workers as u64;
             }

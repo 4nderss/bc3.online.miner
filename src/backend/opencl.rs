@@ -13,8 +13,10 @@ use super::cl_sys::{
     check, cl, cl_handle, cl_int, cl_uint, cstr, err_str, info_string, Cl, CL_DEVICE_NAME,
     CL_DEVICE_TYPE_GPU, CL_DEVICE_VENDOR, CL_FALSE, CL_KERNEL_WORK_GROUP_SIZE, CL_MEM_READ_ONLY,
     CL_MEM_READ_WRITE, CL_PROFILING_COMMAND_END, CL_PROFILING_COMMAND_START, CL_PROGRAM_BUILD_LOG,
-    CL_QUEUE_PROFILING_ENABLE, CL_QUEUE_PROPERTIES, CL_SUCCESS, CL_TRUE,
+    CL_QUEUE_PROFILING_ENABLE, CL_QUEUE_PROPERTIES, CL_SUCCESS,
 };
+#[cfg(feature = "bc3hash")]
+use super::cl_sys::CL_TRUE;
 use super::{
     kernel_lanes, kernel_supports, kernel_target, Launch, MiningBackend, Scan, KERNEL_SOURCE,
     MAX_HITS, QUEUE_DEPTH,
@@ -126,7 +128,9 @@ struct ClSlot {
     /// SHA3-256t: the header as ten interleaved lanes.
     lanes: cl_handle,
     /// BC3Hash: the header and the target limbs.
+    #[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
     header: cl_handle,
+    #[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
     target: cl_handle,
     hits: cl_handle,
     /// Host memory the non-blocking copies read from and write to after the
@@ -143,7 +147,9 @@ struct ClSlot {
 
 struct ClHost {
     lanes: [u64; 10],
+    #[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
     header: [u8; 76],
+    #[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
     target: [u64; 4],
     zero: u32,
     hits: [u32; 1 + MAX_HITS],

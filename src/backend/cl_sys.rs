@@ -27,6 +27,7 @@ pub type cl_bool = cl_uint;
 pub type cl_handle = *mut c_void;
 
 pub const CL_SUCCESS: cl_int = 0;
+#[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
 pub const CL_TRUE: cl_bool = 1;
 pub const CL_FALSE: cl_bool = 0;
 pub const CL_DEVICE_TYPE_GPU: cl_bitfield = 1 << 2;

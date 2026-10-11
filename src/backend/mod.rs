@@ -354,6 +354,7 @@ pub const QUEUE_DEPTH: usize = 2;
 /// One kernel launch: grind `[start, start + count)` for the header (nonce
 /// field excluded) and report the nonces whose `algo` hash is <= `target`.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(any(feature = "cuda", feature = "opencl")), allow(dead_code))]
 pub struct Launch<'a> {
     pub algo: PowAlgo,
     pub header76: &'a [u8; 76],
@@ -402,6 +403,11 @@ pub trait MiningBackend {
         None
     }
 
+    /// Start compiling the BC3Hash kernel for `window` ahead of its first
+    /// use, on a thread of its own, where the platform can do that without
+    /// holding up this card's mining. Returns at once.
+    fn compile_bc3hash_ahead(&self, _window: u32) {}
+
     /// Launches of `algo` should be a whole number of this many nonces - the
     /// card's wave - so that the last wave does not run on a mostly idle card.
     fn launch_granule(&self, _algo: PowAlgo) -> u32 {
@@ -417,6 +423,7 @@ pub trait MiningBackend {
     fn collect(&mut self) -> Result<Scan, String>;
 
     /// Launches queued and not yet collected.
+    #[cfg_attr(not(any(feature = "cuda", feature = "opencl")), allow(dead_code))]
     fn in_flight(&self) -> usize;
 
     /// Give up on everything in flight - after an error, when the results can
@@ -426,6 +433,7 @@ pub trait MiningBackend {
 
     /// One launch from start to finish: the self-test's and the tests' view.
     /// Only with nothing else in flight.
+    #[cfg_attr(not(any(feature = "cuda", feature = "opencl")), allow(dead_code))]
     fn scan_range(
         &mut self,
         algo: PowAlgo,

@@ -173,8 +173,10 @@ fn session(
     outstanding.sent(2, Instant::now());
 
     let mut extranonce1: Vec<u8> = vec![];
+    let mut subscribed = false;
     let mut extranonce2_size = 4usize;
     let mut difficulty = 1.0f64;
+    let mut warned_difficulty = false;
     let mut next_submit_id: u64 = 100;
     // Kept across reads so a message split by a timeout is not lost.
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
@@ -234,7 +236,16 @@ fn session(
             if r.is_null() {
                 return Err(std::io::Error::new(ErrorKind::InvalidData, "subscribe rejected"));
             }
-            extranonce1 = hex::decode(r[1].as_str().unwrap_or("")).unwrap_or_default();
+            // An extranonce1 that does not decode used to become an empty one,
+            // and every notify after it was ignored: connected, no error, and
+            // nothing mined for as long as the session lasted.
+            extranonce1 = parse_extranonce1(&r[1]).ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("pool sent an unusable extranonce1: {}", r[1]),
+                )
+            })?;
+            subscribed = true;
             // Clamp what the pool asks for. Zero would give every worker the
             // same (empty) extranonce2, collapsing the partitioning so all of
             // them grind identical headers; a huge value makes
@@ -283,12 +294,24 @@ fn session(
         }
 
         match msg["method"].as_str() {
-            Some("mining.set_difficulty") => {
-                difficulty = msg["params"][0].as_f64().unwrap_or(1.0);
-            }
+            Some("mining.set_difficulty") => match parse_difficulty(&msg["params"][0]) {
+                Some(d) => difficulty = d,
+                // A value that is not one used to become difficulty 1 - for
+                // BC3Hash a million times what the pool meant, so no share for
+                // the rest of the job - and 0 or less the easiest target there
+                // is, half of all hashes a share. Keep the last good one.
+                None => {
+                    if !std::mem::replace(&mut warned_difficulty, true) {
+                        eprintln!(
+                            "[pool] ignoring an invalid share difficulty {} - keeping {difficulty}",
+                            msg["params"][0]
+                        );
+                    }
+                }
+            },
             Some("mining.notify") => {
                 let p = msg["params"].as_array().cloned().unwrap_or_default();
-                if p.len() < 9 || extranonce1.is_empty() {
+                if p.len() < 9 || !subscribed {
                     continue;
                 }
                 match parse_notify(&p, &extranonce1, extranonce2_size, difficulty) {
@@ -302,6 +325,23 @@ fn session(
             _ => {}
         }
     }
+}
+
+/// The share difficulty in a `mining.set_difficulty`: a finite number above
+/// zero, or None. JSON has no NaN or infinity, but it has strings, nulls,
+/// zero and negative numbers.
+fn parse_difficulty(v: &Value) -> Option<f64> {
+    v.as_f64().filter(|d| d.is_finite() && *d > 0.0)
+}
+
+/// Longest extranonce1 we take. Pools use 4 to 8 bytes; it goes into every
+/// coinbase every worker builds.
+const MAX_EXTRANONCE1: usize = 32;
+
+/// The extranonce1 in a `mining.subscribe` result: hex of at most
+/// `MAX_EXTRANONCE1` bytes. Empty is legal.
+fn parse_extranonce1(v: &Value) -> Option<Vec<u8>> {
+    hex::decode(v.as_str()?).ok().filter(|e| e.len() <= MAX_EXTRANONCE1)
 }
 
 fn parse_notify(
@@ -500,6 +540,30 @@ mod tests {
             assert_eq!(job.version, version);
             assert_eq!(job.algo, algo, "height {height}, version {version:08x}");
         }
+    }
+
+    /// Only a finite difficulty above zero is one; anything else keeps the
+    /// last good value.
+    #[test]
+    fn share_difficulties_must_be_positive_numbers() {
+        assert_eq!(parse_difficulty(&json!(2e-6)), Some(2e-6));
+        assert_eq!(parse_difficulty(&json!(16)), Some(16.0));
+        assert_eq!(parse_difficulty(&json!(1e300)), Some(1e300));
+        for bad in [json!(0), json!(-1.5), json!("0.5"), json!(null), json!([1]), json!(true)] {
+            assert_eq!(parse_difficulty(&bad), None, "{bad}");
+        }
+    }
+
+    /// An extranonce1 is hex of a sane length, or the session is refused -
+    /// not silently left without work.
+    #[test]
+    fn extranonce1_must_be_hex_of_a_sane_length() {
+        assert_eq!(parse_extranonce1(&json!("0a0b0c0d")), Some(vec![10, 11, 12, 13]));
+        assert_eq!(parse_extranonce1(&json!("")), Some(vec![]));
+        assert_eq!(parse_extranonce1(&json!("xyz")), None);
+        assert_eq!(parse_extranonce1(&json!(12)), None);
+        assert_eq!(parse_extranonce1(&json!("00".repeat(MAX_EXTRANONCE1))).map(|e| e.len()), Some(MAX_EXTRANONCE1));
+        assert_eq!(parse_extranonce1(&json!("00".repeat(MAX_EXTRANONCE1 + 1))), None);
     }
 
     #[test]

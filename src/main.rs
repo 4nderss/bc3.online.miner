@@ -337,6 +337,7 @@ fn main() {
         cpu_fallback_threads: if role == CpuRole::GpuFallback { threads } else { 0 },
         gpu_kernel: consensus::PowAlgo::ALL
             .map(|a| gpus.iter().any(|g| backend::device_has_kernel(g, a))),
+        compile_ahead: !args.benchmark,
     };
     let gpu_bc3 = plan.gpu_kernel[consensus::PowAlgo::Bc3Hash.index()];
     #[cfg(not(feature = "bc3hash"))]
@@ -423,7 +424,7 @@ fn main() {
         }
     }
 
-    // Bunden kö: se Shared::submit.
+    // Bounded queue: see Shared::submit.
     let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(shared::SUBMIT_QUEUE);
     let shared = Arc::new(shared::Shared::new(submit_tx, plan));
     shared.set_intensity(args.intensity);

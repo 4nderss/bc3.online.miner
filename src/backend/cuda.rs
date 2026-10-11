@@ -76,7 +76,9 @@ struct Slot {
     /// SHA3-256t: the header as ten interleaved lanes.
     lanes: CudaSlice<u64>,
     /// BC3Hash: the header and the target limbs.
+    #[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
     header: CudaSlice<u8>,
+    #[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
     target: CudaSlice<u64>,
     /// [count, nonce0, nonce1, ...]
     hits: CudaSlice<u32>,
@@ -151,7 +153,33 @@ pub fn list_devices() -> Vec<super::GpuDevice> {
         .collect()
 }
 
+/// Compile the BC3Hash kernel for `window` into the driver's JIT cache, so
+/// that loading it later - at the fork, when the card switches - comes from
+/// the cache in about a second instead of 10-60 s of JIT.
+///
+/// On a context of its own: a JIT on the mining context blocks every launch
+/// on it until it is done (window 16 on an i9-12900HK: 16.7 s, and one
+/// SHA3-256t launch waited all of it), while on a second context nothing
+/// waits (1234 launches meanwhile, the slowest 28 ms). The context goes when
+/// this returns, and the memory it held with it.
+#[cfg(feature = "bc3hash")]
+pub fn compile_bc3hash_ahead(index: usize, window: u32) -> Result<std::time::Duration, String> {
+    let t0 = std::time::Instant::now();
+    let ptx = BC3HASH_PTX
+        .iter()
+        .find(|(w, _)| *w == window)
+        .map(|(_, ptx)| *ptx)
+        .ok_or_else(|| format!("no BC3Hash kernel for a window of {window} bits"))?;
+    let ctx = CudaContext::new_non_primary(index, 0).map_err(|e| format!("context: {e}"))?;
+    ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+        .map_err(|e| format!("could not load the BC3Hash kernel (window {window}): {e}"))?;
+    Ok(t0.elapsed())
+}
+
 pub struct CudaBackend {
+    /// The device's CUDA ordinal.
+    #[cfg(feature = "bc3hash")]
+    index: usize,
     #[cfg(feature = "bc3hash")]
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
@@ -194,6 +222,8 @@ impl CudaBackend {
         let slots = (0..QUEUE_DEPTH).map(|_| Slot::new(&ctx, &stream)).collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
+            #[cfg(feature = "bc3hash")]
+            index,
             #[cfg(feature = "bc3hash")]
             ctx,
             stream,
@@ -414,6 +444,25 @@ impl MiningBackend for CudaBackend {
     #[cfg(feature = "bc3hash")]
     fn bc3hash_window(&self) -> Option<u32> {
         self.bc3.as_ref().map(|k| k.window)
+    }
+
+    #[cfg(feature = "bc3hash")]
+    fn compile_bc3hash_ahead(&self, window: u32) {
+        let (index, name) = (self.index, self.name());
+        let spawned = std::thread::Builder::new().name(format!("jit-{index}")).spawn(move || {
+            match compile_bc3hash_ahead(index, window) {
+                // Anything quicker came from the driver's cache: not news.
+                Ok(took) if took > Duration::from_secs(3) => crate::human!(
+                    "[gpu] {name}: BC3Hash kernel (window {window}) compiled ahead in {:.0} s",
+                    took.as_secs_f64()
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("[gpu] {name}: compiling the BC3Hash kernel ahead failed: {e}"),
+            }
+        });
+        if let Err(e) = spawned {
+            eprintln!("[gpu] could not start the BC3Hash compile thread: {e}");
+        }
     }
 
     fn launch_granule(&self, algo: PowAlgo) -> u32 {
@@ -782,6 +831,46 @@ mod tests {
                 total / busy[i].as_secs_f64() / 1e3
             );
         }
+    }
+
+    /// Compiling the BC3Hash kernel ahead holds up no launch on the mining
+    /// context, and leaves it in the driver's cache: the load that follows
+    /// takes a second, not the JIT. Run with an empty cache, alone:
+    ///     CUDA_CACHE_PATH=/tmp/jit-test cargo test --release -- --ignored cuda_bc3hash_compiled_ahead --nocapture
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    #[ignore = "needs an NVIDIA GPU and an empty JIT cache - run alone, with --nocapture"]
+    fn cuda_bc3hash_compiled_ahead() {
+        let mut backend = CudaBackend::new(0).expect("CUDA-backend");
+        let target = compact_to_target(0x1d00ffff).unwrap();
+        let header76 = [0x42u8; 76];
+        let launch = |start| Launch { algo: PowAlgo::Sha3t, header76: &header76, start, count: 1 << 21, target: &target };
+        backend.scan_range(PowAlgo::Sha3t, &header76, 0, 1 << 21, &target).unwrap();
+        let jit = std::thread::spawn(|| compile_bc3hash_ahead(0, 16));
+        let t0 = std::time::Instant::now();
+        let mut worst = Duration::ZERO;
+        let mut n = 0u32;
+        while !jit.is_finished() || n < 20 {
+            let t = std::time::Instant::now();
+            backend.enqueue(&launch(n.wrapping_mul(1 << 21))).unwrap();
+            backend.collect().unwrap();
+            worst = worst.max(t.elapsed());
+            n += 1;
+        }
+        let took = jit.join().unwrap().expect("compiled");
+        let t1 = std::time::Instant::now();
+        backend.ctx.load_module(cudarc::nvrtc::Ptx::from_src(BC3HASH_PTX[3].1)).expect("loaded");
+        let load = t1.elapsed();
+        println!(
+            "compiled ahead in {:.1} s; meanwhile {n} SHA3-256t launches of 2^21 in {:.1} s, the \
+             slowest {:.1} ms; then loaded on the mining context in {:.2} s",
+            took.as_secs_f64(),
+            t0.elapsed().as_secs_f64(),
+            worst.as_secs_f64() * 1e3,
+            load.as_secs_f64()
+        );
+        assert!(worst < Duration::from_millis(500), "a launch waited for the JIT");
+        assert!(load < took / 2 || load < Duration::from_secs(2), "the load compiled again");
     }
 
     /// The same for BC3Hash, through the window-10 kernel - its header and

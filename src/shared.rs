@@ -239,6 +239,9 @@ pub struct MiningPlan {
     /// Per PoW (`PowAlgo::index`): do the started GPUs have a kernel for it?
     /// Only for telling "no kernel" apart from "not ready" in the status.
     pub gpu_kernel: [bool; 3],
+    /// GPUs mining SHA3-256t compile their BC3Hash kernel in the background,
+    /// ready for the fork. Off for the benchmark, which loads it at once.
+    pub compile_ahead: bool,
 }
 
 /// Where the jobs of one PoW are hashed.
@@ -590,7 +593,8 @@ impl Shared {
             // while, and a line per share would make it worse.
             if n == 1 {
                 eprintln!(
-                    "[miner] submit queue full - dropping shares. The pool difficulty is                      too low for this hashrate; it should retarget shortly."
+                    "[miner] submit queue full - dropping shares. The pool difficulty is \
+                     too low for this hashrate; it should retarget shortly."
                 );
             }
         }
@@ -714,7 +718,7 @@ mod tests {
         let both = [false, true, true];
         // --backend auto with an OpenCL GPU: no BC3Hash kernel, so the CPU
         // threads stand in for it.
-        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 20, gpu_kernel: sha3_only };
+        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 20, gpu_kernel: sha3_only, compile_ahead: true };
         assert_eq!(devices(auto, PowAlgo::Sha3t, true), (true, false));
         assert_eq!(devices(auto, PowAlgo::Bc3Hash, false), (false, true));
         assert_eq!(auto.status(PowAlgo::Sha3t, true), (true, "SHA3-256t: mining on GPU".into()));
@@ -731,17 +735,17 @@ mod tests {
         assert!(cuda.status(PowAlgo::Bc3Hash, false).1.contains("self-test"));
         // A forced OpenCL backend has no CPU threads: BC3Hash is not mined,
         // and that must read as an error, not as "Mining".
-        let forced = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 0, gpu_kernel: sha3_only };
+        let forced = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 0, gpu_kernel: sha3_only, compile_ahead: true };
         assert_eq!(devices(forced, PowAlgo::Sha3t, true), (true, false));
         assert_eq!(devices(forced, PowAlgo::Bc3Hash, false), (false, false));
         let (mining, message) = forced.status(PowAlgo::Bc3Hash, false);
         assert!(!mining && message.contains("NOT mining"), "{message}");
         // GPU plus --threads: both on SHA3-256t, the CPU alone on BC3Hash.
-        let dual = MiningPlan { gpus: 1, cpu_threads: 4, cpu_fallback_threads: 0, gpu_kernel: sha3_only };
+        let dual = MiningPlan { gpus: 1, cpu_threads: 4, cpu_fallback_threads: 0, gpu_kernel: sha3_only, compile_ahead: true };
         assert_eq!(devices(dual, PowAlgo::Sha3t, true), (true, true));
         assert_eq!(devices(dual, PowAlgo::Bc3Hash, false), (false, true));
         // CPU only.
-        let cpu = MiningPlan { gpus: 0, cpu_threads: 8, cpu_fallback_threads: 0, gpu_kernel: [false; 3] };
+        let cpu = MiningPlan { gpus: 0, cpu_threads: 8, cpu_fallback_threads: 0, gpu_kernel: [false; 3], compile_ahead: true };
         assert_eq!(devices(cpu, PowAlgo::Bc3Hash, false), (false, true));
         assert_eq!(cpu.status(PowAlgo::Bc3Hash, false), (true, "BC3Hash: mining on CPU".into()));
         assert_eq!(PowDevices { gpu: true, cpu: true }.label(), "gpu+cpu");
@@ -834,7 +838,7 @@ mod tests {
         let s = shared();
         let t0 = Instant::now();
         s.throttle(Duration::from_millis(50));
-        assert!(t0.elapsed() < Duration::from_millis(20), "100% ska inte vila");
+        assert!(t0.elapsed() < Duration::from_millis(20), "no idling at 100 %");
     }
 
     #[test]
@@ -844,7 +848,7 @@ mod tests {
         let t0 = Instant::now();
         s.throttle(Duration::from_millis(40));
         let waited = t0.elapsed();
-        assert!(waited >= Duration::from_millis(25), "vilade bara {waited:?}");
+        assert!(waited >= Duration::from_millis(25), "idled only {waited:?}");
         assert!(waited < Duration::from_millis(120), "idled too long: {waited:?}");
     }
 

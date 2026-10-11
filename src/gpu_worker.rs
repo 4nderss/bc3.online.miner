@@ -17,6 +17,7 @@ use crate::consensus::{
     PowAlgo, PowFn, Target,
 };
 use crate::shared::{AlgoGate, FoundShare, GpuCapability, MinerJob, Shared, BC3_SLOT_FAILED};
+use crate::worker::en2_fits;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -106,21 +107,25 @@ pub fn run_gpu_worker(
     };
     crate::human!("[gpu] started: {}", backend.name());
 
-    // What this card can mine right now. BC3Hash only counts once its kernel
-    // is loaded and has passed its self-test (`prepare_bc3`): until then the
-    // stand-in CPU threads mine it. Claiming it up front left nothing mining
-    // BC3Hash at the fork for as long as the driver took to JIT the kernel -
-    // 10 to 60 s, longer on a slow CPU. Dropping this on any exit withdraws
-    // every claim.
+    // What this card can mine, as far as anyone can tell before trying. A
+    // kernel that later fails its self-test withdraws its claim; dropping
+    // this on any exit withdraws them all. Not "once it has passed": the
+    // stand-in CPU threads mining meanwhile slow the table build and the
+    // self-test down more than they mine - window 16 took 11.2 s to get
+    // ready instead of 4.6 with twenty of them busy beside it.
     let mut caps = GpuCapability::new(&shared);
-    for algo in PowAlgo::ALL {
-        caps.set(algo, backend.supports(algo) && crate::worker::cpu_may_support(algo));
-    }
+    let claim = |caps: &mut GpuCapability, backend: &dyn MiningBackend| {
+        for algo in PowAlgo::ALL {
+            caps.set(algo, backend.has_kernel(algo) && crate::worker::cpu_may_support(algo));
+        }
+    };
+    claim(&mut caps, &*backend);
     // The BC3Hash window that last failed here, so it is not retried on
     // every job; a different window still gets its chance.
     let mut bc3_failed: Option<u32> = None;
 
     let mut w = Worker::new(&shared, slot, worker_index, total_workers);
+    let mut compiled_ahead = false;
     let mut reopens: u32 = 0;
     let mut gate = AlgoGate::default();
     // Generation of a job this worker sat out; wait for the next one instead
@@ -133,6 +138,12 @@ pub fn run_gpu_worker(
         };
         if job.algo == PowAlgo::Bc3Hash && backend.has_kernel(PowAlgo::Bc3Hash) {
             prepare_bc3(&shared, &mut *backend, slot, &mut caps, &mut bc3_failed);
+        } else if !compiled_ahead && shared.plan.compile_ahead && backend.has_kernel(PowAlgo::Bc3Hash) {
+            // Before the fork the card mines SHA3-256t. Its BC3Hash kernel
+            // is compiled meanwhile, so that the switch at the fork loads it
+            // from the driver's cache instead of waiting 10-60 s for the JIT.
+            compiled_ahead = true;
+            backend.compile_bc3hash_ahead(shared.bc3_window());
         }
         // Decided per job, so the launch loop below carries no dispatch. A
         // kernel without a CPU reference to re-check its hits against does
@@ -203,6 +214,7 @@ pub fn run_gpu_worker(
                         // A fresh context loads its BC3Hash kernel afresh.
                         bc3_failed = None;
                         shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
+                        claim(&mut caps, &*backend);
                     }
                     Err(e) => {
                         eprintln!(
@@ -259,15 +271,6 @@ impl Cursor {
         }
         taken
     }
-}
-
-/// Does extranonce2 counter `en2` fit the job's extranonce2 size? Past that
-/// the encoding wraps onto values already searched - by this worker or by
-/// another one - and every share found there is a duplicate. A pool that asks
-/// for one byte hands out 256 values, which a fast card on a long job can run
-/// through.
-pub fn en2_fits(en2: u64, size: usize) -> bool {
-    size >= 8 || en2 < 1u64 << (8 * size)
 }
 
 /// A launch in flight, with what its hits need to become shares.
@@ -659,8 +662,6 @@ fn prepare_bc3(
         return;
     }
     shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
-    // Not ready until the new kernel has passed: the CPU stands in meanwhile.
-    caps.set(PowAlgo::Bc3Hash, false);
     // The self-test needs the CPU reference; so does every hit later. A CPU
     // build that failed its own vectors leaves the GPU nothing to check
     // against.
