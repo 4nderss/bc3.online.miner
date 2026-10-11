@@ -114,11 +114,51 @@ impl Outstanding {
     }
 }
 
+/// How long a session must have been authorized to count as healthy: the
+/// next failure after one starts the reconnect backoff from the bottom.
+const HEALTHY_SESSION: Duration = Duration::from_secs(60);
+
+/// Seconds between reconnect attempts: 1, 2, 4 ... 60, and back to 1 after a
+/// healthy session.
+///
+/// The ladder used to go back to 1 only when `session` returned Ok - which
+/// it never does; it runs until the link fails. So every reconnect in the
+/// life of the process doubled the wait for good, and from the seventh on a
+/// rig sat out a full minute after every pool restart, however long ago the
+/// one before had been. At a fork, when the pool is most likely to restart,
+/// that minute is lost on every rig that has been up for a while.
+struct Backoff {
+    next: u64,
+}
+
+impl Backoff {
+    const MAX_SECS: u64 = 60;
+
+    fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    /// The wait before the next attempt, after a session that was `healthy`
+    /// or not.
+    fn after(&mut self, healthy: bool) -> u64 {
+        if healthy {
+            self.next = 1;
+        }
+        let wait = self.next;
+        self.next = (self.next * 2).min(Self::MAX_SECS);
+        wait
+    }
+}
+
 pub fn run_client(shared: Arc<Shared>, submit_rx: Receiver<FoundShare>, cfg: StratumConfig) {
-    let mut backoff = 1u64;
+    let mut ladder = Backoff::new();
     loop {
-        match session(&shared, &submit_rx, &cfg) {
-            Ok(()) => backoff = 1,
+        let mut authorized_at = None;
+        let result = session(&shared, &submit_rx, &cfg, &mut authorized_at);
+        let healthy = authorized_at.is_some_and(|t: Instant| t.elapsed() >= HEALTHY_SESSION);
+        let backoff = ladder.after(healthy);
+        match result {
+            Ok(()) => {}
             Err(e) => {
                 eprintln!("[pool] connection error: {e} - reconnecting in {backoff}s");
                 crate::ipc::emit(&crate::ipc::Event::Status {
@@ -139,16 +179,19 @@ pub fn run_client(shared: Arc<Shared>, submit_rx: Receiver<FoundShare>, cfg: Str
                     crate::human!("[pool] dropped {dropped} queued share(s) from the previous connection");
                 }
                 std::thread::sleep(Duration::from_secs(backoff));
-                backoff = (backoff * 2).min(60);
             }
         }
     }
 }
 
+/// One connection to the pool, until it fails. `authorized_at` is set when
+/// the pool accepts the address - how the caller tells a session that worked
+/// from one that never got going.
 fn session(
     shared: &Arc<Shared>,
     submit_rx: &Receiver<FoundShare>,
     cfg: &StratumConfig,
+    authorized_at: &mut Option<Instant>,
 ) -> std::io::Result<()> {
     crate::human!("[pool] connecting to {} as {}", cfg.pool, cfg.user);
     crate::ipc::emit(&crate::ipc::Event::Status {
@@ -270,6 +313,7 @@ fn session(
                 });
                 return Err(std::io::Error::new(ErrorKind::PermissionDenied, "authorize"));
             }
+            *authorized_at = Some(Instant::now());
             crate::human!("[pool] authorized");
             crate::ipc::emit(&crate::ipc::Event::Status {
                 state: crate::ipc::StatusState::Mining,
@@ -572,5 +616,263 @@ mod tests {
         let mut buf = Vec::new();
         let err = next_line(&mut r, &mut buf).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ConnectionAborted);
+    }
+
+    /// The reconnect waits double up to a minute, and a healthy session puts
+    /// them back at the bottom. They never did: the reset hung on `session`
+    /// returning Ok, which it never does.
+    #[test]
+    fn the_reconnect_backoff_starts_over_after_a_healthy_session() {
+        let mut b = Backoff::new();
+        let waits: Vec<u64> = (0..8).map(|_| b.after(false)).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60]);
+        assert_eq!(b.after(true), 1, "a healthy session must reset the ladder");
+        assert_eq!(b.after(false), 2);
+    }
+
+    /// The pool's end of a test connection.
+    struct FakePool {
+        stream: TcpStream,
+        buf: Vec<u8>,
+    }
+
+    impl FakePool {
+        fn accept(listener: &std::net::TcpListener) -> Self {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            Self { stream, buf: Vec::new() }
+        }
+
+        fn send(&mut self, v: Value) {
+            self.stream.write_all((v.to_string() + "\n").as_bytes()).unwrap();
+        }
+
+        /// The next message from the miner; None when none came in time.
+        fn next(&mut self) -> Option<Value> {
+            next_line(&mut self.stream, &mut self.buf)
+                .unwrap()
+                .map(|l| serde_json::from_str(&l).unwrap())
+        }
+    }
+
+    /// A job as the pool keeps it, to check the shares it gets back.
+    #[derive(Clone, Copy)]
+    struct PoolJob {
+        id: &'static str,
+        height: u32,
+        version: u32,
+        /// In stratum's word-swapped order, as notify carries it.
+        prev: [u8; 32],
+        bits: u32,
+        difficulty: f64,
+    }
+
+    const NTIME: u32 = 0x6a00_0000;
+    const EN1: [u8; 4] = [0x0a, 0x0b, 0x0c, 0x0d];
+
+    impl PoolJob {
+        fn coinb1(&self) -> Vec<u8> {
+            let mut coinb1 = Vec::new();
+            coinb1.extend_from_slice(&2u32.to_le_bytes());
+            coinb1.push(0x01);
+            coinb1.extend_from_slice(&[0u8; 32]);
+            coinb1.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+            coinb1.push(24);
+            coinb1.push(0x04);
+            coinb1.extend_from_slice(&self.height.to_le_bytes());
+            coinb1.extend_from_slice(b"/bc3.online/");
+            coinb1
+        }
+
+        /// set_difficulty and notify, in the order the pool sends them.
+        fn announce(&self, pool: &mut FakePool, clean: bool) {
+            pool.send(json!({"id": null, "method": "mining.set_difficulty", "params": [self.difficulty]}));
+            pool.send(json!({"id": null, "method": "mining.notify", "params": [
+                self.id, hex::encode(self.prev), hex::encode(self.coinb1()), "ffffffff", [],
+                format!("{:08x}", self.version), format!("{:08x}", self.bits),
+                format!("{NTIME:08x}"), clean,
+            ]}));
+        }
+
+        /// Does a submit meet this job's target under the job's own PoW -
+        /// the header rebuilt from the job and the submit alone.
+        fn check(&self, en2: &[u8], ntime: u32, nonce: u32) -> bool {
+            let mut coinbase = self.coinb1();
+            coinbase.extend_from_slice(&EN1);
+            coinbase.extend_from_slice(en2);
+            coinbase.extend_from_slice(&[0xff; 4]);
+            let header = crate::consensus::BlockHeader {
+                version: self.version,
+                prev_hash: swab32(&self.prev),
+                merkle_root: crate::consensus::sha256d(&coinbase),
+                time: ntime,
+                bits: self.bits,
+                nonce,
+            }
+            .serialize();
+            let pow = PowAlgo::for_version(self.version).hash_fn().unwrap();
+            crate::consensus::hash_meets_target(&pow(&header), &target_for_difficulty(self.difficulty))
+        }
+    }
+
+    /// The fork over a real connection, as the pool runs it: a SHA3-256t
+    /// job, then at the fork height a job with bit 11 alone and the BC3Hash
+    /// start difficulty - `set_difficulty` before `notify`, which is what
+    /// binds the difficulty to the job. A CPU worker mines throughout; every
+    /// share is checked like the pool checks it. The miner must switch PoW
+    /// at once, never submit a share that fails its job, and take the
+    /// pool's answers at the fork - "stale: the proof of work has changed"
+    /// for SHA3-256t still in flight, "too many shares per second" while
+    /// vardiff catches up - as rejects to count, not as a reason to drop the
+    /// connection or stop. Then a retarget, and the pool going away.
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    fn the_fork_over_a_pool_connection() {
+        use crate::shared::{MiningPlan, SUBMIT_QUEUE};
+        use std::sync::atomic::Ordering;
+        const STALE: &str = "stale: the proof of work has changed";
+        const RATE_LIMITED: &str = "too many shares per second - difficulty will be raised";
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = StratumConfig {
+            pool: listener.local_addr().unwrap().to_string(),
+            user: "bc1qtest.rig".into(),
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let plan = MiningPlan { cpu_threads: 1, ..Default::default() };
+        let shared = Arc::new(Shared::new(tx, plan));
+        let s = shared.clone();
+        let miner = std::thread::spawn(move || {
+            let mut authorized_at = None;
+            let result = session(&s, &rx, &cfg, &mut authorized_at);
+            (result, authorized_at)
+        });
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            crate::worker::run_worker(s, 0, 1, crate::worker::CpuRole::All)
+        });
+
+        let mut pool = FakePool::accept(&listener);
+        let mut asked = Vec::new();
+        while asked.len() < 2 {
+            if let Some(m) = pool.next() {
+                asked.push(m["method"].as_str().unwrap_or("").to_string());
+            }
+        }
+        assert_eq!(asked, ["mining.subscribe", "mining.authorize"]);
+        pool.send(json!({"id": 1, "error": null, "result": [
+            [["mining.set_difficulty", "0a0b0c0d"], ["mining.notify", "0a0b0c0d"]], "0a0b0c0d", 4]}));
+        pool.send(json!({"id": 2, "error": null, "result": true}));
+
+        let sha3 = PoolJob {
+            id: "s1",
+            height: 64_359,
+            version: 0x2000_1000,
+            prev: [0x11; 32],
+            bits: 0x1d00_ffff,
+            difficulty: 1e-5,
+        };
+        let fork = PoolJob {
+            id: "b1",
+            height: 64_360,
+            version: 0x2000_0800,
+            prev: [0x22; 32],
+            bits: 0x1c0f_fff0,
+            difficulty: 2.5e-8,
+        };
+        // A vardiff retarget: the same template at another difficulty.
+        let retarget = PoolJob { id: "b2", difficulty: 5e-8, ..fork };
+
+        #[derive(Default, Debug)]
+        struct Tally {
+            sha3_ok: u32,
+            stale: u32,
+            bc3_ok: u32,
+            limited: u32,
+            retarget_ok: u32,
+            bad: Vec<String>,
+        }
+        let mut t = Tally::default();
+        let mut forked: Option<Instant> = None;
+        let mut first_bc3: Option<Duration> = None;
+        let mut retargeted = false;
+        sha3.announce(&mut pool, true);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while t.retarget_ok < 2 {
+            assert!(Instant::now() < deadline, "the fork never got going: {t:?}");
+            if forked.is_none() && t.sha3_ok >= 1 {
+                fork.announce(&mut pool, true);
+                forked = Some(Instant::now());
+            }
+            if !retargeted && t.bc3_ok >= 3 && t.limited >= 3 {
+                retarget.announce(&mut pool, false);
+                retargeted = true;
+            }
+            let Some(m) = pool.next() else { continue };
+            assert_eq!(m["method"], "mining.submit", "{m}");
+            let p = &m["params"];
+            let en2 = hex::decode(p[2].as_str().unwrap()).unwrap();
+            let ntime = u32::from_str_radix(p[3].as_str().unwrap(), 16).unwrap();
+            let nonce = u32::from_str_radix(p[4].as_str().unwrap(), 16).unwrap();
+            let job = match p[1].as_str().unwrap() {
+                "s1" => &sha3,
+                "b1" => &fork,
+                "b2" => &retarget,
+                other => panic!("a share for a job never sent: {other}"),
+            };
+            if !job.check(&en2, ntime, nonce) {
+                t.bad.push(format!("{m}"));
+            }
+            let answer = if job.id == "s1" && forked.is_some() {
+                t.stale += 1;
+                Err((21, STALE))
+            } else if job.id == "s1" {
+                t.sha3_ok += 1;
+                Ok(())
+            } else if job.id == "b2" {
+                t.retarget_ok += 1;
+                Ok(())
+            } else if t.bc3_ok < 3 {
+                first_bc3.get_or_insert(forked.unwrap().elapsed());
+                t.bc3_ok += 1;
+                Ok(())
+            } else {
+                t.limited += 1;
+                Err((20, RATE_LIMITED))
+            };
+            match answer {
+                Ok(()) => pool.send(json!({"id": m["id"], "error": null, "result": true})),
+                Err((code, why)) => {
+                    pool.send(json!({"id": m["id"], "result": null, "error": [code, why, null]}))
+                }
+            }
+        }
+        assert!(t.bad.is_empty(), "shares that fail their job's target: {:?}", t.bad);
+        println!("fork: first BC3Hash share {first_bc3:?} after the switch; {t:?}");
+
+        // Every answer was counted, and the connection was not given up.
+        let answered = t.sha3_ok + t.stale + t.bc3_ok + t.limited + t.retarget_ok;
+        let until = Instant::now() + Duration::from_secs(10);
+        while shared.stats.accepted.load(Ordering::Relaxed) + shared.stats.rejected.load(Ordering::Relaxed)
+            < u64::from(answered)
+        {
+            assert!(Instant::now() < until, "the miner did not take every answer");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            shared.stats.accepted.load(Ordering::Relaxed),
+            u64::from(t.sha3_ok + t.bc3_ok + t.retarget_ok)
+        );
+        assert_eq!(shared.stats.rejected.load(Ordering::Relaxed), u64::from(t.stale + t.limited));
+        assert!(!miner.is_finished(), "the miner dropped the connection over rejects");
+        assert_eq!(shared.current_algo(), Some(PowAlgo::Bc3Hash));
+
+        // The pool goes away: the session ends with an error, and says it
+        // had been authorized, so a long one resets the reconnect backoff.
+        drop(pool);
+        let (result, authorized_at) = miner.join().unwrap();
+        assert!(result.is_err());
+        assert!(authorized_at.is_some());
+        shared.clear_job();
     }
 }
