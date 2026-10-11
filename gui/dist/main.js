@@ -321,11 +321,13 @@ listen("miner-event", ({ payload: ev }) => {
       break;
     case "stats":
       setStat("hashrate", fmtHashrate(ev.hashrate));
-      // Show the split only when both backends actually contribute.
-      if (ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0) {
-        el("hashrate-sub").textContent =
-          `GPU ${fmtHashrate(ev.hashrate_gpu)} · CPU ${fmtHashrate(ev.hashrate_cpu)}`;
-      }
+      // Show the split only when both backends actually contribute - and
+      // clear it when they stop: in auto the CPU stands in for the GPU until
+      // its kernel is ready, and a split left over from those first seconds
+      // kept showing a CPU rate that no longer added up to the total.
+      el("hashrate-sub").textContent = ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0
+        ? `GPU ${fmtHashrate(ev.hashrate_gpu)} · CPU ${fmtHashrate(ev.hashrate_cpu)}`
+        : "";
       setStat("accepted", numInt.format(ev.accepted));
       setStat("rejected", numInt.format(ev.rejected));
       // The pool's answer time: the last submit, or the handshake before
