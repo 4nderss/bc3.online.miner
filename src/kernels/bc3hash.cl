@@ -221,6 +221,27 @@ CONST_ARR u64 BC3_E128[2] = {0xfa5aa27fac6a65b3ULL, 0x928a70e905d1724aULL};
 CONST_ARR u64 BC3_E256[4] = {0xa30182cddcf6c2a9ULL, 0x2d97ec3a6a936438ULL, 0xb27c7c729029c0a7ULL, 0x77f21ca678d771adULL};
 CONST_ARR u64 BC3_INVALID_X[4] = {0xfffffffefffffc2fULL, 0xffffffffffffffffULL, 0xffffffffffffffffULL, 0xffffffffffffffffULL};
 CONST_ARR u64 BC3_INVALID_Y[4] = {0xb0d1596d3e58acfdULL, 0xcca6988067678d8dULL, 0xae3609da2bb48f73ULL, 0x0f63cbbb426c5da1ULL};
+// BC3_X64: window 3, 13 multiplications by 4 odd powers, tail 0
+#define BC3_X64_FIRST 0
+#define BC3_X64_STEPS 13
+#define BC3_X64_TAIL 0
+#define BC3_X64_ODD 4
+CONST_ARR u8 BC3_X64_SQ[13] = {5, 4, 8, 2, 4, 6, 4, 6, 3, 6, 3, 3, 5};
+CONST_ARR u8 BC3_X64_IX[13] = {1, 1, 2, 1, 2, 3, 0, 3, 1, 3, 3, 2, 0};
+// BC3_X128: window 4, 25 multiplications by 8 odd powers, tail 0
+#define BC3_X128_FIRST 4
+#define BC3_X128_STEPS 25
+#define BC3_X128_TAIL 0
+#define BC3_X128_ODD 8
+CONST_ARR u8 BC3_X128_SQ[25] = {5, 6, 5, 7, 5, 9, 3, 7, 4, 6, 5, 3, 5, 5, 4, 7, 4, 3, 5, 7, 5, 4, 5, 4, 1};
+CONST_ARR u8 BC3_X128_IX[25] = {2, 2, 3, 3, 4, 5, 2, 5, 4, 4, 5, 3, 4, 6, 2, 4, 7, 3, 5, 6, 4, 4, 6, 4, 0};
+// BC3_X256: window 4, 50 multiplications by 8 odd powers, tail 0
+#define BC3_X256_FIRST 3
+#define BC3_X256_STEPS 50
+#define BC3_X256_TAIL 0
+#define BC3_X256_ODD 8
+CONST_ARR u8 BC3_X256_SQ[50] = {5, 3, 3, 7, 5, 4, 6, 7, 4, 4, 7, 5, 4, 6, 4, 7, 1, 6, 5, 3, 9, 5, 9, 5, 6, 3, 6, 4, 3, 7, 5, 3, 4, 6, 4, 3, 7, 6, 5, 9, 9, 6, 4, 2, 6, 5, 1, 7, 4, 3};
+CONST_ARR u8 BC3_X256_IX[50] = {7, 3, 0, 3, 2, 1, 7, 6, 3, 3, 6, 6, 5, 4, 7, 7, 0, 3, 2, 0, 2, 3, 2, 3, 5, 1, 5, 7, 1, 3, 4, 2, 2, 4, 5, 0, 3, 2, 1, 1, 5, 6, 6, 1, 7, 6, 0, 2, 2, 0};
 // ---- end of generated constants ----
 
 // =========================================================================
@@ -1656,6 +1677,133 @@ DEVICE_FN u256 reduce8_secp(const u32* t) {
                (u64)r6 | ((u64)r7 << 32));
 }
 
+// t folded to 8 words modulo 2^256 - C for C < 2^16, not canonical: the first
+// fold as in the reductions above, the second into r0 and r1; returns the
+// carry out of r1 (probability C^2/2^64 or less), for fold_fix.
+DEVICE_FN u32 fold8_small(const u32* t, u32 C, u32* r) {
+  u32 r0, r1, r2, r3, r4, r5, r6, r7, c;
+  const u32 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3], t4 = t[4], t5 = t[5], t6 = t[6], t7 = t[7], t8 = t[8], t9 = t[9], t10 = t[10], t11 = t[11], t12 = t[12], t13 = t[13], t14 = t[14], t15 = t[15];
+  asm("{\n\t"
+      ".reg .u64 q<8>; .reg .u32 ql<8>, qh<8>, x;\n\t"
+      "mul.wide.u32 q0, %17, %25;\n\t"
+      "mov.b64 {ql0, qh0}, q0;\n\t"
+      "mul.wide.u32 q1, %18, %25;\n\t"
+      "mov.b64 {ql1, qh1}, q1;\n\t"
+      "mul.wide.u32 q2, %19, %25;\n\t"
+      "mov.b64 {ql2, qh2}, q2;\n\t"
+      "mul.wide.u32 q3, %20, %25;\n\t"
+      "mov.b64 {ql3, qh3}, q3;\n\t"
+      "mul.wide.u32 q4, %21, %25;\n\t"
+      "mov.b64 {ql4, qh4}, q4;\n\t"
+      "mul.wide.u32 q5, %22, %25;\n\t"
+      "mov.b64 {ql5, qh5}, q5;\n\t"
+      "mul.wide.u32 q6, %23, %25;\n\t"
+      "mov.b64 {ql6, qh6}, q6;\n\t"
+      "mul.wide.u32 q7, %24, %25;\n\t"
+      "mov.b64 {ql7, qh7}, q7;\n\t"
+      "add.cc.u32 %0, %9, ql0;\n\t"
+      "addc.cc.u32 %1, %10, ql1;\n\t"
+      "addc.cc.u32 %2, %11, ql2;\n\t"
+      "addc.cc.u32 %3, %12, ql3;\n\t"
+      "addc.cc.u32 %4, %13, ql4;\n\t"
+      "addc.cc.u32 %5, %14, ql5;\n\t"
+      "addc.cc.u32 %6, %15, ql6;\n\t"
+      "addc.cc.u32 %7, %16, ql7;\n\t"
+      "addc.u32 %8, 0, 0;\n\t"
+      "add.cc.u32 %1, %1, qh0;\n\t"
+      "addc.cc.u32 %2, %2, qh1;\n\t"
+      "addc.cc.u32 %3, %3, qh2;\n\t"
+      "addc.cc.u32 %4, %4, qh3;\n\t"
+      "addc.cc.u32 %5, %5, qh4;\n\t"
+      "addc.cc.u32 %6, %6, qh5;\n\t"
+      "addc.cc.u32 %7, %7, qh6;\n\t"
+      "addc.u32 %8, %8, qh7;\n\t"
+      "mul.lo.u32 x, %8, %25;\n\t"
+      "add.cc.u32 %0, %0, x;\n\t"
+      "addc.cc.u32 %1, %1, 0;\n\t"
+      "addc.u32 %8, 0, 0;\n\t"
+      "}"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4), "=r"(r5), "=r"(r6), "=r"(r7), "=r"(c)
+      : "r"(t0), "r"(t1), "r"(t2), "r"(t3), "r"(t4), "r"(t5), "r"(t6), "r"(t7), "r"(t8), "r"(t9), "r"(t10), "r"(t11), "r"(t12), "r"(t13), "r"(t14), "r"(t15), "r"(C));
+  r[0] = r0;
+  r[1] = r1;
+  r[2] = r2;
+  r[3] = r3;
+  r[4] = r4;
+  r[5] = r5;
+  r[6] = r6;
+  r[7] = r7;
+  return c;
+}
+
+// t folded to 4 words modulo 2^128 - C for C < 2^16, not canonical: the first
+// fold as in the reductions above, the second into r0 and r1; returns the
+// carry out of r1 (probability C^2/2^64 or less), for fold_fix.
+DEVICE_FN u32 fold4_small(const u32* t, u32 C, u32* r) {
+  u32 r0, r1, r2, r3, c;
+  const u32 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3], t4 = t[4], t5 = t[5], t6 = t[6], t7 = t[7];
+  asm("{\n\t"
+      ".reg .u64 q<4>; .reg .u32 ql<4>, qh<4>, x;\n\t"
+      "mul.wide.u32 q0, %9, %13;\n\t"
+      "mov.b64 {ql0, qh0}, q0;\n\t"
+      "mul.wide.u32 q1, %10, %13;\n\t"
+      "mov.b64 {ql1, qh1}, q1;\n\t"
+      "mul.wide.u32 q2, %11, %13;\n\t"
+      "mov.b64 {ql2, qh2}, q2;\n\t"
+      "mul.wide.u32 q3, %12, %13;\n\t"
+      "mov.b64 {ql3, qh3}, q3;\n\t"
+      "add.cc.u32 %0, %5, ql0;\n\t"
+      "addc.cc.u32 %1, %6, ql1;\n\t"
+      "addc.cc.u32 %2, %7, ql2;\n\t"
+      "addc.cc.u32 %3, %8, ql3;\n\t"
+      "addc.u32 %4, 0, 0;\n\t"
+      "add.cc.u32 %1, %1, qh0;\n\t"
+      "addc.cc.u32 %2, %2, qh1;\n\t"
+      "addc.cc.u32 %3, %3, qh2;\n\t"
+      "addc.u32 %4, %4, qh3;\n\t"
+      "mul.lo.u32 x, %4, %13;\n\t"
+      "add.cc.u32 %0, %0, x;\n\t"
+      "addc.cc.u32 %1, %1, 0;\n\t"
+      "addc.u32 %4, 0, 0;\n\t"
+      "}"
+      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3), "=r"(c)
+      : "r"(t0), "r"(t1), "r"(t2), "r"(t3), "r"(t4), "r"(t5), "r"(t6), "r"(t7), "r"(C));
+  r[0] = r0;
+  r[1] = r1;
+  r[2] = r2;
+  r[3] = r3;
+  return c;
+}
+
+// t folded to 2 words modulo 2^64 - C for C < 2^16, not canonical: the first
+// fold as in the reductions above, the second into r0 and r1; returns the
+// carry out of r1 (probability C^2/2^64 or less), for fold_fix.
+DEVICE_FN u32 fold2_small(const u32* t, u32 C, u32* r) {
+  u32 r0, r1, c;
+  const u32 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3];
+  asm("{\n\t"
+      ".reg .u64 q<2>; .reg .u32 ql<2>, qh<2>, x;\n\t"
+      "mul.wide.u32 q0, %5, %7;\n\t"
+      "mov.b64 {ql0, qh0}, q0;\n\t"
+      "mul.wide.u32 q1, %6, %7;\n\t"
+      "mov.b64 {ql1, qh1}, q1;\n\t"
+      "add.cc.u32 %0, %3, ql0;\n\t"
+      "addc.cc.u32 %1, %4, ql1;\n\t"
+      "addc.u32 %2, 0, 0;\n\t"
+      "add.cc.u32 %1, %1, qh0;\n\t"
+      "addc.u32 %2, %2, qh1;\n\t"
+      "mul.lo.u32 x, %2, %7;\n\t"
+      "add.cc.u32 %0, %0, x;\n\t"
+      "addc.cc.u32 %1, %1, 0;\n\t"
+      "addc.u32 %2, 0, 0;\n\t"
+      "}"
+      : "=r"(r0), "=r"(r1), "=r"(c)
+      : "r"(t0), "r"(t1), "r"(t2), "r"(t3), "r"(C));
+  r[0] = r0;
+  r[1] = r1;
+  return c;
+}
+
 // ---- gen_ptx.js: end ----
 
 DEVICE_FN u256 reduce8_small(const u32* t, u32 C) {
@@ -1812,7 +1960,160 @@ DEVICE_FN u256 reduce8_secp(const u32* t) {
   for (int i = 2; i < 8; i++) { s += r[i]; y[i] = (u32)s; s >>= 32; }
   return s ? join256(y) : join256(r);
 }
+
+// The 128- and 64-bit products and the lazy folds of the CUDA part above.
+DEVICE_FN void mulN_c(const u32* a, const u32* b, u32* t, int n) {
+  for (int i = 0; i < 2 * n; i++) t[i] = 0;
+  for (int i = 0; i < n; i++) {
+    u64 c = 0;
+    for (int j = 0; j < n; j++) {
+      c += (u64)a[i] * b[j] + t[i + j];
+      t[i + j] = (u32)c;
+      c >>= 32;
+    }
+    t[i + n] = (u32)c;
+  }
+}
+DEVICE_FN void mul4(const u32* a, const u32* b, u32* t) { mulN_c(a, b, t, 4); }
+DEVICE_FN void sqr4(const u32* a, u32* t) { mulN_c(a, a, t, 4); }
+DEVICE_FN void mul2(const u32* a, const u32* b, u32* t) { mulN_c(a, b, t, 2); }
+DEVICE_FN void sqr2(const u32* a, u32* t) { mulN_c(a, a, t, 2); }
+
+// t folded to n words modulo 2^(32n) - C, not canonical; returns the carry
+// out of r1 (see fold8_small in the CUDA part).
+DEVICE_FN u32 foldN_c(const u32* t, int n, u32 C, u32* r) {
+  u64 c = 0;
+  for (int i = 0; i < n; i++) {
+    c += (u64)t[n + i] * C + t[i];
+    r[i] = (u32)c;
+    c >>= 32;
+  }
+  u64 s = (u64)r[0] + c * C;
+  r[0] = (u32)s;
+  s >>= 32;
+  s += r[1];
+  r[1] = (u32)s;
+  return (u32)(s >> 32);
+}
+DEVICE_FN u32 fold8_small(const u32* t, u32 C, u32* r) { return foldN_c(t, 8, C, r); }
+DEVICE_FN u32 fold4_small(const u32* t, u32 C, u32* r) { return foldN_c(t, 4, C, r); }
+DEVICE_FN u32 fold2_small(const u32* t, u32 C, u32* r) { return foldN_c(t, 2, C, r); }
 #endif
+
+#ifndef BC3_RARE
+#define BC3_RARE(k)
+#endif
+
+// The rare end of a lazy fold: c = 1 is a carry out of r1, 2^64 more. If it
+// runs off the top, 2^(32n) = C mod p, and r is tiny then: no further carry.
+DEVICE_FN void fold_fix(u32* r, int n, u32 c, u32 C) {
+  BC3_RARE(12);
+  u64 s = c;
+  for (int k = 2; k < n; k++) {
+    s += r[k];
+    r[k] = (u32)s;
+    s >>= 32;
+  }
+  if (s) {
+    BC3_RARE(13);
+    s = (u64)r[0] + C;
+    r[0] = (u32)s;
+    s >>= 32;
+    s += r[1];
+    r[1] = (u32)s;
+  }
+}
+
+// Not unrolled: with three warps a scheduler at different places in the
+// kernel, the squaring loop unrolled (the compiler's choice, 4 times, 21 KiB
+// of code) cost the whole kernel 7.5 % - while the powers alone ran 2 %
+// faster that way: the instruction cache.
+#if defined(__OPENCL_VERSION__)
+#define BC3_UNROLL1 __attribute__((opencl_unroll_hint(1)))
+#else
+#define BC3_UNROLL1 _Pragma("unroll 1")
+#endif
+
+// ---- Two independent chains at once ----
+//
+// The kernel is latency-bound: a product is a few long carry chains, then
+// the reduction's compares and branches, and a scheduler has only a few
+// warps to switch between (two at 255 registers a thread, three at the 168
+// of BC3_BOUNDS). With one chain of products a warp, the pipes stood idle
+// about half the time (clock64 phase profile, RTX 3050 Ti). The reference already pairs
+// its powers (FixedExponent::pair, FixedPower::pair); here the two products of
+// a pair are one basic block, so the two chains interleave. Products are
+// lazy: reduced to n words but not compared against p - any n-word value is a
+// valid input to the next product - and only the end of a chain is made
+// canonical. The one branch left, for both chains, is the carry fold_fix
+// finishes, taken with a probability of about 2^-32 or less.
+#define BC3_PAIR_OPS(N, MUL, SQR, FOLD)                                          \
+  DEVICE_FN void SQR##x2(u32* r, u32* s, u32 C) {                                \
+    u32 tr[2 * N], ts[2 * N];                                                    \
+    SQR(r, tr);                                                                  \
+    SQR(s, ts);                                                                  \
+    u32 cr = FOLD(tr, C, r), cs = FOLD(ts, C, s);                                \
+    if (cr | cs) {                                                               \
+      fold_fix(r, N, cr, C);                                                     \
+      fold_fix(s, N, cs, C);                                                     \
+    }                                                                            \
+  }                                                                              \
+  DEVICE_FN void MUL##x2(u32* r, const u32* x, u32* s, const u32* y, u32 C) {    \
+    u32 tr[2 * N], ts[2 * N];                                                    \
+    MUL(r, x, tr);                                                               \
+    MUL(s, y, ts);                                                               \
+    u32 cr = FOLD(tr, C, r), cs = FOLD(ts, C, s);                                \
+    if (cr | cs) {                                                               \
+      fold_fix(r, N, cr, C);                                                     \
+      fold_fix(s, N, cs, C);                                                     \
+    }                                                                            \
+  }
+BC3_PAIR_OPS(8, mul8, sqr8, fold8_small)
+BC3_PAIR_OPS(4, mul4, sqr4, fold4_small)
+BC3_PAIR_OPS(2, mul2, sqr2, fold2_small)
+
+// r^E and s^E in place, lazily, for the fixed exponent whose schedule X is in
+// consts.h (gen_consts.cpp): odd powers r^(2i+1), then per step `sq`
+// squarings and a product with an odd power. The odd powers live in local
+// memory - the step picks one at run time - and the step's index is the same
+// in every lane, so the loads are one cache line a warp - made before the
+// step's squarings, which hide their latency.
+#define BC3_EXP_PAIR(NAME, N, X, MUL2, SQR2)                                     \
+  DEVICE_FN void NAME(u32* r, u32* s, u32 C) {                                   \
+    u32 oa[X##_ODD][N], ob[X##_ODD][N], a2[N], b2[N];                            \
+    for (int k = 0; k < N; k++) {                                                \
+      oa[0][k] = a2[k] = r[k];                                                   \
+      ob[0][k] = b2[k] = s[k];                                                   \
+    }                                                                            \
+    if (X##_ODD > 1) {                                                           \
+      SQR2(a2, b2, C);                                                           \
+      for (int i = 1; i < X##_ODD; i++) {                                        \
+        MUL2(r, a2, s, b2, C);                                                   \
+        for (int k = 0; k < N; k++) {                                            \
+          oa[i][k] = r[k];                                                       \
+          ob[i][k] = s[k];                                                       \
+        }                                                                        \
+      }                                                                          \
+    }                                                                            \
+    for (int k = 0; k < N; k++) {                                                \
+      r[k] = oa[X##_FIRST][k];                                                   \
+      s[k] = ob[X##_FIRST][k];                                                   \
+    }                                                                            \
+    for (int i = 0; i < X##_STEPS; i++) {                                        \
+      const u32 sq = X##_SQ[i], ix = X##_IX[i];                                  \
+      u32 xa[N], xb[N];                                                          \
+      for (int k = 0; k < N; k++) {                                              \
+        xa[k] = oa[ix][k];                                                       \
+        xb[k] = ob[ix][k];                                                       \
+      }                                                                          \
+      BC3_UNROLL1 for (u32 j = 0; j < sq; j++) SQR2(r, s, C);                    \
+      MUL2(r, xa, s, xb, C);                                                     \
+    }                                                                            \
+    for (int i = 0; i < X##_TAIL; i++) SQR2(r, s, C);                            \
+  }
+BC3_EXP_PAIR(exp8_pair, 8, BC3_X256, mul8x2, sqr8x2)
+BC3_EXP_PAIR(exp4_pair, 4, BC3_X128, mul4x2, sqr4x2)
+BC3_EXP_PAIR(exp2_pair, 2, BC3_X64, mul2x2, sqr2x2)
 
 DEVICE_FN u256 mulmod256(u256 a, u256 b, u64 C) {
   u32 x[8], y[8], t[16];
@@ -1832,7 +2133,9 @@ DEVICE_FN u256 sqrmod256(u256 a, u64 C) {
 
 // a^E mod p for a fixed exponent E (FixedExponent in uint.hpp): sliding
 // window of 4 bits over odd powers. E is uniform across threads, so the
-// schedule branches identically in every lane.
+// schedule branches identically in every lane. One chain, canonical after
+// every product, the window read from E at run time: the mix uses the pairs
+// below (expfix*x2); these stay as their independent check in the lab.
 DEVICE_BIG u64 expfix64(u64 a, CONST_PTR const u64* E, u64 C) {
   u64 odd[8];
   odd[0] = norm64(a, C);
@@ -1914,6 +2217,30 @@ DEVICE_BIG u256 expfix256(u256 a, CONST_PTR const u64* E, u64 C) {
   return r;
 }
 
+// a^E and b^E for the E of each width (exp256.pair etc. in mix.cpp), with
+// the schedules of consts.h; canonical results.
+DEVICE_BIG void expfix256x2(u256 a, u256 b, u256* ra, u256* rb) {
+  u32 r[8], s[8];
+  split256(a, r);
+  split256(b, s);
+  exp8_pair(r, s, (u32)C_M256);
+  *ra = norm256(join256(r), C_M256);
+  *rb = norm256(join256(s), C_M256);
+}
+DEVICE_BIG void expfix128x2(u128 a, u128 b, u128* ra, u128* rb) {
+  u32 r[4] = {(u32)a.v[0], (u32)(a.v[0] >> 32), (u32)a.v[1], (u32)(a.v[1] >> 32)};
+  u32 s[4] = {(u32)b.v[0], (u32)(b.v[0] >> 32), (u32)b.v[1], (u32)(b.v[1] >> 32)};
+  exp4_pair(r, s, (u32)C_M128);
+  *ra = norm128(mk128((u64)r[0] | ((u64)r[1] << 32), (u64)r[2] | ((u64)r[3] << 32)), C_M128);
+  *rb = norm128(mk128((u64)s[0] | ((u64)s[1] << 32), (u64)s[2] | ((u64)s[3] << 32)), C_M128);
+}
+DEVICE_BIG void expfix64x2(u64 a, u64 b, u64* ra, u64* rb) {
+  u32 r[2] = {(u32)a, (u32)(a >> 32)}, s[2] = {(u32)b, (u32)(b >> 32)};
+  exp2_pair(r, s, (u32)C_M64);
+  *ra = norm64((u64)r[0] | ((u64)r[1] << 32), C_M64);
+  *rb = norm64((u64)s[0] | ((u64)s[1] << 32), C_M64);
+}
+
 // g^e = product of table[i][byte i of e] (FixedPower in uint.hpp). The
 // tables come from the reference implementation (ref_pow_table).
 DEVICE_FN u64 powtab64(GLOBAL const u64* tab, u64 e) {
@@ -1935,11 +2262,32 @@ DEVICE_FN u256 tab256(GLOBAL const u64* tab, u32 row, u32 b) {
   u32 k = (row * 256u + b) * 4u;
   return mk256(tab[k], tab[k + 1], tab[k + 2], tab[k + 3]);
 }
+// One product at a time; the mix uses powtab256x2 below, the lab tests both.
 DEVICE_BIG u256 powtab256(GLOBAL const u64* tab, u256 e) {
   u256 r = tab256(tab, 0, (u32)(e.v[0] & 255u));
   for (u32 i = 1; i < 32; i++)
     r = mulmod256(r, tab256(tab, i, (u32)((e.v[i >> 3] >> (8 * (i & 7))) & 255u)), C_F256);
   return r;
+}
+
+// t.pow256.pair(e, f) of mix.cpp: both table products at once, lazily, and
+// each row's entries loaded one product ahead (the last load, of row 0
+// again, is not used).
+DEVICE_BIG void powtab256x2(GLOBAL const u64* tab, u256 e, u256 f, u256* re, u256* rf) {
+  u32 r[8], s[8], x[8], y[8];
+  split256(tab256(tab, 0, (u32)(e.v[0] & 255u)), r);
+  split256(tab256(tab, 0, (u32)(f.v[0] & 255u)), s);
+  u256 ne = tab256(tab, 1, (u32)((e.v[0] >> 8) & 255u)), nf = tab256(tab, 1, (u32)((f.v[0] >> 8) & 255u));
+  for (u32 i = 1; i < 32; i++) {
+    split256(ne, x);
+    split256(nf, y);
+    const u32 j = (i + 1u) & 31u, sh = 8u * (j & 7u);
+    ne = tab256(tab, j, (u32)((e.v[j >> 3] >> sh) & 255u));
+    nf = tab256(tab, j, (u32)((f.v[j >> 3] >> sh) & 255u));
+    mul8x2(r, x, s, y, (u32)C_F256);
+  }
+  *re = norm256(join256(r), C_F256);
+  *rf = norm256(join256(s), C_F256);
 }
 
 // =========================================================================
@@ -2259,6 +2607,12 @@ DEVICE_BIG u256 inv_f256_fermat(u256 a) {
 DEVICE_FN u256 inv_secp(u256 a) { return modinv256(a, BC3_MODINV_SECP, BC3_MODINV_SECP_INV30); }
 DEVICE_FN u256 inv_f256(u256 a) { return modinv256(norm256(a, C_F256), BC3_MODINV_F256, BC3_MODINV_F256_INV30); }
 
+// Phase profile hooks (prof.cu defines them; nothing anywhere else).
+#ifndef BC3_PROF_BEGIN
+#define BC3_PROF_BEGIN()
+#define BC3_PROF_MARK(k)
+#endif
+
 // The table sum of curve_multiply(point, k) in Jacobian coordinates.
 // *invalid is set when k = 0 mod n - the reference then returns the fixed
 // "invalid point" constants - and Z is set to 1 so a batch inversion can
@@ -2304,14 +2658,17 @@ DEVICE_BIG void curve_mul(GLOBAL const u64* tab, u256 k, u256* ox, u256* oy) {
 DEVICE_BIG void curve_mul4(GLOBAL const u64* tc, u256 k0, u256 k1, u256 k2, u256 k3, u256* out) {
   u256 X[4], Y[4], Z[4];
   int inv[4];
+  BC3_PROF_BEGIN();
   curve_sum(tc + 0 * (u64)BC3_CURVE_POINTS * 8u, k0, &X[0], &Y[0], &Z[0], &inv[0]);
   curve_sum(tc + 1 * (u64)BC3_CURVE_POINTS * 8u, k1, &X[1], &Y[1], &Z[1], &inv[1]);
   curve_sum(tc + 2 * (u64)BC3_CURVE_POINTS * 8u, k2, &X[2], &Y[2], &Z[2], &inv[2]);
   curve_sum(tc + 3 * (u64)BC3_CURVE_POINTS * 8u, k3, &X[3], &Y[3], &Z[3], &inv[3]);
+  BC3_PROF_MARK(13);
   u256 p01 = fmul(Z[0], Z[1]);
   u256 p012 = fmul(p01, Z[2]);
   u256 all = fmul(p012, Z[3]);
   u256 t = inv_secp(all);           // (Z0 Z1 Z2 Z3)^-1
+  BC3_PROF_MARK(14);
   u256 z3i = fmul(t, p012);
   t = fmul(t, Z[3]);                // (Z0 Z1 Z2)^-1
   u256 z2i = fmul(t, p01);
@@ -2322,6 +2679,7 @@ DEVICE_BIG void curve_mul4(GLOBAL const u64* tc, u256 k0, u256 k1, u256 k2, u256
   jac_to_affine(X[1], Y[1], z1i, inv[1], &out[2], &out[3]);
   jac_to_affine(X[2], Y[2], z2i, inv[2], &out[4], &out[5]);
   jac_to_affine(X[3], Y[3], z3i, inv[3], &out[6], &out[7]);
+  BC3_PROF_MARK(15);
 }
 
 // =========================================================================
@@ -2340,6 +2698,7 @@ DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
   GLOBAL const u64* T256 = tables + BC3_TABLE_POW256;
   GLOBAL const u64* TC = tables + BC3_TABLE_CURVE;
 
+  BC3_PROF_BEGIN();
   // ---- message expansion ----
   u64 m64[32];
   for (int i = 0; i < 8; i++) m64[i] = load_be64(in + 8 * i);
@@ -2359,14 +2718,17 @@ DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
     m256[i - 41] = add256(add256(beta256(m256[i - 48]), beta256(m256[i - 47])),
                           add256(beta256(m256[i - 43]), beta256(m256[i - 42])));
 
+  BC3_PROF_MARK(0);
   // ---- stage 1: 64-bit lanes ----
   for (int i = 0; i < 32; i++) {
-    u64 p1 = expfix64(c1 ^ sig0_64(c2), BC3_E64, C_M64);
-    u64 p2 = expfix64(c3 ^ sig1_64(c4), BC3_E64, C_M64);
+    u64 p1, p2;
+    expfix64x2(c1 ^ sig0_64(c2), c3 ^ sig1_64(c4), &p1, &p2);
+    BC3_PROF_MARK(1);
     u64 d1 = p1 + ror64(c6, 7) + rol64(c5, 13);
     u64 d2 = p2 + ch64(c5, c6, c7) + maj64(c1, c4, c8);
     u64 d3 = c8 + Sig0_64(c7) + BC3_ROUND64[i];
     u64 d4 = c5 + Sig1_64(c1) + d1 + m64[i] + powtab64(T64, d3);
+    BC3_PROF_MARK(2);
     u64 n8 = c7;
     u64 n7 = c6 + d1 + sig0_64(mulmod64(d1, d3, C_M64));
     u64 n6 = c5 + sig1_64(d2 ^ d3);
@@ -2377,18 +2739,21 @@ DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
     c3 = c2;
     c2 = c1 ^ d3;
     c1 = n1;
+    BC3_PROF_MARK(3);
   }
 
   // ---- stage 2: 128-bit lanes ----
   u128 f1 = mk128(c5, c1), f2 = mk128(c6, c2), f3 = mk128(c7, c3), f4 = mk128(c8, c4);
   for (int i = 0; i < 16; i++) {
-    u128 pa = expfix128(xor128(f1, beta128(f3)), BC3_E128, C_M128);
-    u128 pb = expfix128(xor128(f2, beta128(f4)), BC3_E128, C_M128);
+    u128 pa, pb;
+    expfix128x2(xor128(f1, beta128(f3)), xor128(f2, beta128(f4)), &pa, &pb);
+    BC3_PROF_MARK(4);
     u128 a = add128(add128(pa, sig0_128(xor128(f2, f4))), ch128(f2, f3, f4));
     u128 b = add128(add128(pb, sig1_128(xor128(f1, f3))), maj128(f1, f2, f3));
     u128 c = add128(add128(rol128(not128(f1), 29), ror128(not128(f2), 7)), f3);
     c = add128(add128(c, not128(f4)), m128[8 + i]);
     c = add128(c, powtab128(T128, f3));
+    BC3_PROF_MARK(5);
     u128 d = add128(add128(rol128(not128(f3), 29), ror128(f4, 7)), f2);
     d = add128(add128(d, not128(f1)), mk128(BC3_ROUND128[2 * i], BC3_ROUND128[2 * i + 1]));
     u128 nf4 = add128(f3, a);
@@ -2398,22 +2763,27 @@ DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
     f3 = f2;
     f2 = nf2;
     f1 = nf1;
+    BC3_PROF_MARK(6);
   }
 
   // ---- stage 3: 256-bit lanes and the curves ----
   u256 h1 = mk256(f3.v[0], f3.v[1], f1.v[0], f1.v[1]);
   u256 h2 = mk256(f4.v[0], f4.v[1], f2.v[0], f2.v[1]);
   for (int i = 0; i < 16; i++) {
-    u256 p1 = expfix256(xor256(rol256(h1, 11), h2), BC3_E256, C_M256);
-    u256 p2 = expfix256(xor256(h1, beta256(not256(h2))), BC3_E256, C_M256);
+    u256 p1, p2;
+    expfix256x2(xor256(rol256(h1, 11), h2), xor256(h1, beta256(not256(h2))), &p1, &p2);
+    BC3_PROF_MARK(7);
     u256 j1 = add256(p1, beta256(xor256(h1, h2)));
     u256 j2 = add256(p2, gamma256(h1, h2));
-    u256 q1 = expfix256(j1, BC3_E256, C_M256);
-    u256 q2 = expfix256(j2, BC3_E256, C_M256);
+    u256 q1, q2;
+    expfix256x2(j1, j2, &q1, &q2);
+    BC3_PROF_MARK(7);
     u256 j3 = add256(add256(gamma256(j1, j2), q1), c256(BC3_ROUND256 + 4 * i));
     u256 j4 = add256(add256(gamma256(j3, beta256(h2)), q2), add256(m256[7 + i], ch256(j1, j2, j3)));
     u256 pts[8];
+    BC3_PROF_MARK(9);
     curve_mul4(TC, h1, h2, j1, j3, pts);
+    BC3_PROF_MARK(8);
     u256 j5 = pts[0], j6 = pts[1], j7 = pts[2], j8 = pts[3], j9 = pts[4], j10 = pts[5], j11 = pts[6], j12 = pts[7];
     u256 nh2 = add256(h1, gamma256(j1, j3));
     nh2 = add256(nh2, maj256(j2, j3, j4));
@@ -2429,19 +2799,25 @@ DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
     nh1 = add256(nh1, j12);
     h1 = nh1;
     h2 = nh2;
+    BC3_PROF_MARK(9);
   }
 
   // ---- stage 4: table powers and inversions mod 2^256 - 36113 ----
   u256 u1 = h1, u2 = h2;
   for (int i = 0; i < 64; i++) {
     u256 fc = c256(BC3_FINAL + 4 * i);
-    u256 k1 = add256(powtab256(T256, u1), beta256(u2));
-    u256 k2 = add256(add256(powtab256(T256, u2), gamma256(u1, u2)), ch256(k1, u2, u1));
+    u256 g1, g2;
+    powtab256x2(T256, u1, u2, &g1, &g2);
+    u256 k1 = add256(g1, beta256(u2));
+    u256 k2 = add256(add256(g2, gamma256(u1, u2)), ch256(k1, u2, u1));
+    BC3_PROF_MARK(10);
     u256 k3 = add256(add256(inv_f256(k2), beta256(u1)), beta256(xor256(xor256(u2, k1), fc)));
+    BC3_PROF_MARK(11);
     u256 nu2 = add256(add256(xor256(k1, u1), maj256(k1, k2, u2)), beta256(k3));
     u256 nu1 = add256(beta256(k1), k2);
     u2 = nu2;
     u1 = nu1;
+    BC3_PROF_MARK(12);
   }
   u256 res = add256(u1, beta256(u2));
   for (int i = 0; i < 4; i++)
@@ -2748,6 +3124,7 @@ DEVICE_BIG void bc3hash80(GLOBAL const u64* tables, const u8* header, u8* out) {
   u8 msg[58 + 80];
   u8 preimage[64], mix[32], s384[48], s512[64], r160[20], bs[32], bb[64];
   u32 n;
+  BC3_PROF_BEGIN();
   n = bc3_tag(msg, 0);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
   sha3(msg, n + 80u, 64u, preimage);
@@ -2766,7 +3143,9 @@ DEVICE_BIG void bc3hash80(GLOBAL const u64* tables, const u8* header, u8* out) {
   n = bc3_tag(msg, 5);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
   blake2b(BC3_PERSON_B, msg, n + 80u, bb);
+  BC3_PROF_MARK(16);
   bc3mix512(tables, preimage, mix);
+  BC3_PROF_MARK(17);
   u8 fin[56 + 48 + 32 + 64 + 20 + 32 + 64];
   n = bc3_tag(fin, 6);
   for (int i = 0; i < 48; i++) fin[n++] = s384[i];
@@ -2776,14 +3155,30 @@ DEVICE_BIG void bc3hash80(GLOBAL const u64* tables, const u8* header, u8* out) {
   for (int i = 0; i < 32; i++) fin[n++] = bs[i];
   for (int i = 0; i < 64; i++) fin[n++] = bb[i];
   sha3(fin, n, 32u, out);
+  BC3_PROF_MARK(18);
 }
 
 // =========================================================================
 // Kernels.
 // =========================================================================
 
+// CUDA: the register budget, from the blocks of 64 threads (BC3_BLOCK_DIM in
+// the miner) an SM must hold at once. Six: 168 registers, three warps a
+// scheduler instead of two at 255 - 7.7 % faster with no spill in the hot
+// code. Eight (128 registers) ran the powers faster still, but the curve sums
+// and table powers slower - their L1/L2 traffic grows with the warps - and
+// the whole kernel lost 3 % against six (RTX 3050 Ti).
+#if defined(__OPENCL_VERSION__)
+#define BC3_BOUNDS
+#else
+#ifndef BC3_MIN_BLOCKS
+#define BC3_MIN_BLOCKS 6
+#endif
+#define BC3_BOUNDS __launch_bounds__(64, BC3_MIN_BLOCKS)
+#endif
+
 // Test/verification: BC3Mix of `count` 64-byte inputs.
-KERNEL_FN void bc3mix_batch(GLOBAL const u64* tables, GLOBAL const u8* in, u32 count, GLOBAL u8* out) {
+KERNEL_FN void BC3_BOUNDS bc3mix_batch(GLOBAL const u64* tables, GLOBAL const u8* in, u32 count, GLOBAL u8* out) {
   u32 gid = GLOBAL_ID();
   if (gid >= count) return;
   u8 buf[64], res[32];
@@ -2793,7 +3188,7 @@ KERNEL_FN void bc3mix_batch(GLOBAL const u64* tables, GLOBAL const u8* in, u32 c
 }
 
 // Test/verification: BC3Hash of `count` 80-byte headers.
-KERNEL_FN void bc3hash_batch(GLOBAL const u64* tables, GLOBAL const u8* in, u32 count, GLOBAL u8* out) {
+KERNEL_FN void BC3_BOUNDS bc3hash_batch(GLOBAL const u64* tables, GLOBAL const u8* in, u32 count, GLOBAL u8* out) {
   u32 gid = GLOBAL_ID();
   if (gid >= count) return;
   u8 hdr[80], res[32];
@@ -2806,7 +3201,7 @@ KERNEL_FN void bc3hash_batch(GLOBAL const u64* tables, GLOBAL const u8* in, u32 
 // nonce when the hash, read as a little-endian 256-bit number, is <= target
 // (target[0..4) are its u64 limbs, least significant first). hits[0] is the
 // atomic hit counter, hits[1..1+max_hits] the nonces - as sha3t_scan.
-KERNEL_FN void bc3hash_scan(GLOBAL const u64* tables, GLOBAL const u8* header76, u32 start_nonce, u32 nonce_count,
+KERNEL_FN void BC3_BOUNDS bc3hash_scan(GLOBAL const u64* tables, GLOBAL const u8* header76, u32 start_nonce, u32 nonce_count,
                             GLOBAL const u64* target, GLOBAL u32* hits, u32 max_hits) {
   u32 gid = GLOBAL_ID();
   if (gid >= nonce_count) return;
