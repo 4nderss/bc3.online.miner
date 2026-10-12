@@ -66,13 +66,23 @@ jobs:
           # nvcc stamps its own version into a banner comment; that line is
           # about the compiler, not the kernel, so it is not part of the check.
           #
+          # Nor is the hash in the names nvcc gives functions with internal
+          # linkage (_INTERNAL_<hash>_...): it is derived from the absolute
+          # path of the source file. The committed BC3Hash PTX was built in
+          # /work, as AGENTS.md says (fdfb051c); built from a checkout in
+          # /__w/bc3.online.miner/bc3.online.miner it gets 2495b0d9, and no
+          # other line differs. sha3t.cl inlines everything, so it has no
+          # such names.
+          #
           # POSIX sh, not bash: this job runs in a container, where the step
           # shell is /bin/sh - dash on Ubuntu. Process substitution here was a
           # syntax error, so the check exited 2 without ever comparing anything.
           # A check that cannot fail for the right reason is worse than none.
           for k in sha3t bc3hash_w10 bc3hash_w12 bc3hash_w14 bc3hash_w16; do
-            grep -v '^//' src/kernels/$k.ptx > /tmp/committed.ptx
-            grep -v '^//' /tmp/$k.ptx > /tmp/regenerated.ptx
+            sed -e '/^\/\//d' -e 's/_INTERNAL_[0-9a-f]*_/_INTERNAL_/g' \
+              src/kernels/$k.ptx > /tmp/committed.ptx
+            sed -e '/^\/\//d' -e 's/_INTERNAL_[0-9a-f]*_/_INTERNAL_/g' \
+              /tmp/$k.ptx > /tmp/regenerated.ptx
             if ! diff -q /tmp/committed.ptx /tmp/regenerated.ptx; then
               echo
               echo "The committed src/kernels/$k.ptx does not match its kernel source."
