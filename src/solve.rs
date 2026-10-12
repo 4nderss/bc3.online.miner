@@ -385,7 +385,9 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
                 }
                 ok += 1;
                 if hash_meets_target(&hash, &block_target) {
-                    return found(&template, &hash, &header, &block, started.elapsed());
+                    let code = found(&template, &hash, &header, &block, started.elapsed());
+                    quiesce(&shared);
+                    return code;
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -417,6 +419,24 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
                 }
             }
         }
+    }
+}
+
+/// Take the job away and wait until the workers have stopped hashing. The
+/// process exits right after, and exit runs the C++ side's static
+/// destructors: a CPU thread still inside BC3Hash then reads freed tables
+/// and the miner dies with a segfault - after printing the block, but still
+/// a crash to explain.
+fn quiesce(shared: &Shared) {
+    shared.clear_job();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = shared.stats.hashes.load(std::sync::atomic::Ordering::Relaxed);
+    let mut still = 0;
+    while still < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(300));
+        let now = shared.stats.hashes.load(std::sync::atomic::Ordering::Relaxed);
+        still = if now == last { still + 1 } else { 0 };
+        last = now;
     }
 }
 
