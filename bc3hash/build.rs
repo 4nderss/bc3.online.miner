@@ -107,6 +107,13 @@ fn main() {
     for flag in guards {
         bc3.flag(flag);
     }
+    // clang-cl compiles C++ without exceptions unless told otherwise, and
+    // mix.cpp throws on impossible inputs ("cannot use 'throw' with
+    // exceptions disabled" on GitHub's Windows runner). cargo-xwin's cross
+    // build passed /EHsc itself, so only the native Windows build broke.
+    if tool.is_like_clang_cl() {
+        bc3.flag("/EHsc");
+    }
     if wasm {
         wasm_flags(&mut bc3);
         bc3.include("wasm/include")
