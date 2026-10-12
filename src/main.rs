@@ -12,6 +12,7 @@ mod gpu_worker;
 mod ipc;
 mod telemetry;
 mod shared;
+mod solve;
 mod stats;
 mod stratum;
 mod worker;
@@ -86,6 +87,14 @@ struct Args {
     /// pool, no network, no address needed.
     #[arg(long)]
     benchmark: bool,
+
+    /// Solve one fixed block template offline instead of mining for a pool: a
+    /// job file with the block's height, previous hash, version, time, bits,
+    /// coinbase text and outputs, as published for the hard fork's first
+    /// block. No pool, no node, no network; the whole block is printed and
+    /// saved to a file when it is found.
+    #[arg(long, value_name = "JOB.json", conflicts_with = "benchmark")]
+    solve: Option<std::path::PathBuf>,
 
     /// Benchmark: the PoW to measure.
     #[arg(long, value_enum, default_value_t = BenchAlgo::Bc3hash)]
@@ -296,7 +305,7 @@ fn main() {
     });
     let user = match user {
         Some(user) => user,
-        None if args.benchmark => String::new(),
+        None if args.benchmark || args.solve.is_some() => String::new(),
         None => {
             eprintln!("bc3-miner: set --user <address[.rig]>, or --wallet with an optional --rig");
             std::process::exit(2);
@@ -337,7 +346,7 @@ fn main() {
         cpu_fallback_threads: if role == CpuRole::GpuFallback { threads } else { 0 },
         gpu_kernel: consensus::PowAlgo::ALL
             .map(|a| gpus.iter().any(|g| backend::device_has_kernel(g, a))),
-        compile_ahead: !args.benchmark,
+        compile_ahead: !args.benchmark && args.solve.is_none(),
     };
     let gpu_bc3 = plan.gpu_kernel[consensus::PowAlgo::Bc3Hash.index()];
     #[cfg(not(feature = "bc3hash"))]
@@ -462,7 +471,7 @@ fn main() {
             .spawn(move || gpu_worker::run_gpu_worker(s, gpu, g, threads + g, total_workers))
             .expect("could not start a GPU thread");
     }
-    if !args.benchmark {
+    if !args.benchmark && args.solve.is_none() {
         let s = shared.clone();
         let interval = args.stats_interval;
         std::thread::spawn(move || stats::run_reporter(s, interval));
@@ -500,6 +509,20 @@ fn main() {
             );
             std::process::exit(1);
         });
+    }
+
+    if let Some(path) = args.solve.clone() {
+        let code = solve::run(
+            shared,
+            submit_rx,
+            solve::Config {
+                path,
+                difficulty: args.difficulty,
+                gpus: gpu_names.len(),
+                cpu_threads: threads,
+            },
+        );
+        std::process::exit(code);
     }
 
     if args.benchmark {
