@@ -579,10 +579,17 @@ mod tests {
     #[cfg(feature = "bc3hash")]
     #[test]
     fn node_header_vectors_through_the_miner_path() {
+        // bc3hash/vectors from the root crate; the wasm crate compiles this
+        // file too, one directory down, and CI runs its tests without
+        // BC3HASH_VECTORS.
         let dir = std::env::var_os("BC3HASH_VECTORS")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bc3hash/vectors")
+                let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                [here.join("bc3hash/vectors"), here.join("../bc3hash/vectors")]
+                    .into_iter()
+                    .find(|d| d.is_dir())
+                    .unwrap_or_else(|| here.join("bc3hash/vectors"))
             });
         let path = dir.join("header-vectors.json");
         let json = std::fs::read_to_string(&path)
