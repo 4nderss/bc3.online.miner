@@ -1,0 +1,1298 @@
+[
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88473000,
+    "height_diff": 0,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -172200,
+    "height_diff": 0,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -1,
+    "height_diff": 0,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 599,
+    "height_diff": 0,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 600,
+    "height_diff": 0,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 601,
+    "height_diff": 0,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1201,
+    "height_diff": 0,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 173400,
+    "height_diff": 0,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88474200,
+    "height_diff": 0,
+    "expected_target": "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "1d00ffff"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88472400,
+    "height_diff": 1,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -171600,
+    "height_diff": 1,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 599,
+    "height_diff": 1,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1199,
+    "height_diff": 1,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1200,
+    "height_diff": 1,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1201,
+    "height_diff": 1,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1801,
+    "height_diff": 1,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 174000,
+    "height_diff": 1,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88474800,
+    "height_diff": 1,
+    "expected_target": "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "1d00ffff"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88406400,
+    "height_diff": 111,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -105600,
+    "height_diff": 111,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 66599,
+    "height_diff": 111,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67199,
+    "height_diff": 111,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67200,
+    "height_diff": 111,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67201,
+    "height_diff": 111,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67801,
+    "height_diff": 111,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 240000,
+    "height_diff": 111,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88540800,
+    "height_diff": 111,
+    "expected_target": "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "1d00ffff"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88405800,
+    "height_diff": 112,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -105000,
+    "height_diff": 112,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67199,
+    "height_diff": 112,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67799,
+    "height_diff": 112,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67800,
+    "height_diff": 112,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67801,
+    "height_diff": 112,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 68401,
+    "height_diff": 112,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 240600,
+    "height_diff": 112,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88541400,
+    "height_diff": 112,
+    "expected_target": "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "1d00ffff"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -87263400,
+    "height_diff": 2016,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1037400,
+    "height_diff": 2016,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1209599,
+    "height_diff": 2016,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210199,
+    "height_diff": 2016,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210200,
+    "height_diff": 2016,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210201,
+    "height_diff": 2016,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210801,
+    "height_diff": 2016,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1383000,
+    "height_diff": 2016,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 89683800,
+    "height_diff": 2016,
+    "expected_target": "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "1d00ffff"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -44466600,
+    "height_diff": 73344,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 43834200,
+    "height_diff": 73344,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44006399,
+    "height_diff": 73344,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44006999,
+    "height_diff": 73344,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44007000,
+    "height_diff": 73344,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44007001,
+    "height_diff": 73344,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44007601,
+    "height_diff": 73344,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44179800,
+    "height_diff": 73344,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "main",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 132480600,
+    "height_diff": 73344,
+    "expected_target": "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "1d00ffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -88473000,
+    "height_diff": 0,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -172200,
+    "height_diff": 0,
+    "expected_target": "387fff8000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "20387fff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -1,
+    "height_diff": 0,
+    "expected_target": "70ba575e18cd5500000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ba57"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 599,
+    "height_diff": 0,
+    "expected_target": "70ffe14be5434b00000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffe1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 600,
+    "height_diff": 0,
+    "expected_target": "70ffff0000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 601,
+    "height_diff": 0,
+    "expected_target": "71001cb48bbcb400000000000000000000000000000000000000000000000000",
+    "expected_bits": "2071001c"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1201,
+    "height_diff": 0,
+    "expected_target": "7145d1acb9d12800000000000000000000000000000000000000000000000000",
+    "expected_bits": "207145d1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 173400,
+    "height_diff": 0,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 88474200,
+    "height_diff": 0,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -88472400,
+    "height_diff": 1,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -171600,
+    "height_diff": 1,
+    "expected_target": "387fff8000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "20387fff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 599,
+    "height_diff": 1,
+    "expected_target": "70ba575e18cd5500000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ba57"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1199,
+    "height_diff": 1,
+    "expected_target": "70ffe14be5434b00000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffe1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1200,
+    "height_diff": 1,
+    "expected_target": "70ffff0000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1201,
+    "height_diff": 1,
+    "expected_target": "71001cb48bbcb400000000000000000000000000000000000000000000000000",
+    "expected_bits": "2071001c"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1801,
+    "height_diff": 1,
+    "expected_target": "7145d1acb9d12800000000000000000000000000000000000000000000000000",
+    "expected_bits": "207145d1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 174000,
+    "height_diff": 1,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 88474800,
+    "height_diff": 1,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -88406400,
+    "height_diff": 111,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -105600,
+    "height_diff": 111,
+    "expected_target": "387fff8000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "20387fff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 66599,
+    "height_diff": 111,
+    "expected_target": "70ba575e18cd5500000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ba57"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67199,
+    "height_diff": 111,
+    "expected_target": "70ffe14be5434b00000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffe1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67200,
+    "height_diff": 111,
+    "expected_target": "70ffff0000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67201,
+    "height_diff": 111,
+    "expected_target": "71001cb48bbcb400000000000000000000000000000000000000000000000000",
+    "expected_bits": "2071001c"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67801,
+    "height_diff": 111,
+    "expected_target": "7145d1acb9d12800000000000000000000000000000000000000000000000000",
+    "expected_bits": "207145d1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 240000,
+    "height_diff": 111,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 88540800,
+    "height_diff": 111,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -88405800,
+    "height_diff": 112,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -105000,
+    "height_diff": 112,
+    "expected_target": "387fff8000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "20387fff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67199,
+    "height_diff": 112,
+    "expected_target": "70ba575e18cd5500000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ba57"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67799,
+    "height_diff": 112,
+    "expected_target": "70ffe14be5434b00000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffe1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67800,
+    "height_diff": 112,
+    "expected_target": "70ffff0000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 67801,
+    "height_diff": 112,
+    "expected_target": "71001cb48bbcb400000000000000000000000000000000000000000000000000",
+    "expected_bits": "2071001c"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 68401,
+    "height_diff": 112,
+    "expected_target": "7145d1acb9d12800000000000000000000000000000000000000000000000000",
+    "expected_bits": "207145d1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 240600,
+    "height_diff": 112,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 88541400,
+    "height_diff": 112,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -87263400,
+    "height_diff": 2016,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1037400,
+    "height_diff": 2016,
+    "expected_target": "387fff8000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "20387fff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1209599,
+    "height_diff": 2016,
+    "expected_target": "70ba575e18cd5500000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ba57"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1210199,
+    "height_diff": 2016,
+    "expected_target": "70ffe14be5434b00000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffe1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1210200,
+    "height_diff": 2016,
+    "expected_target": "70ffff0000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1210201,
+    "height_diff": 2016,
+    "expected_target": "71001cb48bbcb400000000000000000000000000000000000000000000000000",
+    "expected_bits": "2071001c"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1210801,
+    "height_diff": 2016,
+    "expected_target": "7145d1acb9d12800000000000000000000000000000000000000000000000000",
+    "expected_bits": "207145d1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 1383000,
+    "height_diff": 2016,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 89683800,
+    "height_diff": 2016,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": -44466600,
+    "height_diff": 73344,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 43834200,
+    "height_diff": 73344,
+    "expected_target": "387fff8000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "20387fff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 44006399,
+    "height_diff": 73344,
+    "expected_target": "70ba575e18cd5500000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ba57"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 44006999,
+    "height_diff": 73344,
+    "expected_target": "70ffe14be5434b00000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffe1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 44007000,
+    "height_diff": 73344,
+    "expected_target": "70ffff0000000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "2070ffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 44007001,
+    "height_diff": 73344,
+    "expected_target": "71001cb48bbcb400000000000000000000000000000000000000000000000000",
+    "expected_bits": "2071001c"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 44007601,
+    "height_diff": 73344,
+    "expected_target": "7145d1acb9d12800000000000000000000000000000000000000000000000000",
+    "expected_bits": "207145d1"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 44179800,
+    "height_diff": 73344,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "regtest",
+    "reference_bits": "2070ffff",
+    "elapsed": 132480600,
+    "height_diff": 73344,
+    "expected_target": "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "expected_bits": "207fffff"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88473000,
+    "height_diff": 0,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -172200,
+    "height_diff": 0,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -1,
+    "height_diff": 0,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 599,
+    "height_diff": 0,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 600,
+    "height_diff": 0,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 601,
+    "height_diff": 0,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1201,
+    "height_diff": 0,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 173400,
+    "height_diff": 0,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88474200,
+    "height_diff": 0,
+    "expected_target": "00000377ae000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1e0377ae"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88472400,
+    "height_diff": 1,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -171600,
+    "height_diff": 1,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 599,
+    "height_diff": 1,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1199,
+    "height_diff": 1,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1200,
+    "height_diff": 1,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1201,
+    "height_diff": 1,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1801,
+    "height_diff": 1,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 174000,
+    "height_diff": 1,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88474800,
+    "height_diff": 1,
+    "expected_target": "00000377ae000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1e0377ae"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88406400,
+    "height_diff": 111,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -105600,
+    "height_diff": 111,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 66599,
+    "height_diff": 111,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67199,
+    "height_diff": 111,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67200,
+    "height_diff": 111,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67201,
+    "height_diff": 111,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67801,
+    "height_diff": 111,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 240000,
+    "height_diff": 111,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88540800,
+    "height_diff": 111,
+    "expected_target": "00000377ae000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1e0377ae"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -88405800,
+    "height_diff": 112,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -105000,
+    "height_diff": 112,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67199,
+    "height_diff": 112,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67799,
+    "height_diff": 112,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67800,
+    "height_diff": 112,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 67801,
+    "height_diff": 112,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 68401,
+    "height_diff": 112,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 240600,
+    "height_diff": 112,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 88541400,
+    "height_diff": 112,
+    "expected_target": "00000377ae000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1e0377ae"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -87263400,
+    "height_diff": 2016,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1037400,
+    "height_diff": 2016,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1209599,
+    "height_diff": 2016,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210199,
+    "height_diff": 2016,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210200,
+    "height_diff": 2016,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210201,
+    "height_diff": 2016,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1210801,
+    "height_diff": 2016,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 1383000,
+    "height_diff": 2016,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 89683800,
+    "height_diff": 2016,
+    "expected_target": "00000377ae000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1e0377ae"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": -44466600,
+    "height_diff": 73344,
+    "expected_target": "0000000000000000000000000000000000000000000000000000000000000001",
+    "expected_bits": "01010000"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 43834200,
+    "height_diff": 73344,
+    "expected_target": "0000000007fff800000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c07fff8"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44006399,
+    "height_diff": 73344,
+    "expected_target": "000000000ff613348cd550000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ff613"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44006999,
+    "height_diff": 73344,
+    "expected_target": "000000000fffebcb5434b0000000000000000000000000000000000000000000",
+    "expected_bits": "1c0fffeb"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44007000,
+    "height_diff": 73344,
+    "expected_target": "000000000ffff000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44007001,
+    "height_diff": 73344,
+    "expected_target": "000000000ffff434bbcb40000000000000000000000000000000000000000000",
+    "expected_bits": "1c0ffff4"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44007601,
+    "height_diff": 73344,
+    "expected_target": "000000001009d2e39d1280000000000000000000000000000000000000000000",
+    "expected_bits": "1c1009d2"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 44179800,
+    "height_diff": 73344,
+    "expected_target": "000000001fffe000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1c1fffe0"
+  },
+  {
+    "network": "signet",
+    "reference_bits": "1c0ffff0",
+    "elapsed": 132480600,
+    "height_diff": 73344,
+    "expected_target": "00000377ae000000000000000000000000000000000000000000000000000000",
+    "expected_bits": "1e0377ae"
+  }
+]
