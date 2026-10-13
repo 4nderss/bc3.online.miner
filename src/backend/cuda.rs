@@ -29,14 +29,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The BC3Hash kernel, one PTX per secp256k1 table window: the best window
-/// depends on the card's L2 - on an RTX 3050 Ti (2 MB of L2) the lab measured
-/// 110 kH/s at 10 bits and 128 at 16 - so the choice is made at run time.
+/// The BC3Hash kernel, one PTX per secp256k1 table window. Every card starts
+/// at 16; a card with the memory for them is moved to a bigger window while it
+/// mines, if it hashes faster there (src/tuning.rs).
 const BC3HASH_PTX: [(u32, &str); 4] = [
-    (10, include_str!(env!("BC3_BC3HASH_W10_PTX"))),
-    (12, include_str!(env!("BC3_BC3HASH_W12_PTX"))),
-    (14, include_str!(env!("BC3_BC3HASH_W14_PTX"))),
     (16, include_str!(env!("BC3_BC3HASH_W16_PTX"))),
+    (18, include_str!(env!("BC3_BC3HASH_W18_PTX"))),
+    (19, include_str!(env!("BC3_BC3HASH_W19_PTX"))),
+    (20, include_str!(env!("BC3_BC3HASH_W20_PTX"))),
 ];
 
 /// Threads per block for BC3Hash. Must stay 64: the kernel declares
@@ -166,7 +166,31 @@ fn check_driver() -> Result<(), String> {
     Ok(())
 }
 
+/// Compile the BC3Hash kernel for `window` into the driver's JIT cache, so
+/// that loading it later - when the window tuning switches the card - comes
+/// from the cache in about a second instead of 10-60 s of JIT.
+///
+/// On a context of its own: a JIT on the mining context blocks every launch
+/// on it until it is done (window 16 on an i9-12900HK: 16.7 s, and one launch
+/// waited all of it), while on a second context nothing waits (1234 launches
+/// meanwhile, the slowest 28 ms). The context goes when this returns, and the
+/// memory it held with it.
+pub fn compile_bc3hash_ahead(index: usize, window: u32) -> Result<Duration, String> {
+    let t0 = std::time::Instant::now();
+    let ptx = BC3HASH_PTX
+        .iter()
+        .find(|(w, _)| *w == window)
+        .map(|(_, ptx)| *ptx)
+        .ok_or_else(|| format!("no BC3Hash kernel for a window of {window} bits"))?;
+    let ctx = CudaContext::new_non_primary(index, 0).map_err(|e| format!("context: {e}"))?;
+    ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+        .map_err(|e| format!("could not load the BC3Hash kernel (window {window}): {e}"))?;
+    Ok(t0.elapsed())
+}
+
 pub struct CudaBackend {
+    /// The device's CUDA ordinal, for a context of its own to compile on.
+    index: usize,
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     name: String,
@@ -195,7 +219,7 @@ impl CudaBackend {
         let name = ctx.name().unwrap_or_else(|_| format!("CUDA device {index}"));
         let stream = ctx.default_stream();
         let slots = (0..QUEUE_DEPTH).map(|_| Slot::new(&ctx, &stream)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { ctx, stream, name, slots, queued: VecDeque::new(), next_slot: 0, bc3: None })
+        Ok(Self { index, ctx, stream, name, slots, queued: VecDeque::new(), next_slot: 0, bc3: None })
     }
 
     /// Load the BC3Hash kernel for `window` and upload its tables. The JIT
@@ -351,6 +375,41 @@ impl MiningBackend for CudaBackend {
         self.bc3.as_ref().map(|k| k.window)
     }
 
+    fn memory(&self) -> Option<(u64, u64)> {
+        self.ctx.mem_get_info().ok().map(|(free, total)| (free as u64, total as u64))
+    }
+
+    fn compile_bc3hash_ahead(&self, window: u32) -> Option<std::sync::mpsc::Receiver<()>> {
+        let (index, name) = (self.index, self.name());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name(format!("jit-{index}")).spawn(move || {
+            // Whatever happens, say it is over: the tuning waits for it.
+            struct Over(std::sync::mpsc::Sender<()>);
+            impl Drop for Over {
+                fn drop(&mut self) {
+                    let _ = self.0.send(());
+                }
+            }
+            let _over = Over(tx);
+            match compile_bc3hash_ahead(index, window) {
+                // Anything quicker came from the driver's cache: not news.
+                Ok(took) if took > Duration::from_secs(3) => crate::human!(
+                    "[gpu] {name}: BC3Hash kernel (window {window}) compiled ahead in {:.0} s",
+                    took.as_secs_f64()
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!("[gpu] {name}: compiling the BC3Hash kernel ahead failed: {e}"),
+            }
+        });
+        match spawned {
+            Ok(_) => Some(rx),
+            Err(e) => {
+                eprintln!("[gpu] could not start the BC3Hash compile thread: {e}");
+                None
+            }
+        }
+    }
+
     fn launch_granule(&self, algo: PowAlgo) -> u32 {
         match algo {
             PowAlgo::Bc3Hash => self.bc3.as_ref().map_or(1, |k| k.wave),
@@ -471,15 +530,42 @@ mod tests {
         }
     }
 
+    /// Every window the card has the memory for passes the self-test - the
+    /// node's header vectors, random headers against the CPU reference, a
+    /// scan against the CPU's hit set - and the card switches between them
+    /// and back to 16 on one context, as the tuning does.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU (run inside a --gpus all container)"]
+    fn cuda_bc3hash_every_window_passes_the_self_test() {
+        let mut backend = CudaBackend::new(0).expect("CUDA-backend");
+        let windows: Vec<u32> = BC3HASH_PTX.iter().map(|(w, _)| *w).chain([16]).collect();
+        let mut tested = 0;
+        for window in windows {
+            backend.prepare_bc3hash(16).expect("window 16 first");
+            let (free, _) = backend.memory().expect("memory");
+            // The window's tables replace 16's, which are held now.
+            let free = free + crate::tuning::table_bytes(16);
+            if crate::tuning::table_bytes(window) + (512 << 20) > free {
+                println!("window {window}: skipped, {} MiB free", free >> 20);
+                continue;
+            }
+            let took = backend.prepare_bc3hash(window).unwrap_or_else(|e| panic!("window {window}: {e}"));
+            assert_eq!(backend.bc3hash_window(), Some(window));
+            println!("window {window}: self-test passed ({:.1} s)", took.as_secs_f64());
+            tested += 1;
+        }
+        assert!(tested >= 2, "window 16, tested first and last, must always fit");
+    }
+
     /// Launches queued behind each other must each come back with their own
     /// hits - their own header, range and target - in order, through the
-    /// window-10 kernel, with the slot buffers reused round-robin and their
+    /// window-16 kernel, with the slot buffers reused round-robin and their
     /// copies skipped when unchanged.
     #[test]
     #[ignore = "needs an NVIDIA GPU (run inside a --gpus all container)"]
     fn cuda_bc3hash_queued_launches_match_the_cpu() {
         let mut backend = CudaBackend::new(0).expect("CUDA-backend");
-        backend.prepare_bc3hash(10).expect("BC3Hash window 10 passes the self-test");
+        backend.prepare_bc3hash(16).expect("BC3Hash window 16 passes the self-test");
         let mut header80 = [0u8; 80];
         header80[..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
         let mut a = header80;

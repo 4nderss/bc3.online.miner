@@ -83,6 +83,11 @@ pub enum Event {
     /// the difficulty that block needs (from the job's nBits) - so the two
     /// never show as a mismatched pair until the next stats.
     NewBlockHeight { height: u32, network_difficulty: f64 },
+    /// The BC3Hash table window a GPU mines at (by slot), the memory its
+    /// tables take, and whether it is still tuning it (src/tuning.rs). As a
+    /// measurement ends: the window it tried, and how much faster than 16
+    /// that hashed, in percent.
+    Tables { gpu: usize, window: u32, mib: u64, tuning: bool, tried: Option<u32>, gain_pct: Option<f64> },
     /// Answer to `--probe`: available hardware (the GUI asks before start).
     Probe {
         gpus: Vec<String>,

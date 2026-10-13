@@ -18,8 +18,10 @@ use crate::consensus::{
 };
 use crate::shared::{AlgoGate, FoundShare, GpuCapability, MinerJob, Shared, BC3_SLOT_FAILED};
 use crate::worker::en2_fits;
+use crate::tuning::{Action, Tuner, START_WINDOW};
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,6 +60,234 @@ const MAX_REOPENS: u32 = 5;
 
 /// How many launches in a row may fail before the device counts as gone.
 const MAX_SCAN_ERRORS: u32 = 5;
+
+/// This card's BC3Hash window tuning (src/tuning.rs), as the worker drives
+/// it: the window the card should be at, the tuner while it runs, and the
+/// background build of the tables it is to switch to.
+struct Tune {
+    want: u32,
+    tuner: Option<Tuner>,
+    /// Whether the tuning was started - or ruled out - for this card.
+    begun: bool,
+    key: String,
+    name: String,
+    slot: usize,
+    built: Option<Receiver<Result<(), String>>>,
+    /// The tables' outcome once known, waiting for the kernel's compile.
+    tables: Option<bool>,
+    /// The compile of the target's kernel ahead, while it runs.
+    jit: Option<Receiver<()>>,
+    /// The window whose ahead-built tables this card holds (bc3::release).
+    held: Option<u32>,
+    /// A switch the launch loop is to stop for; the main loop makes it.
+    switch_to: Option<u32>,
+}
+
+impl Tune {
+    fn new(shared: &Shared, slot: usize) -> Self {
+        Tune {
+            want: shared.bc3_window(),
+            tuner: None,
+            begun: false,
+            key: String::new(),
+            name: String::new(),
+            slot,
+            built: None,
+            tables: None,
+            jit: None,
+            held: None,
+            switch_to: None,
+        }
+    }
+
+    /// The window the card should be at: its tuning's, or one set by hand -
+    /// the internal tools' - which every card follows and none tunes. The
+    /// benchmark sets one window after another while the workers run.
+    fn want(&self, shared: &Shared) -> u32 {
+        if shared.bc3_window_set() {
+            shared.bc3_window()
+        } else {
+            self.want
+        }
+    }
+
+    /// Once the card mines at the start window: decide what to try, from its
+    /// free memory and the host's, or recall what was chosen before.
+    fn begin(&mut self, shared: &Shared, backend: &dyn MiningBackend) {
+        if self.begun || shared.bc3_window_set() || backend.bc3hash_window() != Some(START_WINDOW) {
+            return;
+        }
+        self.begun = true;
+        self.name = backend.name();
+        let Some((free, total)) = backend.memory() else {
+            self.announce(false);
+            return;
+        };
+        let driver = crate::telemetry::Telemetry::open().driver_version();
+        self.key = crate::tuning::key(&self.name, total, driver.as_deref());
+        let fitting = crate::tuning::largest_fitting(free, crate::tuning::available_ram());
+        let recalled = crate::tuning::recall(&self.key);
+        let Some((tuner, first)) = Tuner::start(fitting, recalled) else {
+            match recalled {
+                Some(c) if c.window > START_WINDOW => crate::human!(
+                    "[gpu] {}: BC3Hash window {} was chosen for this card, but its tables do not fit now - \
+                     staying at {START_WINDOW}",
+                    self.name,
+                    c.window
+                ),
+                Some(_) => crate::human!("[gpu] {}: BC3Hash window {START_WINDOW} - remembered for this card", self.name),
+                None => {}
+            }
+            self.announce(false);
+            return;
+        };
+        let target = tuner.target();
+        let gib = crate::tuning::table_bytes(target) as f64 / f64::from(1u32 << 30);
+        if recalled.is_some() {
+            crate::human!(
+                "[gpu] {}: building the tables of BC3Hash window {target} ({gib:.1} GiB), remembered for \
+                 this card - switching when they are ready",
+                self.name
+            );
+        } else {
+            crate::human!(
+                "[gpu] {}: tuning the BC3Hash window - building window {target} ({gib:.1} GiB of tables) \
+                 meanwhile, then measuring it against {START_WINDOW}",
+                self.name
+            );
+        }
+        self.tuner = Some(tuner);
+        self.announce(recalled.is_none());
+        if let Action::Build(w) = first {
+            self.built = Some(crate::backend::bc3::prebuild(w));
+            self.held = Some(w);
+            self.jit = backend.compile_bc3hash_ahead(w);
+        }
+    }
+
+    /// A launch came back at `window`.
+    fn launched(&mut self, window: u32, hashes: u64, busy: Duration) {
+        let Some(tuner) = self.tuner.as_mut() else { return };
+        let mut action = Action::Wait;
+        if let Some(rx) = &self.built {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.built = None;
+                    if let Err(e) = &result {
+                        eprintln!("[gpu] {}: the tables of window {} could not be built: {e}", self.name, tuner.target());
+                    }
+                    self.tables = Some(result.is_ok());
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.built = None;
+                    self.tables = Some(false);
+                }
+            }
+        }
+        if let Some(rx) = &self.jit {
+            if !matches!(rx.try_recv(), Err(TryRecvError::Empty)) {
+                self.jit = None;
+            }
+        }
+        // Ready when the tables are and the kernel's compile is over - or at
+        // once if the tables failed: there is nothing to switch to.
+        if let Some(ok) = self.tables {
+            if self.jit.is_none() || !ok {
+                self.tables = None;
+                action = tuner.built(ok);
+            }
+        }
+        if action == Action::Wait {
+            action = tuner.launched(window, hashes, busy);
+        }
+        self.act(action);
+    }
+
+    /// The card switched to `window` (`ok`), or could not.
+    fn switched(&mut self, window: u32, ok: bool) {
+        let Some(tuner) = self.tuner.as_mut() else { return };
+        if !ok {
+            self.want = START_WINDOW;
+        }
+        // The target's tables are held until the tuning is done: the card
+        // goes back to 16 to measure it again, and then maybe to the target.
+        let action = tuner.switched(window, ok);
+        self.act(action);
+    }
+
+    fn act(&mut self, action: Action) {
+        match action {
+            Action::Wait | Action::Build(_) => {}
+            Action::Switch(w) => {
+                self.want = w;
+                self.switch_to = Some(w);
+            }
+            Action::Done { choice, remember } => {
+                self.tuner = None;
+                self.release();
+                let mut measured = None;
+                if choice.start_rate > 0.0 && choice.tried_rate > 0.0 {
+                    let gain = (choice.tried_rate / choice.start_rate - 1.0) * 100.0;
+                    measured = Some((choice.tried, gain));
+                    crate::human!(
+                        "[gpu] {}: BC3Hash window {} measured {gain:+.1} % against {START_WINDOW} - {}{}",
+                        self.name,
+                        choice.tried,
+                        if choice.window == choice.tried { "kept" } else { "staying at 16" },
+                        if remember {
+                            ""
+                        } else {
+                            " for now: 16 measured differently before and after, so the next start measures again"
+                        }
+                    );
+                }
+                if remember {
+                    if let Err(e) = crate::tuning::remember(&self.key, choice) {
+                        eprintln!(
+                            "[gpu] {}: could not remember the tuned window ({e}) - it measures again next time",
+                            self.name
+                        );
+                    }
+                }
+                self.emit(false, measured);
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(w) = self.held.take() {
+            crate::backend::bc3::release(w);
+        }
+        self.built = None;
+        self.tables = None;
+        self.jit = None;
+    }
+
+    /// Tell the GUI the window this card mines at, and whether it is tuning.
+    fn announce(&self, tuning: bool) {
+        self.emit(tuning, None);
+    }
+
+    /// As `announce`, with what the measurement found: the window tried and
+    /// its gain over 16 in percent.
+    fn emit(&self, tuning: bool, measured: Option<(u32, f64)>) {
+        crate::ipc::emit(&crate::ipc::Event::Tables {
+            gpu: self.slot,
+            window: self.want,
+            mib: crate::tuning::table_bytes(self.want) >> 20,
+            tuning,
+            tried: measured.map(|m| m.0),
+            gain_pct: measured.map(|m| m.1),
+        });
+    }
+}
+
+impl Drop for Tune {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 /// `slot` is the GPU's place in the detected list (per-device statistics);
 /// `worker_index`/`total_workers` partition the extranonce2 space across all
@@ -113,7 +343,12 @@ pub fn run_gpu_worker(
             None => shared.wait_for_job(),
         };
         if job.algo == PowAlgo::Bc3Hash && backend.has_kernel(PowAlgo::Bc3Hash) {
-            prepare_bc3(&shared, &mut *backend, slot, &mut caps, &mut bc3_failed);
+            if let Some(window) = w.tune.switch_to.take() {
+                let ok = switch_bc3(&shared, &mut *backend, slot, window);
+                w.tune.switched(window, ok);
+            }
+            prepare_bc3(&shared, &mut *backend, slot, &mut caps, &mut bc3_failed, w.tune.want(&shared));
+            w.tune.begin(&shared, &*backend);
         }
         // Decided per job, so the launch loop below carries no dispatch. A
         // kernel without a CPU reference to re-check its hits against does
@@ -275,6 +510,8 @@ struct Worker<'a> {
     /// When the last launch came back, for timing launches by the host
     /// clock where the device has none.
     last_collect: Option<Instant>,
+    /// The BC3Hash window tuning of this card.
+    tune: Tune,
 }
 
 /// The header of one extranonce2, built once and used by all its launches.
@@ -323,6 +560,8 @@ struct JobRun<'j> {
     /// Set once no more launches may be queued for the job.
     ending: Option<JobEnd>,
     header: Option<En2Header>,
+    /// The BC3Hash window the launches hash at (0: none), for the tuning.
+    window: u32,
 }
 
 impl<'a> Worker<'a> {
@@ -339,6 +578,7 @@ impl<'a> Worker<'a> {
             errors: 0,
             collected: 0,
             last_collect: None,
+            tune: Tune::new(shared, slot),
         }
     }
 
@@ -376,6 +616,7 @@ impl<'a> Worker<'a> {
             inflight: VecDeque::new(),
             ending: None,
             header: None,
+            window: backend.bc3hash_window().unwrap_or(0),
         };
         let end = self.pump(backend, &mut run);
         self.prev = Some(job.clone());
@@ -420,7 +661,10 @@ impl<'a> Worker<'a> {
     /// over. Err only when the device is gone.
     fn top_up(&mut self, backend: &mut dyn MiningBackend, run: &mut JobRun) -> Result<(), JobEnd> {
         while run.ending.is_none() && run.inflight.len() < run.depth {
-            if self.shared.generation.load(Ordering::Acquire) != run.generation {
+            // A window switch ends the run like a new job: what is in flight
+            // is collected, and the main loop switches and picks the same job
+            // up again where the cursor stopped.
+            if self.shared.generation.load(Ordering::Acquire) != run.generation || self.tune.switch_to.is_some() {
                 run.ending = Some(JobEnd::Changed);
                 break;
             }
@@ -565,6 +809,9 @@ impl<'a> Worker<'a> {
         let projected = elapsed.mul_f64(f64::from(self.batch) / f64::from(done.count.max(1)));
         self.batch =
             autotune(self.batch, projected, BC3_TARGET_LAUNCH, run.granule, run.min_batch, run.max_batch);
+        if run.algo == PowAlgo::Bc3Hash && run.window != 0 {
+            self.tune.launched(run.window, u64::from(done.count), elapsed);
+        }
         elapsed
     }
 }
@@ -606,7 +853,35 @@ impl MiningBackend for Closed {
     fn abandon(&mut self) {}
 }
 
-/// Have the card's BC3Hash kernel at the window `Shared::bc3_window` asks for,
+/// Switch the card to BC3Hash window `window` for its tuning: the tables
+/// were built ahead and the kernel compiled ahead, so the card stops for the
+/// upload and the self-test only. A failure is no failure of the card - the
+/// tuning goes back to the start window, which worked - so unlike
+/// `prepare_bc3` it neither hands BC3Hash to the CPU nor says so in red.
+fn switch_bc3(shared: &Shared, backend: &mut dyn MiningBackend, slot: usize, window: u32) -> bool {
+    if backend.bc3hash_window() == Some(window) {
+        return true;
+    }
+    shared.gpu_slot_bc3[slot].store(0, Ordering::Relaxed);
+    match backend.prepare_bc3hash(window) {
+        Ok(took) => {
+            shared.gpu_slot_bc3[slot].store(window, Ordering::Relaxed);
+            crate::human!(
+                "[gpu] {}: BC3Hash window {window} ready, self-test passed ({:.1} s)",
+                backend.name(),
+                took.as_secs_f64()
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[gpu] {}: switching to BC3Hash window {window} failed ({e}) - staying at {START_WINDOW}", backend.name());
+            false
+        }
+    }
+}
+
+/// Have the card's BC3Hash kernel at window `want` - where the card starts,
+/// `Shared::bc3_window`, or where its tuning moved it -
 /// self-tested, before it mines a BC3Hash job - or know that it cannot, and
 /// let the CPU have the job. Loading means building the tables (0.1-3 s), the
 /// driver's JIT of the PTX (slow the first time on a card, cached after) and
@@ -617,8 +892,8 @@ fn prepare_bc3(
     slot: usize,
     caps: &mut GpuCapability,
     failed: &mut Option<u32>,
+    want: u32,
 ) {
-    let want = shared.bc3_window();
     // Already there, or already known not to work: say so again, for a reader
     // (the benchmark) that has reset the slot.
     if backend.bc3hash_window() == Some(want) {
@@ -1081,7 +1356,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "the stand-in mined what the card had claimed");
 
         let mut failed = None;
-        prepare_bc3(&shared, &mut NoBc3, 0, &mut caps, &mut failed);
+        prepare_bc3(&shared, &mut NoBc3, 0, &mut caps, &mut failed, shared.bc3_window());
         assert_eq!(failed, Some(shared.bc3_window()));
         assert_eq!(shared.gpu_slot_bc3[0].load(Ordering::Relaxed), BC3_SLOT_FAILED);
         assert!(!shared.gpus_mine(PowAlgo::Bc3Hash), "the failed card still claims BC3Hash");
@@ -1091,7 +1366,7 @@ mod tests {
             .expect("nothing mines BC3Hash after the card's kernel failed");
         assert_eq!(share.job_id, "j");
         // The next job looks again and finds the same failure: no claim.
-        prepare_bc3(&shared, &mut NoBc3, 0, &mut caps, &mut failed);
+        prepare_bc3(&shared, &mut NoBc3, 0, &mut caps, &mut failed, shared.bc3_window());
         assert!(!shared.gpus_mine(PowAlgo::Bc3Hash));
         shared.clear_job();
     }

@@ -397,6 +397,25 @@ pub trait MiningBackend {
         None
     }
 
+    /// Free and total device memory in bytes: what the window tuning
+    /// (src/tuning.rs) decides from. None - no tuning, the card stays at
+    /// window 16 - on OpenCL: a switch there builds the kernel from source
+    /// while the card waits, and OpenCL caps a buffer, the tables' one
+    /// included, at CL_DEVICE_MAX_MEM_ALLOC_SIZE, often a quarter of the
+    /// memory. Neither has been tried on an AMD or Intel card.
+    fn memory(&self) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Have the BC3Hash kernel for `window` compiled into the driver's cache
+    /// in the background, so that switching to it later does not stop the
+    /// card for the JIT. Returns at once, with what says when the compile is
+    /// over (done or failed); None when there is nothing to wait for - a
+    /// backend that builds its programs otherwise.
+    fn compile_bc3hash_ahead(&self, _window: u32) -> Option<std::sync::mpsc::Receiver<()>> {
+        None
+    }
+
     /// Launches of `algo` should be a whole number of this many nonces - the
     /// card's wave - so that the last wave does not run on a mostly idle card.
     fn launch_granule(&self, _algo: PowAlgo) -> u32 {

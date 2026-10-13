@@ -5,13 +5,16 @@
 //! 256 MiB of tables at 16 bits, 3.3 GiB at 20. On an RTX 4090 (24 GiB, 72 MiB
 //! of L2, at its 450 W limit throughout) window 20 hashed 5.6 % faster than 16
 //! (2.66 against 2.52 MH/s, 60 s runs), 19 3.6 % and 18 1.6 %; on an RTX 3050
-//! Ti laptop (4 GiB) 19 was about 5 % faster. Whether a card gains depends on
+//! Ti laptop (4 GiB) 19 was 2-5 % faster. Whether a card gains depends on
 //! its memory and its caches, and nobody can try every card, so the miner
 //! measures rather than guesses: it mines at 16 at once, builds the tables of
-//! the largest window that fits while it does, switches, and keeps that
-//! window only if the card hashes faster with it. The choice is remembered
-//! per card model, memory size, driver and miner version, so the next start
-//! goes straight there; a new driver or miner version measures again.
+//! the largest window that fits while it does, then measures 16, the bigger
+//! window, and 16 again, and keeps the bigger window only if the card hashes
+//! faster with it than with 16 on average. The choice is remembered per card
+//! model, memory size, driver and miner version, so the next start goes
+//! straight there; a new driver or miner version measures again.
+//!
+//! Only CUDA cards tune (see `MiningBackend::memory`); the others stay at 16.
 //!
 //! This module is the decision, driven by events and free of I/O but for the
 //! file the choices are kept in - so that it can be tested without a GPU.
@@ -42,14 +45,31 @@ const RAM_SPARE: u64 = 2 << 30;
 /// (~0.2-0.4 s) under 1 % of a rate, and the RTX 4090's rates held within
 /// 0.5 % over its 60 s runs.
 pub const MEASURE: Duration = Duration::from_secs(60);
-/// Mining before the first measurement starts: the card warms up, and a
-/// power-limited card settles its clock.
-pub const WARM_UP: Duration = Duration::from_secs(30);
-/// After a switch, before the new window is measured.
-pub const SETTLE: Duration = Duration::from_secs(10);
+/// Mining between the end of the build - the bigger window's tables and its
+/// kernel - and the first measurement. The build keeps every core busy, and
+/// in a laptop the CPU and the GPU share one power budget and one cooling
+/// system, which the GPU gets back slowly: an RTX 3050 Ti laptop
+/// (i9-12900HK, the GPU holding at 74 C) dropped from 40 to 27 W while the
+/// build ran, and was back at 40 W only 90 s after it. Its first
+/// measurement of 16 right after the build came out 20 % low, and window 19
+/// looked 11.5 % faster; with this warm-up the tuning measured +3.7 %, where
+/// alternated runs give 2-5 %. The card warms up meanwhile, too.
+pub const WARM_UP: Duration = Duration::from_secs(90);
+/// After a switch, before the new window is measured. The switch idles the
+/// card for a second or two, and a power-limited card comes back faster than
+/// it settles: an RTX 3050 Ti laptop ran 2 % faster for half a minute.
+pub const SETTLE: Duration = Duration::from_secs(30);
 /// The bigger window must be at least this much faster to be kept: its
 /// tables cost memory and start-up time, and measuring has a spread too.
 pub const MIN_GAIN: f64 = 0.005;
+/// How far the two measurements of the start window - before the bigger
+/// window and after it - may differ for the choice to be remembered. Their
+/// mean cancels a clock that drifts as the card warms up; a bigger
+/// difference means something else moved the rate, so the choice is used
+/// but the next start measures again. An RTX 3050 Ti laptop drifted 2-4 %
+/// in a few minutes of mining; a measurement the build's power sharing
+/// still held down (see WARM_UP) was 20 % off.
+pub const MAX_DRIFT: f64 = 0.05;
 
 /// Size of the GPU tables at `window` (bc3hash::gpu_tables): the three power
 /// tables, then four curves of (256 / w rounded up) rows of 2^w - 1 points of
@@ -203,24 +223,29 @@ pub enum Action {
     Build(u32),
     /// Switch the card to this window now: its tables are ready.
     Switch(u32),
-    /// The tuning is over; remember this.
-    Done(Choice),
+    /// The tuning is over: the card stays at `choice.window`. `remember`:
+    /// whether the choice is sound enough for the next start to go straight
+    /// to it - not when the start window measured differently twice.
+    Done { choice: Choice, remember: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
-    /// Mining at START_WINDOW, its warm-up not over yet.
+    /// Mining at START_WINDOW while the target's tables are built, and then
+    /// for the warm-up; only the time after the build counts.
     WarmUp { mined: Duration },
-    /// Measuring START_WINDOW (the target's tables are being built meanwhile).
+    /// Measuring START_WINDOW.
     MeasureStart { rate: Rate },
-    /// Start measured; waiting for the target's tables.
-    AwaitBuilt { start: f64 },
     /// Switched to the target, letting it settle.
-    Settle { start: f64, mined: Duration },
+    Settle { before: f64, mined: Duration },
     /// Measuring the target.
-    MeasureTarget { start: f64, rate: Rate },
-    /// Going back to START_WINDOW, the target having lost.
-    Revert { choice: Choice },
+    MeasureTarget { before: f64, rate: Rate },
+    /// Back at START_WINDOW, letting it settle.
+    SettleBack { before: f64, tried: f64, mined: Duration },
+    /// Measuring START_WINDOW again.
+    MeasureBack { before: f64, tried: f64, rate: Rate },
+    /// Going to the target for good, it having won.
+    Return { choice: Choice, remember: bool },
     /// Going straight to a remembered window, unmeasured.
     Recalled { window: u32 },
     Finished,
@@ -266,8 +291,7 @@ impl Tuner {
             });
         }
         let t = Tuner { target: fitting, built: false, phase: Phase::WarmUp { mined: Duration::ZERO } };
-        // The tables take seconds to build; the warm-up and the measurement
-        // of the start window run meanwhile.
+        // The card mines at the start window while the tables are built.
         Some((t, Action::Build(fitting)))
     }
 
@@ -277,9 +301,12 @@ impl Tuner {
     }
 
     /// A launch came back: `hashes` hashed at `window` in `busy` of GPU time.
+    /// A launch at a window the phase does not expect - one still in flight
+    /// across a switch - counts for nothing.
     pub fn launched(&mut self, window: u32, hashes: u64, busy: Duration) -> Action {
+        let target = self.target;
         match &mut self.phase {
-            Phase::WarmUp { mined } if window == START_WINDOW => {
+            Phase::WarmUp { mined } if window == START_WINDOW && self.built => {
                 *mined += busy;
                 if *mined >= WARM_UP {
                     self.phase = Phase::MeasureStart { rate: Rate::default() };
@@ -288,48 +315,56 @@ impl Tuner {
             }
             Phase::MeasureStart { rate } if window == START_WINDOW => {
                 rate.add(hashes, busy);
-                if rate.busy >= MEASURE {
-                    let start = rate.per_second();
-                    self.phase = Phase::AwaitBuilt { start };
-                    if self.built {
-                        return self.switch_to_target(start);
-                    }
+                if rate.busy < MEASURE {
+                    return Action::Wait;
                 }
-                Action::Wait
+                self.phase = Phase::Settle { before: rate.per_second(), mined: Duration::ZERO };
+                Action::Switch(target)
             }
-            Phase::Settle { start, mined } if window == self.target => {
+            Phase::Settle { before, mined } if window == target => {
                 *mined += busy;
                 if *mined >= SETTLE {
-                    let start = *start;
-                    self.phase = Phase::MeasureTarget { start, rate: Rate::default() };
+                    self.phase = Phase::MeasureTarget { before: *before, rate: Rate::default() };
                 }
                 Action::Wait
             }
-            Phase::MeasureTarget { start, rate } if window == self.target => {
+            Phase::MeasureTarget { before, rate } if window == target => {
                 rate.add(hashes, busy);
                 if rate.busy < MEASURE {
                     return Action::Wait;
                 }
-                let (start, tried_rate) = (*start, rate.per_second());
-                let keep = tried_rate > start * (1.0 + MIN_GAIN);
+                self.phase = Phase::SettleBack { before: *before, tried: rate.per_second(), mined: Duration::ZERO };
+                Action::Switch(START_WINDOW)
+            }
+            Phase::SettleBack { before, tried, mined } if window == START_WINDOW => {
+                *mined += busy;
+                if *mined >= SETTLE {
+                    self.phase = Phase::MeasureBack { before: *before, tried: *tried, rate: Rate::default() };
+                }
+                Action::Wait
+            }
+            Phase::MeasureBack { before, tried, rate } if window == START_WINDOW => {
+                rate.add(hashes, busy);
+                if rate.busy < MEASURE {
+                    return Action::Wait;
+                }
+                let (before, after, tried) = (*before, rate.per_second(), *tried);
+                let start_rate = (before + after) / 2.0;
+                let remember = (before - after).abs() <= start_rate * MAX_DRIFT;
+                let keep = tried > start_rate * (1.0 + MIN_GAIN);
                 let choice = Choice {
-                    window: if keep { self.target } else { START_WINDOW },
-                    start_rate: start,
-                    tried: self.target,
-                    tried_rate,
+                    window: if keep { target } else { START_WINDOW },
+                    start_rate,
+                    tried: target,
+                    tried_rate: tried,
                 };
                 if keep {
-                    self.phase = Phase::Finished;
-                    Action::Done(choice)
+                    self.phase = Phase::Return { choice, remember };
+                    Action::Switch(target)
                 } else {
-                    self.phase = Phase::Revert { choice };
-                    Action::Switch(START_WINDOW)
+                    self.phase = Phase::Finished;
+                    Action::Done { choice, remember }
                 }
-            }
-            Phase::Revert { choice } if window == START_WINDOW => {
-                let choice = *choice;
-                self.phase = Phase::Finished;
-                Action::Done(choice)
             }
             _ => Action::Wait,
         }
@@ -341,38 +376,40 @@ impl Tuner {
             // Nothing to switch to: stay at the start window, and do not
             // remember it - the next start may have the memory.
             self.phase = Phase::Finished;
-            return Action::Wait;
+            let choice = Choice { window: START_WINDOW, start_rate: 0.0, tried: self.target, tried_rate: 0.0 };
+            return Action::Done { choice, remember: false };
         }
         self.built = true;
         match self.phase {
-            Phase::AwaitBuilt { start } => self.switch_to_target(start),
-            Phase::Recalled { window } => {
-                self.phase = Phase::Finished;
-                Action::Switch(window)
-            }
+            Phase::Recalled { window } => Action::Switch(window),
             _ => Action::Wait,
         }
     }
 
     /// The card switched to `window` (`ok`), or the switch failed - its
-    /// self-test, its memory. A failed target falls back to the start window
-    /// and is remembered as such.
+    /// self-test, its memory. Every failure ends the tuning at the start
+    /// window.
     pub fn switched(&mut self, window: u32, ok: bool) -> Action {
-        if ok || window == START_WINDOW {
-            return Action::Wait;
-        }
+        let unmeasured = |window, tried| Choice { window, start_rate: 0.0, tried, tried_rate: 0.0 };
+        let done = match self.phase {
+            Phase::Return { choice, remember } if ok && window == self.target => Action::Done { choice, remember },
+            // Already in the file: nothing to write again.
+            Phase::Recalled { .. } if ok => Action::Done { choice: unmeasured(window, window), remember: false },
+            _ if ok => return Action::Wait,
+            // A target that fails is remembered as such: the card stays at the
+            // start window until a new driver or miner version.
+            _ if window != START_WINDOW => Action::Done { choice: unmeasured(START_WINDOW, window), remember: true },
+            // The start window itself, on the way back: no answer at all.
+            _ => Action::Done { choice: unmeasured(START_WINDOW, self.target), remember: false },
+        };
         self.phase = Phase::Finished;
-        Action::Done(Choice { window: START_WINDOW, start_rate: 0.0, tried: window, tried_rate: 0.0 })
+        done
     }
 
     /// Whether the tuning is over.
+    #[cfg(test)]
     pub fn finished(&self) -> bool {
         self.phase == Phase::Finished
-    }
-
-    fn switch_to_target(&mut self, start: f64) -> Action {
-        self.phase = Phase::Settle { start, mined: Duration::ZERO };
-        Action::Switch(self.target)
     }
 }
 
@@ -412,48 +449,60 @@ mod tests {
 
     /// Drive a tuner through launches of `busy` each at the window the card
     /// is at, applying its actions; `built_after` launches until the tables
-    /// are ready. Returns the actions seen.
-    fn run(tuner: &mut Tuner, first: Action, rate_at: impl Fn(u32) -> f64, built_after: usize) -> Vec<Action> {
+    /// are ready, `rate_at(window, launch)` the card's rate. Returns the
+    /// actions seen.
+    fn run(tuner: &mut Tuner, first: Action, rate_at: impl Fn(u32, usize) -> f64, built_after: usize) -> Vec<Action> {
         let busy = Duration::from_millis(250);
         let mut window = START_WINDOW;
         let mut actions = vec![first];
-        for n in 0..2000 {
-            if n == built_after {
-                let a = tuner.built(true);
-                if a != Action::Wait {
-                    actions.push(a);
-                }
-                if let Action::Switch(w) = a {
-                    window = w;
-                    assert_eq!(tuner.switched(w, true), Action::Wait);
-                }
-            }
-            let hashes = (rate_at(window) * busy.as_secs_f64()) as u64;
-            let a = tuner.launched(window, hashes, busy);
+        let apply = |a: Action, window: &mut u32, tuner: &mut Tuner, actions: &mut Vec<Action>| {
             if a != Action::Wait {
                 actions.push(a);
             }
-            match a {
-                Action::Switch(w) => {
-                    window = w;
-                    assert_eq!(tuner.switched(w, true), Action::Wait);
+            if let Action::Switch(w) = a {
+                *window = w;
+                let after = tuner.switched(w, true);
+                if after != Action::Wait {
+                    actions.push(after);
                 }
-                Action::Done(_) => break,
-                _ => {}
+            }
+        };
+        for n in 0..5000 {
+            if n == built_after {
+                let a = tuner.built(true);
+                apply(a, &mut window, tuner, &mut actions);
+            }
+            if tuner.finished() {
+                break;
+            }
+            let hashes = (rate_at(window, n) * busy.as_secs_f64()) as u64;
+            let a = tuner.launched(window, hashes, busy);
+            apply(a, &mut window, tuner, &mut actions);
+            if tuner.finished() {
+                break;
             }
         }
         actions
+    }
+
+    fn done(actions: &[Action]) -> (Choice, bool) {
+        match actions.last() {
+            Some(&Action::Done { choice, remember }) => (choice, remember),
+            _ => panic!("not done: {actions:?}"),
+        }
     }
 
     #[test]
     fn a_faster_bigger_window_is_kept() {
         let (mut t, first) = Tuner::start(Some(20), None).unwrap();
         assert_eq!(first, Action::Build(20));
-        let actions = run(&mut t, first, |w| if w == 20 { 2.66e6 } else { 2.52e6 }, 40);
-        assert_eq!(actions[1], Action::Switch(20));
-        let Action::Done(c) = *actions.last().unwrap() else { panic!("{actions:?}") };
+        let actions = run(&mut t, first, |w, _| if w == 20 { 2.66e6 } else { 2.52e6 }, 40);
+        // 16, 20, 16 again, and back to 20 for good.
+        assert_eq!(actions[1..4], [Action::Switch(20), Action::Switch(START_WINDOW), Action::Switch(20)]);
+        let (c, remember) = done(&actions);
         assert_eq!(c.window, 20);
         assert!((c.start_rate - 2.52e6).abs() < 1e3 && (c.tried_rate - 2.66e6).abs() < 1e3);
+        assert!(remember);
         assert!(t.finished());
     }
 
@@ -461,20 +510,110 @@ mod tests {
     fn a_window_that_is_not_faster_goes_back() {
         let (mut t, first) = Tuner::start(Some(19), None).unwrap();
         // 0.2 % faster is within the spread: not worth 1.75 GiB.
-        let actions = run(&mut t, first, |w| if w == 19 { 2.505e6 } else { 2.50e6 }, 10);
-        assert_eq!(actions[1], Action::Switch(19));
-        assert_eq!(actions[2], Action::Switch(START_WINDOW));
-        let Action::Done(c) = *actions.last().unwrap() else { panic!("{actions:?}") };
+        let actions = run(&mut t, first, |w, _| if w == 19 { 2.505e6 } else { 2.50e6 }, 10);
+        assert_eq!(actions[1..3], [Action::Switch(19), Action::Switch(START_WINDOW)]);
+        let (c, remember) = done(&actions);
         assert_eq!((c.window, c.tried), (START_WINDOW, 19));
+        assert!(remember, "a steady loss is as good an answer as a win");
+        assert_eq!(actions.len(), 4, "no switch after the decision: {actions:?}");
+    }
+
+    #[test]
+    fn a_drifting_clock_cancels_out() {
+        // Both windows equally fast, the clock rising 0.5 % a minute: 16
+        // measured once, before, would make the bigger window look 0.7 %
+        // faster - over MIN_GAIN. Measured before and after, it is not.
+        let rising = |_: u32, n: usize| 2.5e6 * (1.0 + 2e-5 * n as f64);
+        let (mut t, first) = Tuner::start(Some(20), None).unwrap();
+        let (c, remember) = done(&run(&mut t, first, rising, 10));
+        assert_eq!(c.window, START_WINDOW, "{c:?}");
+        assert!((c.tried_rate / c.start_rate - 1.0).abs() < 1e-3, "{c:?}");
+        assert!(remember, "1.4 % between the two is drift, not a disturbance");
+    }
+
+    #[test]
+    fn a_disturbed_measurement_is_used_but_not_remembered() {
+        // 16 at 1.82 the first time and 2.15 the second, as the laptop's
+        // power sharing had it: the choice stands for now, the next start
+        // measures again.
+        let (mut t, first) = Tuner::start(Some(19), None).unwrap();
+        let rate = |w: u32, n: usize| match (w, n < 700) {
+            (START_WINDOW, true) => 1.82e6,
+            (START_WINDOW, false) => 2.15e6,
+            _ => 2.2e6,
+        };
+        let (c, remember) = done(&run(&mut t, first, rate, 10));
+        assert_eq!(c.window, 19);
+        assert!((c.start_rate - 1.985e6).abs() < 1e3, "{c:?}");
+        assert!(!remember);
     }
 
     #[test]
     fn slow_tables_are_waited_for() {
-        // The start window is measured long before the tables are ready.
+        // The tables come long after the warm-up; the start window's rate
+        // while they were built (here 2.0, the CPU busy) must not count.
         let (mut t, first) = Tuner::start(Some(20), None).unwrap();
-        let actions = run(&mut t, first, |w| if w == 20 { 2.6e6 } else { 2.5e6 }, 1500);
-        assert_eq!(actions[1], Action::Switch(20));
-        assert!(matches!(actions.last(), Some(Action::Done(Choice { window: 20, .. }))));
+        let built_after = 1000;
+        let rate = |w: u32, n: usize| match (w, n < built_after) {
+            (START_WINDOW, true) => 2.0e6,
+            (START_WINDOW, false) => 2.5e6,
+            _ => 2.6e6,
+        };
+        let actions = run(&mut t, first, rate, built_after);
+        let (c, _) = done(&actions);
+        assert_eq!(c.window, 20);
+        assert!((c.start_rate - 2.5e6).abs() < 1e3, "start rate {} includes the build", c.start_rate);
+    }
+
+    #[test]
+    fn the_start_window_is_measured_after_the_build_and_the_warm_up() {
+        // Launches of 0.25 s: the warm-up is 360 of them after the build,
+        // the measurement 240 more.
+        let (mut t, _) = Tuner::start(Some(20), None).unwrap();
+        let busy = Duration::from_millis(250);
+        let built_after = 1000;
+        for n in 0..built_after + 360 + 240 {
+            if n == built_after {
+                assert_eq!(t.built(true), Action::Wait);
+            }
+            let a = t.launched(START_WINDOW, 625_000, busy);
+            let expect = if n + 1 == built_after + 360 + 240 { Action::Switch(20) } else { Action::Wait };
+            assert_eq!(a, expect, "launch {n}");
+        }
+    }
+
+    #[test]
+    fn a_launch_from_before_a_switch_counts_for_nothing() {
+        let (mut t, first) = Tuner::start(Some(20), None).unwrap();
+        // Every launch at the window the phase does not expect - as one in
+        // flight across a switch would be - at an absurd rate.
+        let actions = run(&mut t, first, |w, _| if w == 20 { 2.6e6 } else { 2.5e6 }, 10);
+        let (c, _) = done(&actions);
+        let (mut u, _) = Tuner::start(Some(20), None).unwrap();
+        assert_eq!(u.built(true), Action::Wait);
+        let busy = Duration::from_millis(250);
+        let mut window = START_WINDOW;
+        let mut result = None;
+        for _ in 0..5000 {
+            let stray = if window == START_WINDOW { 20 } else { START_WINDOW };
+            assert_eq!(u.launched(stray, u64::MAX / 8, busy), Action::Wait);
+            let rate = if window == 20 { 2.6e6 } else { 2.5e6 };
+            match u.launched(window, (rate * 0.25) as u64, busy) {
+                Action::Switch(w) => {
+                    window = w;
+                    if let Action::Done { choice, .. } = u.switched(w, true) {
+                        result = Some(choice);
+                        break;
+                    }
+                }
+                Action::Done { choice, .. } => {
+                    result = Some(choice);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(result, Some(c));
     }
 
     #[test]
@@ -484,6 +623,8 @@ mod tests {
         assert_eq!(first, Action::Build(19));
         assert_eq!(t.launched(START_WINDOW, 1000, Duration::from_secs(100)), Action::Wait);
         assert_eq!(t.built(true), Action::Switch(19));
+        // Already in the file: nothing to write again.
+        assert!(matches!(t.switched(19, true), Action::Done { choice: Choice { window: 19, .. }, remember: false }));
         assert!(t.finished());
         // ...but only if it still fits.
         assert!(Tuner::start(Some(18), Some(c)).is_none());
@@ -499,11 +640,29 @@ mod tests {
 
     #[test]
     fn a_failed_build_or_switch_stays_at_the_start_window() {
+        // Tables that could not be built: nothing remembered, the next start
+        // may have the memory.
         let (mut t, _) = Tuner::start(Some(20), None).unwrap();
-        assert_eq!(t.built(false), Action::Wait);
+        assert!(matches!(
+            t.built(false),
+            Action::Done { choice: Choice { window: START_WINDOW, tried: 20, .. }, remember: false }
+        ));
         assert!(t.finished());
+        // A switch that failed - the self-test, the card's memory - is
+        // remembered: the card stays at 16 until a new driver or version.
         let (mut t, _) = Tuner::start(Some(20), None).unwrap();
-        assert!(matches!(t.switched(20, false), Action::Done(Choice { window: START_WINDOW, tried: 20, .. })));
+        assert!(matches!(
+            t.switched(20, false),
+            Action::Done { choice: Choice { window: START_WINDOW, tried: 20, .. }, remember: true }
+        ));
+        // So is a remembered window that fails.
+        let c = Choice { window: 19, start_rate: 1.0, tried: 19, tried_rate: 2.0 };
+        let (mut t, _) = Tuner::start(Some(20), Some(c)).unwrap();
+        assert_eq!(t.built(true), Action::Switch(19));
+        assert!(matches!(
+            t.switched(19, false),
+            Action::Done { choice: Choice { window: START_WINDOW, tried: 19, .. }, remember: true }
+        ));
     }
 
     #[test]

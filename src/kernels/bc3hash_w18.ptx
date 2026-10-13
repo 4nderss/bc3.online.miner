@@ -29339,7 +29339,7 @@ $L__BB6_6:
 
 $L__BB6_7:
 	add.u64 	%rd726, %SPL, 0;
-	mul.lo.s32 	%r719, %r8233, 14;
+	mul.lo.s32 	%r719, %r8233, 18;
 	shr.u32 	%r720, %r719, 6;
 	and.b32  	%r3, %r719, 62;
 	mul.wide.u32 	%rd96, %r720, 8;
@@ -29359,11 +29359,11 @@ $L__BB6_7:
 	or.b64  	%rd754, %rd99, %rd754;
 
 $L__BB6_9:
-	and.b64  	%rd32, %rd754, 16383;
+	and.b64  	%rd32, %rd754, 262143;
 	setp.eq.s64 	%p17, %rd32, 0;
 	@%p17 bra 	$L__BB6_124;
 
-	mul.lo.s32 	%r724, %r8233, 16383;
+	mul.lo.s32 	%r724, %r8233, 262143;
 	cvt.u64.u32 	%rd100, %r724;
 	add.s64 	%rd101, %rd32, %rd100;
 	shl.b64 	%rd103, %rd101, 6;
@@ -36582,7 +36582,7 @@ $L__BB6_123:
 
 $L__BB6_124:
 	add.s32 	%r8233, %r8233, 1;
-	setp.ne.s32 	%p201, %r8233, 19;
+	setp.ne.s32 	%p201, %r8233, 15;
 	@%p201 bra 	$L__BB6_7;
 
 	ret;
@@ -36662,7 +36662,7 @@ $L__BB6_124:
 	add.s64 	%rd80, %rd77, 32;
 	add.s64 	%rd81, %rd75, 32;
 	or.b64  	%rd82, %rd78, 4;
-	add.s64 	%rd83, %rd58, 19921728;
+	add.s64 	%rd83, %rd58, 251657280;
 	{ // callseq 1, 0
 	.reg .b32 temp_param_reg;
 	.param .b64 param0;
@@ -36695,7 +36695,7 @@ $L__BB6_124:
 	add.s64 	%rd85, %rd77, 64;
 	add.s64 	%rd86, %rd75, 64;
 	or.b64  	%rd87, %rd78, 8;
-	add.s64 	%rd88, %rd58, 39843456;
+	add.s64 	%rd88, %rd58, 503314560;
 	{ // callseq 2, 0
 	.reg .b32 temp_param_reg;
 	.param .b64 param0;
@@ -36728,7 +36728,7 @@ $L__BB6_124:
 	add.s64 	%rd90, %rd77, 96;
 	add.s64 	%rd91, %rd75, 96;
 	or.b64  	%rd92, %rd78, 12;
-	add.s64 	%rd93, %rd58, 59765184;
+	add.s64 	%rd93, %rd58, 754971840;
 	{ // callseq 3, 0
 	.reg .b32 temp_param_reg;
 	.param .b64 param0;

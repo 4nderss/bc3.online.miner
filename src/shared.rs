@@ -1,7 +1,7 @@
 //! State shared between the stratum client and the worker threads.
 
 use crate::consensus::{difficulty_of_bits, PowAlgo, Target};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 #[cfg(test)]
 use std::sync::Arc;
@@ -189,6 +189,8 @@ pub struct Shared {
     /// The secp256k1 table window the GPUs' BC3Hash kernels should use; the
     /// GPU workers switch to it before their next BC3Hash job.
     bc3_window: AtomicU32,
+    /// A window set by hand (the internal tools): the cards do not tune it.
+    bc3_window_set: AtomicBool,
     /// Hashes per GPU (by the GPU's slot in the detected list), for the
     /// benchmark's per-device rates.
     pub gpu_slot_hashes: Vec<AtomicU64>,
@@ -380,6 +382,7 @@ impl Shared {
             gpu_capable: Default::default(),
             gpus_opened: AtomicU32::new(0),
             bc3_window: AtomicU32::new(DEFAULT_BC3_WINDOW),
+            bc3_window_set: AtomicBool::new(false),
             gpu_slot_hashes: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
             gpu_slot_bc3: (0..plan.gpus).map(|_| AtomicU32::new(0)).collect(),
             gpu_slot_stamp: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
@@ -431,16 +434,25 @@ impl Shared {
         }
     }
 
-    /// The BC3Hash table window the GPUs should use.
+    /// The BC3Hash table window the GPUs start at - and stay at, if it was
+    /// set by hand (`bc3_window_set`); else each card tunes its own.
     pub fn bc3_window(&self) -> u32 {
         self.bc3_window.load(Ordering::Relaxed)
     }
 
+    /// Whether the window was set by hand (the internal tools), which turns
+    /// the cards' window tuning off.
+    pub fn bc3_window_set(&self) -> bool {
+        self.bc3_window_set.load(Ordering::Relaxed)
+    }
+
     /// Ask the GPUs for another BC3Hash window; they switch before their next
-    /// BC3Hash job, so publish a job after this. Only the internal tools do:
-    /// a release mines at `DEFAULT_BC3_WINDOW`.
+    /// BC3Hash job, so publish a job after this, and none tunes its own from
+    /// then on. Only the internal tools do: a release starts every card at
+    /// `DEFAULT_BC3_WINDOW` and lets it tune (src/tuning.rs).
     #[cfg(feature = "internal-tools")]
     pub fn set_bc3_window(&self, window: u32) {
+        self.bc3_window_set.store(true, Ordering::Relaxed);
         self.bc3_window.store(window, Ordering::Relaxed);
     }
 

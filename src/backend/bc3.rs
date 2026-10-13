@@ -4,7 +4,8 @@
 
 use super::{Launch, MiningBackend, QUEUE_DEPTH};
 use crate::consensus::{PowAlgo, Target};
-use std::sync::{Arc, Weak};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, Weak};
 
 /// The kernel source, for the OpenCL backend, which builds it at run time
 /// (`-DBC3_WINDOW=N`); CUDA embeds the PTX that build.rs made from it.
@@ -17,9 +18,13 @@ pub const SOURCE: &str = include_str!("../kernels/bc3hash.cl");
 /// Held only as long as a card is uploading them. Kept for the life of the
 /// process, they were 256 MiB of RAM nobody read again after the start; a
 /// card that loads them later (a reopen, another window) builds them again,
-/// about 3 s at window 16.
+/// about 1.3 s at window 16 on 20 threads. Tables built ahead for a switch
+/// (`prebuild`) come from there.
 pub fn host_tables(window: u32) -> Result<Arc<Vec<u64>>, String> {
-    static CACHE: std::sync::Mutex<Option<(u32, Weak<Vec<u64>>)>> = std::sync::Mutex::new(None);
+    if let Some(tables) = prebuilt(window) {
+        return Ok(tables);
+    }
+    static CACHE: Mutex<Option<(u32, Weak<Vec<u64>>)>> = Mutex::new(None);
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((w, tables)) = cache.as_ref() {
         if *w == window {
@@ -32,6 +37,90 @@ pub fn host_tables(window: u32) -> Result<Arc<Vec<u64>>, String> {
     let tables = Arc::new(bc3hash::gpu_tables(window)?);
     *cache = Some((window, Arc::downgrade(&tables)));
     Ok(tables)
+}
+
+/// Tables built ahead of a switch to a bigger window, by window: built once
+/// for every card that asks for them (a rig of eight builds 3.3 GiB once, not
+/// eight times), and kept until the last of those cards has let go.
+struct Prebuilt {
+    window: u32,
+    holders: usize,
+    state: Prebuild,
+}
+
+enum Prebuild {
+    Building(Vec<Sender<Result<(), String>>>),
+    Ready(Arc<Vec<u64>>),
+    Failed(String),
+}
+
+static PREBUILT: Mutex<Vec<Prebuilt>> = Mutex::new(Vec::new());
+
+/// Build the tables of `window` in the background, for a card that will
+/// switch to it; the receiver says when they are ready (or why not). Every
+/// call must be matched by a `release`.
+pub fn prebuild(window: u32) -> Receiver<Result<(), String>> {
+    let (tx, rx) = channel();
+    let mut list = PREBUILT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = list.iter_mut().find(|p| p.window == window) {
+        p.holders += 1;
+        match &mut p.state {
+            Prebuild::Building(waiting) => waiting.push(tx),
+            Prebuild::Ready(_) => {
+                let _ = tx.send(Ok(()));
+            }
+            Prebuild::Failed(e) => {
+                let _ = tx.send(Err(e.clone()));
+            }
+        }
+        return rx;
+    }
+    list.push(Prebuilt { window, holders: 1, state: Prebuild::Building(vec![tx]) });
+    drop(list);
+    let spawned = std::thread::Builder::new().name(format!("tables-{window}")).spawn(move || {
+        let built = bc3hash::gpu_tables(window).map(Arc::new);
+        finish_prebuild(window, built);
+    });
+    if let Err(e) = spawned {
+        finish_prebuild(window, Err(format!("could not start a thread: {e}")));
+    }
+    rx
+}
+
+fn finish_prebuild(window: u32, built: Result<Arc<Vec<u64>>, String>) {
+    let mut list = PREBUILT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(p) = list.iter_mut().find(|p| p.window == window) else { return };
+    let next = match &built {
+        Ok(t) => Prebuild::Ready(t.clone()),
+        Err(e) => Prebuild::Failed(e.clone()),
+    };
+    if let Prebuild::Building(waiting) = std::mem::replace(&mut p.state, next) {
+        for tx in waiting {
+            let _ = tx.send(built.as_ref().map(|_| ()).map_err(|e| e.clone()));
+        }
+    }
+}
+
+/// The tables of `window`, if they were built ahead and are ready.
+fn prebuilt(window: u32) -> Option<Arc<Vec<u64>>> {
+    let list = PREBUILT.lock().unwrap_or_else(|e| e.into_inner());
+    list.iter().find(|p| p.window == window).and_then(|p| match &p.state {
+        Prebuild::Ready(t) => Some(t.clone()),
+        _ => None,
+    })
+}
+
+/// A card that asked for `window` ahead is done with it - switched, or
+/// gave up. The last one lets the tables go (a build still running finishes
+/// into nothing).
+pub fn release(window: u32) {
+    let mut list = PREBUILT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = list.iter().position(|p| p.window == window) {
+        list[i].holders = list[i].holders.saturating_sub(1);
+        if list[i].holders == 0 {
+            list.remove(i);
+        }
+    }
 }
 
 /// The share target as the kernel takes it: four u64 limbs, least

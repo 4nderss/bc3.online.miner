@@ -27,10 +27,10 @@ pub struct Tools {
     #[arg(long, value_enum, env = "BC3_BC3HASH_MODE")]
     bc3hash_mode: Option<Bc3HashMode>,
 
-    /// Table window of the GPU's BC3Hash kernel in bits: 10 (7 MiB), 12
-    /// (22 MiB), 14 (76 MiB) or 16 (256 MiB of GPU memory). Bigger is faster
-    /// as long as the card's L2 keeps up; `--benchmark` without it compares
-    /// all four. Default 16.
+    /// Table window of the GPU's BC3Hash kernel in bits: 16 (256 MiB of GPU
+    /// memory), 18 (0.9 GiB), 19 (1.8 GiB) or 20 (3.3 GiB). Fixes the window:
+    /// without it every card starts at 16 and tunes its own while it mines
+    /// (src/tuning.rs). `--benchmark` without it compares all four.
     #[cfg(feature = "bc3hash")]
     #[arg(long, env = "BC3_BC3HASH_WINDOW", value_parser = parse_bc3_window)]
     bc3_window: Option<u32>,
@@ -50,8 +50,16 @@ pub struct Tools {
     #[arg(long, value_name = "JOB.json", conflicts_with = "benchmark")]
     solve: Option<std::path::PathBuf>,
 
+    /// Benchmark: leave the window to each card's tuning, as a release does,
+    /// instead of comparing windows - to watch the tuning without a pool.
+    /// Set BC3_TUNING_FILE to a new file to measure instead of recalling.
+    #[cfg(feature = "bc3hash")]
+    #[arg(long, requires = "benchmark", conflicts_with = "bc3_window")]
+    tune: bool,
+
     /// Benchmark: seconds to measure. Comparing the BC3Hash windows, each
-    /// window runs twice for this long (default 20); otherwise 60.
+    /// window runs twice for this long (default 20); with --tune 540, time
+    /// for the tuning to finish; otherwise 60.
     #[arg(long)]
     seconds: Option<u64>,
 
@@ -78,7 +86,7 @@ fn parse_bc3_window(s: &str) -> Result<u32, String> {
 
 /// The table windows there is a GPU kernel for (see build.rs).
 #[cfg(feature = "bc3hash")]
-const BC3_WINDOWS: [u32; 4] = [10, 12, 14, 16];
+const BC3_WINDOWS: [u32; 4] = [16, 18, 19, 20];
 
 /// Size of the BC3Hash tables - see `bc3hash::Mode`.
 #[cfg(feature = "bc3hash")]
@@ -157,20 +165,28 @@ impl Tools {
                 },
             );
         }
+        // Window 0: the benchmark leaves the window alone, and each card
+        // tunes its own (--tune).
         #[cfg(feature = "bc3hash")]
         let windows = match self.bc3_window {
             Some(w) => vec![w],
+            None if self.tune => vec![0],
             None if devices.bc3.contains(&true) => BC3_WINDOWS.to_vec(),
             None => vec![shared.bc3_window()],
         };
         #[cfg(not(feature = "bc3hash"))]
         let windows = vec![shared.bc3_window()];
         let compare = windows.len() > 1;
+        // The tuning takes about seven minutes: the bigger window's tables
+        // and kernel, a minute and a half of warm-up after them, a minute
+        // each of 16, it and 16 again, half a minute's settling after each
+        // switch.
+        let tuning = windows == [0];
         bench::run(
             shared,
             rx,
             bench::Config {
-                seconds: self.seconds.unwrap_or(if compare { 20 } else { 60 }),
+                seconds: self.seconds.unwrap_or(if compare { 20 } else if tuning { 540 } else { 60 }),
                 difficulty: self.difficulty,
                 windows,
                 gpu_names: devices.names,

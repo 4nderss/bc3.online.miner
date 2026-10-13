@@ -29,8 +29,10 @@ use std::process::Command;
 /// The kernel source every PTX is built from.
 const SOURCE: &str = "src/kernels/bc3hash.cl";
 
-/// The table windows there is a PTX for.
-const WINDOWS: [u32; 4] = [10, 12, 14, 16];
+/// The table windows there is a PTX for: 16, where every card starts, and the
+/// bigger ones the tuning (src/tuning.rs) may move a card with the memory to.
+/// 10-14 never beat 16 on any card measured, and cost 2.4 MB each.
+const WINDOWS: [u32; 4] = [16, 18, 19, 20];
 
 /// Lowest architecture the PTX must be JITable for (Maxwell and upwards).
 const ARCH: &str = "compute_52";

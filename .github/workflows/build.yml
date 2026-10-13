@@ -55,7 +55,7 @@ jobs:
       - name: Regenerate the PTX from the kernel source
         run: |
           # One PTX per secp256k1 table window, see build.rs.
-          for w in 10 12 14 16; do
+          for w in 16 18 19 20; do
             /usr/local/cuda/bin/nvcc --ptx -arch compute_52 -O3 -DBC3_WINDOW=$w -x cu \
               src/kernels/bc3hash.cl -o /tmp/bc3hash_w$w.ptx
           done
@@ -75,7 +75,7 @@ jobs:
           # shell is /bin/sh - dash on Ubuntu. Process substitution here was a
           # syntax error, so the check exited 2 without ever comparing anything.
           # A check that cannot fail for the right reason is worse than none.
-          for k in bc3hash_w10 bc3hash_w12 bc3hash_w14 bc3hash_w16; do
+          for k in bc3hash_w16 bc3hash_w18 bc3hash_w19 bc3hash_w20; do
             sed -e '/^\/\//d' -e 's/_INTERNAL_[0-9a-f]*_/_INTERNAL_/g' \
               src/kernels/$k.ptx > /tmp/committed.ptx
             sed -e '/^\/\//d' -e 's/_INTERNAL_[0-9a-f]*_/_INTERNAL_/g' \
