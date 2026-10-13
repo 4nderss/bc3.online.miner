@@ -13,10 +13,11 @@
 # in a different order. The CUDA backend falls back to the PTX for any card
 # whose architecture is not here, and for a driver that refuses the code.
 #
-# Writes src/kernels/sass/bc3hash_w<window>_sm<arch>.cubin, and manifest.txt
-# with the SHA-256 of each PTX they were made from (line endings normalised:
-# a Windows checkout has CRLF). build.rs embeds the machine code of a window
-# only while its PTX still matches - never code of an older kernel.
+# Writes src/kernels/sass/bc3hash_<name>_sm<arch>.cubin for every PTX - each
+# table window's and the table builder's - and manifest.txt with the SHA-256
+# of each PTX they were made from (line endings normalised: a Windows
+# checkout has CRLF). build.rs embeds a kernel's machine code only while its
+# PTX still matches - never code of an older kernel.
 set -eu
 ARCHS="${BC3_SASS_ARCHS:-61 75 86 89 120}"
 OUT="${1:-src/kernels/sass}"
@@ -26,7 +27,7 @@ export PTXAS
 mkdir -p "$OUT"
 rm -f "$OUT"/*.cubin "$OUT"/manifest.txt
 
-for ptx in src/kernels/bc3hash_w*.ptx; do
+for ptx in src/kernels/bc3hash_*.ptx; do
   base=$(basename "$ptx" .ptx)
   for sm in $ARCHS; do
     printf '%s sm_%s %s/%s_sm%s.cubin\n' "$ptx" "$sm" "$OUT" "$base" "$sm"
@@ -36,7 +37,7 @@ done | xargs -P "$(nproc)" -L 1 sh -c '"$PTXAS" -arch="$1" -O3 "$0" -o "$2" && e
 {
   echo "# $("$PTXAS" --version | tail -n 1)"
   echo "# archs: $ARCHS"
-  for ptx in src/kernels/bc3hash_w*.ptx; do
+  for ptx in src/kernels/bc3hash_*.ptx; do
     printf '%s  %s\n' "$(tr -d '\r' < "$ptx" | sha256sum | cut -d' ' -f1)" "$(basename "$ptx")"
   done
 } > "$OUT/manifest.txt"

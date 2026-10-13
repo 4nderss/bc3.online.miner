@@ -32,9 +32,10 @@ src/                 mining core (the bc3-miner CLI)
   backend/           CUDA, OpenCL and the dynamic loaders for both
   kernels/bc3hash.cl GPU kernel - one source for CUDA and OpenCL; from the
                      kernel lab, never edited here
-  kernels/bc3hash_w*.ptx
-                     GENERATED from bc3hash.cl, one per table window -
-                     never hand-edit
+  kernels/bc3hash_*.ptx
+                     GENERATED from bc3hash.cl by tools/ptx.sh, one per
+                     table window and one of the table builder - never
+                     hand-edit
   consensus.rs       the choice of PoW, headers, targets; the correctness
                      oracle, with bc3hash/
   tuning.rs          each GPU's BC3Hash table window, measured while it
@@ -59,10 +60,11 @@ CUDA and OpenCL are both in the default build. Neither is linked - both are
 resolved at run time - so **no GPU SDK is needed to build**, and one binary
 runs with CUDA on NVIDIA, OpenCL on AMD/Intel, or CPU alone.
 
-`build.rs` compiles `bc3hash.cl` to PTX, once per table window, when `nvcc` is
-on PATH, and otherwise falls back to the checked-in `bc3hash_w*.ptx`. That
-fallback is the normal path: NVRTC ships with the CUDA *Toolkit*, not the
-graphics driver, so the kernel must be compiled ahead of time and embedded.
+`build.rs` compiles `bc3hash.cl` to PTX, once per table window and once as
+the table builder, when `nvcc` is on PATH, and otherwise falls back to the
+checked-in `bc3hash_*.ptx`. That fallback is the normal path: NVRTC ships with
+the CUDA *Toolkit*, not the graphics driver, so the kernel must be compiled
+ahead of time and embedded.
 The `cuda` and `opencl` features bring `bc3hash` with them - BC3Hash is the
 only kernel either backend has.
 
@@ -80,7 +82,7 @@ docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.9.1-devel-ubuntu22.04 sh
 ```
 
 and writes a manifest with the SHA-256 of each PTX; `build.rs` embeds a
-window's code only while the PTX it embeds is that one. Both workflows build
+kernel's code only while the PTX it embeds is that one. Both workflows build
 the cubins in a `sass` job and set `BC3_REQUIRE_SASS=1`, which makes a build
 without them fail. CUDA 12.9 because its machine code loads on every CUDA 12
 driver (R525 and up, as the PTX needs) and it knows Blackwell; a CUDA 13
@@ -168,21 +170,42 @@ cannot. To move to a newer node, copy the two directories again, update
 `src/kernels/bc3hash.cl` is generated outside this repository (the kernel lab,
 from the node's constants) - copy it in whole, never edit it here. One source
 serves both backends, with what differs between them in macros at the top of
-the file. Its secp256k1 tables come in four window sizes - 16, 18, 19 and 20
-bits - chosen at run time, per card, by the tuning (see "Window tuning"), so
-it is built four times:
-
-```
-for w in 16 18 19 20; do
-  nvcc --ptx -arch compute_52 -O3 -DBC3_WINDOW=$w -x cu \
-    src/kernels/bc3hash.cl -o src/kernels/bc3hash_w$w.ptx
-done
-```
-
-with the CUDA 12.0 toolkit (see "Changing the GPU kernel" for why).
+the file. Its secp256k1 tables come in six window sizes - 16, 18, 19, 20, 22
+and 24 bits - chosen at run time, per card, by the tuning (see "Window
+tuning"), so it is built six times, and once more as the table builder
+alone. `tools/ptx.sh` does it, with the CUDA 12.0 toolkit (see "Changing the
+GPU kernel" for why), and is the one list of what is built with which
+defines: CI regenerates the committed PTX with it and compares.
 OpenCL builds the same source
-at run time with `-DBC3_WINDOW=N` (`cargo test --release opencl -- --ignored`
-under pocl runs it, see the README). The two builds do not share all of their
+at run time with `-DBC3_WINDOW=N`, for the uniform windows (`cargo test
+--release opencl -- --ignored` under pocl runs it, see the README).
+
+**Mixed schedules.** What a window buys is fewer digits: each is a point
+addition in each of the four curve multiplications, about 2 % of a hash on
+an RTX 4090 (16 digits at window 16, 13 at 20: +5.6 %). A uniform window
+above 20 buys them dearly - 22 bits are 12 digits in 12 GiB of tables. 22 and
+24 are therefore mixed: 8 digits of 21 bits and 4 of 22 (12 digits, 8 GiB),
+8 of 23 and 3 of 24 (11 digits, 28 GiB, for a 32 GB card). The kernel takes
+a schedule as `BC3_WINDOW` (the narrow width) and `BC3_WIDE` (how many digits
+one bit wider follow the narrow ones), the host as `tuning::digits`, and the
+self-test catches the two disagreeing. A window's id is its widest digit.
+
+**The tables are built on the card.** A CUDA card builds its curve tables
+itself (`CudaBackend::build_tables`): the host works out each row's base
+2^pos * P with libsecp256k1 and uploads the power tables, and
+`bc3hash_build_row` makes the row - each thread a stretch of it, the first
+point by double-and-add and the rest by adding the base, in Jacobian
+coordinates, a run of 16 at a time made affine with one inversion. The field
+operations are canonical, so the points are libsecp256k1's to the bit; the
+first, a middle and the last point of every row are checked against the
+host's (`check_tables`), and the self-test follows. A run of 16 keeps the
+builder's stack at 2 KB, under the hash kernel's 3.4 KB - the driver reserves
+a kernel's stack for every thread the card can hold; 32 was 15 % faster at
+4 KB. Window 20 takes 0.4 s on an RTX 3050 Ti; the host took 18.7 s on 20
+threads and 3.3 GiB of RAM, and its build on every core took a laptop's GPU
+from 40 to 27 W. Window 24 is 470 million points - out of the host's reach.
+An OpenCL card still gets the uniform windows' tables from the host
+(`bc3hash::gpu_tables`). The two builds do not share all of their
 arithmetic: under CUDA the multi-word products, squarings, reductions and the
 secp256k1 field additions are inline PTX generated by the lab's `gen_ptx.js`,
 while OpenCL compiles the C versions next to them in the file
@@ -234,15 +257,14 @@ A/B, and +12 % in `--benchmark` (151 -> 169 kH/s at window 16): the laptop
 is power-capped (35 W), and the busier kernel runs 14 % lower clocks at the
 same power. A card with headroom gets more of the 30 %. The lab's `prof.cu`
 profiles the phases with clock64; `ubench.cu` measures a product at 1-8
-warps a scheduler. The host builds the matching tables
-(`bc3hash::gpu_tables`), and every card self-tests every window before it
-mines with it: the node's header vectors, random headers against the CPU
-reference, and a scan range against the CPU's hit set. A card that fails
+warps a scheduler. Every card self-tests every window before it mines with
+it, its tables included: the node's header vectors, random headers against
+the CPU reference, and a scan range against the CPU's hit set. A card that fails
 mines no BC3Hash; the CPU takes over. Launches are whole waves of the card
 (`launch_granule`) - a partial last wave cost 14 % on an RTX 3050 Ti.
 
 `bc3-miner --benchmark`, in an internal-tools build, measures it through the
-real worker path with an in-process job source, compares the four windows on
+real worker path with an in-process job source, compares the windows on
 every card with the kernel, and checks every share with the CPU reference. It
 also prints how busy each GPU was: the device time of its launches (CUDA
 events, OpenCL profiling) over the wall time between them.
@@ -260,27 +282,31 @@ a hash at one or two waves a launch against 7.9 at eight on an RTX 3050 Ti
 
 `src/tuning.rs` decides, `gpu_worker::Tune` drives it. Every CUDA card
 starts at window 16 and mines from its first launch. Then it picks the
-largest window whose tables fit beside 1 GiB of free GPU memory and, while
-they are built, 2 GiB of free host memory, builds them in the background
-(`bc3::prebuild`: one build for every card that wants the same window, held
-until the last lets go) and has the driver compile that window's kernel
-ahead on a non-primary context of the card (`compile_bc3hash_ahead`), so the
+largest window whose tables fit beside 1 GiB of free GPU memory - 24 on a
+32 GB card, 22 on 12-24 GB, 20 on 8 GB - and, where this build has no
+machine code for the card, has the driver compile that window's kernel ahead
+on a non-primary context of the card (`compile_bc3hash_ahead`), so the
 switch later is a load from the driver's cache. Then it measures, in GPU
-time from the launches' own events: 90 s of warm-up after the build, 16 for
-a minute, the bigger window for a minute after 30 s of settling, 16 again.
-The bigger window stays if it beat the mean of the two 16s by 0.5 %. A
-switch ends the launch run as a new job would: what is in flight is
-collected, the main loop switches (`switch_bc3`, self-test included) and
-picks the same job up where the cursor stopped.
+time from the launches' own events: 90 s of warm-up, 16 for a minute, the
+bigger window for a minute after 30 s of settling, 16 again. The bigger
+window stays if it beat the mean of the two 16s by 0.5 %. A switch ends the
+launch run as a new job would: what is in flight is collected, the main loop
+switches (`switch_bc3`: the card builds the window's tables, about a second
+even at 24, and self-tests) and picks the same job up where the cursor
+stopped. A first switch to the bigger window that fails - 28 GiB that did
+not fit after all, on a card that also drives a desktop - tries the next
+smaller window that fits, against the same 16.
 
 - **In a laptop, CPU and GPU share one power budget, and the GPU gets its
-  share back slowly.** The table build, on every core, took an RTX 3050 Ti
-  from 40 to 27 W, and it was back at 40 W only 90 s after the build; 16
-  measured right after the build came out 20 % low, and window 19 looked
-  11.5 % faster where it is 2-5 %. Hence the warm-up after the build, and
-  hence 16 is measured twice: the mean cancels a steady drift, and two 16s
-  more than 5 % apart (`MAX_DRIFT`) mean something else moved the rate - the
-  choice holds for the run, and the next start measures again.
+  share back slowly.** In 2.1 the host built the bigger window's tables, on
+  every core, and that took an RTX 3050 Ti from 40 to 27 W; it was back at
+  40 W only 90 s after the build, 16 measured right after the build came out
+  20 % low, and window 19 looked 11.5 % faster where it is 2-5 %. Hence the
+  warm-up, and hence 16 is measured twice: the mean cancels a steady drift,
+  and two 16s more than 5 % apart (`MAX_DRIFT`) mean something else moved
+  the rate - the choice holds for the run, and the next start measures
+  again. The card builds its tables itself now; the warm-up stays for its
+  clock, which falls as it warms up.
 - **What is remembered**: a steady measurement, win or loss, and a bigger
   window that failed its switch - per card name, memory size, driver and
   miner version (`tuning::key`), in `tuning.json` in the user's cache
@@ -310,10 +336,12 @@ machine - so a change there is a consensus change. It comes from the kernel
 lab (see "The BC3Hash GPU kernel"); the workflow that catches mistakes here:
 
 1. Copy the lab's `bc3hash.cl` in whole. The host side of its contract is
-   `src/backend/bc3.rs` - the target limbs, the self-test - the tables from
-   `bc3hash::gpu_tables`, and the argument order of `bc3hash_scan` and
-   `bc3hash_batch` in `cuda.rs` and `opencl.rs`; they change with it.
-2. Regenerate the four PTX files, **using the CUDA 12.0 toolkit**. The toolkit
+   `src/backend/bc3.rs` - the target limbs, the self-test - the tables'
+   layout (`tuning::rows`, `BC3_TABLE_*` in the kernel), their build
+   (`CudaBackend::build_tables`, `bc3hash::gpu_tables` for OpenCL), and the
+   argument order of `bc3hash_scan`, `bc3hash_batch` and `bc3hash_build_row`
+   in `cuda.rs` and `opencl.rs`; they change with it.
+2. Regenerate the PTX files, **using the CUDA 12.0 toolkit**. The toolkit
    version decides the PTX ISA version, and a driver can only JIT the versions
    it knows: ISA 8.0 needs driver R525, ISA 8.8 (CUDA 12.9) needs R575. Build
    it too new and the card is detected but the kernel never loads. `build.rs`
@@ -329,10 +357,11 @@ lab (see "The BC3Hash GPU kernel"); the workflow that catches mistakes here:
    comparison ignores those names, see `build.yml`).
 
    ```
-   docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.0.1-devel-ubuntu22.04 \
-     sh -c 'for w in 16 18 19 20; do /usr/local/cuda/bin/nvcc --ptx -arch compute_52 \
-       -O3 -DBC3_WINDOW=$w -x cu src/kernels/bc3hash.cl -o src/kernels/bc3hash_w$w.ptx; done'
+   docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.0.1-devel-ubuntu22.04 sh tools/ptx.sh
    ```
+
+   A window added there needs its line in `build.rs`'s `KERNELS`, in
+   `BC3HASH_PTX` (cuda.rs) and `tuning::digits`.
 3. **Verify bit-exactness against an independent reference**, not against the
    previous kernel: the node's own C++, which `bc3hash/` builds. Every card's
    self-test does that before it mines (the node's header vectors, random
@@ -340,8 +369,12 @@ lab (see "The BC3Hash GPU kernel"); the workflow that catches mistakes here:
    `cargo test --release -- --ignored` on a GPU runs it at every window the
    card has the memory for, switching between them on one context
    (`cuda_bc3hash_every_window_passes_the_self_test`), and
-   `cuda_bc3hash_queued_launches_match_the_cpu` on top. The lab's 20,000
-   random inputs against the node's code run at window 16.
+   `cuda_bc3hash_queued_launches_match_the_cpu` on top;
+   `cuda_tables_built_on_the_card_are_the_hosts` compares whole tables the
+   card built with the host's. The lab's 20,000 random inputs against the
+   node's code run at window 16 and at small mixed schedules (9 and 10 bits,
+   12 and 13, 11 and 12) whose digits cross the 64-bit limbs as 22's and
+   24's do; its builder test builds tables with launches of every size.
 4. Check the OpenCL build too - under pocl it runs without a GPU (README). It
    is a different compiler with different rules, and it does not even share
    all of its arithmetic with the CUDA build (the C versions instead of inline
@@ -376,7 +409,7 @@ default build has no dead code. `build.yml` runs `cargo test --release
 |--------|----------|--------------|
 | `--benchmark` | | Measure instead of mining, see below |
 | `--solve job.json` | | Mine one fixed block template offline, see below |
-| `--bc3-window 16\|18\|19\|20` | `BC3_BC3HASH_WINDOW` | Table window of the GPU's BC3Hash kernel: 256 MiB, 0.9, 1.8 or 3.3 GiB of GPU memory. Fixes it for every card; without it each tunes its own |
+| `--bc3-window 16\|18\|19\|20\|22\|24` | `BC3_BC3HASH_WINDOW` | Table window of the GPU's BC3Hash kernel: 256 MiB, 0.9, 1.8, 3.3, 8 or 28 GiB of GPU memory; 22 and 24 on CUDA cards only. Fixes it for every card; without it each tunes its own |
 | `--tune` | | Benchmark: leave the window to each card's tuning, as a release does. Measures afresh only with a new `BC3_TUNING_FILE` |
 | `--bc3hash-mode fast\|compact` | `BC3_BC3HASH_MODE` | The CPU's BC3Hash tables: `fast` (~256 MiB of RAM, about 10 s to build) or `compact` (~7 MiB, 10-20 % slower); both find the same shares. Default `compact` when a GPU mines BC3Hash and the CPU only re-checks its hits, `fast` otherwise |
 | `--seconds N` | | Benchmark: seconds a run (default 20 comparing windows, 540 with `--tune`, else 60) |
@@ -384,7 +417,7 @@ default build has no dead code. `build.yml` runs `cargo test --release
 | `--gpu-queue 1\|2` (hidden) | | Kernel launches each GPU keeps queued; 1 is the old one-at-a-time loop |
 
 ```
-bc3-miner --benchmark                    # BC3Hash: every GPU, all four table windows
+bc3-miner --benchmark                    # BC3Hash: every GPU, every table window
 bc3-miner --benchmark --bc3-window 16    # BC3Hash at one window, 60 s
 BC3_TUNING_FILE=/tmp/t.json bc3-miner --benchmark --tune   # the tuning, from scratch
 bc3-miner --solve job.json
@@ -395,7 +428,7 @@ job source hands random BC3Hash jobs to the normal workers - the same
 dispatch, kernels and launch queue as real mining, every GPU hit re-checked
 on the CPU - and every share is checked once more against the CPU reference,
 the way the pool checks it. On GPUs with the kernel, and without
-`--bc3-window`, it compares the four table windows. Each
+`--bc3-window`, it compares the table windows. Each
 window runs twice, once on the way up and once on the way back down, and the
 two runs are averaged: a GPU's clock drifts as it warms up - on a laptop by
 more than the windows differ - and a steady drift cancels out that way.

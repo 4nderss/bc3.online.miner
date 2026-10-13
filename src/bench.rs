@@ -10,10 +10,11 @@
 //! how busy each GPU was: the device time of its launches (CUDA events,
 //! OpenCL profiling) over the wall time between them.
 //!
-//! On GPUs with a BC3Hash kernel it compares the table windows (16, 18, 19
-//! and 20 bits) unless `--bc3-window` names one - the bigger ones need 0.9,
-//! 1.8 and 3.3 GiB of GPU memory. A release does not compare: each card is
-//! tuned while it mines (src/tuning.rs).
+//! On GPUs with a BC3Hash kernel it compares the table windows (16, 18, 19,
+//! 20, 22 and 24 bits) unless `--bc3-window` names one - the bigger ones need
+//! 0.9, 1.8, 3.3, 8 and 28 GiB of GPU memory, and a card fails those it has
+//! not the memory for. A release does not compare: each card is tuned while
+//! it mines (src/tuning.rs).
 
 use crate::consensus::{
     hash_meets_target, root_from_steps, sha256d, target_for_difficulty, BlockHeader, PowAlgo,

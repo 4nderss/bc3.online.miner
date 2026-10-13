@@ -28,9 +28,10 @@ pub struct Tools {
     bc3hash_mode: Option<Bc3HashMode>,
 
     /// Table window of the GPU's BC3Hash kernel in bits: 16 (256 MiB of GPU
-    /// memory), 18 (0.9 GiB), 19 (1.8 GiB) or 20 (3.3 GiB). Fixes the window:
-    /// without it every card starts at 16 and tunes its own while it mines
-    /// (src/tuning.rs). `--benchmark` without it compares all four.
+    /// memory), 18 (0.9 GiB), 19 (1.8 GiB), 20 (3.3 GiB), 22 (8 GiB) or 24
+    /// (28 GiB) - 22 and 24 on CUDA cards only. Fixes the window: without it
+    /// every card starts at 16 and tunes its own while it mines
+    /// (src/tuning.rs). `--benchmark` without it compares them all.
     #[cfg(feature = "bc3hash")]
     #[arg(long, env = "BC3_BC3HASH_WINDOW", value_parser = parse_bc3_window)]
     bc3_window: Option<u32>,
@@ -86,7 +87,7 @@ fn parse_bc3_window(s: &str) -> Result<u32, String> {
 
 /// The table windows there is a GPU kernel for (see build.rs).
 #[cfg(feature = "bc3hash")]
-const BC3_WINDOWS: [u32; 4] = [16, 18, 19, 20];
+const BC3_WINDOWS: [u32; 6] = [16, 18, 19, 20, 22, 24];
 
 /// Size of the BC3Hash tables - see `bc3hash::Mode`.
 #[cfg(feature = "bc3hash")]

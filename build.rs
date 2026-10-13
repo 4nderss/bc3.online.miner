@@ -8,9 +8,13 @@
 //! (the driver), which JITs the PTX to machine code for the exact card
 //! installed.
 //!
-//! The kernel is built four times, once per secp256k1 table window (16, 18,
-//! 19 and 20 bits, `-DBC3_WINDOW=N`): every card starts at 16, and the window
-//! tuning (src/tuning.rs) moves a card that hashes faster with a bigger one.
+//! The kernel is built once per secp256k1 table window (16, 18, 19, 20, 22
+//! and 24 bits): every card starts at 16, and the window tuning
+//! (src/tuning.rs) moves a card that hashes faster with a bigger one. Once
+//! more it is built as the table builder alone (`-DBC3_BUILD_ONLY`), which a
+//! CUDA card runs to make a window's tables on itself. `KERNELS` has the
+//! defines of each, as tools/ptx.sh does - the list CI checks the committed
+//! PTX against.
 //!
 //! Beside the PTX goes the machine code tools/sass.sh made from it for the
 //! common architectures (`embed_sass`): a card that has its own loads it in
@@ -19,10 +23,10 @@
 //! the window tuning.
 //!
 //! Order, per PTX:
-//!   1. An explicit path in the environment (`BC3_BC3HASH_W<N>_PTX_PATH`) -
-//!      used by CI.
+//!   1. An explicit path in the environment (`BC3_<STEM>_PTX_PATH`, as
+//!      `BC3_BC3HASH_W16_PTX_PATH`).
 //!   2. `nvcc` in PATH - compile src/kernels/bc3hash.cl -> OUT_DIR.
-//!   3. The checked-in `src/kernels/bc3hash_w<N>.ptx` - fallback when nvcc is
+//!   3. The checked-in `src/kernels/<stem>.ptx` - fallback when nvcc is
 //!      missing, which is the normal case.
 //!
 //! PTX is forward compatible: `compute_52` is JITed by the driver to
@@ -34,10 +38,21 @@ use std::process::Command;
 /// The kernel source every PTX is built from.
 const SOURCE: &str = "src/kernels/bc3hash.cl";
 
-/// The table windows there is a PTX for: 16, where every card starts, and the
-/// bigger ones the tuning (src/tuning.rs) may move a card with the memory to.
-/// 10-14 never beat 16 on any card measured, and cost 2.4 MB each.
-const WINDOWS: [u32; 4] = [16, 18, 19, 20];
+/// Every PTX the CUDA backend embeds, and the defines it is built with - the
+/// same as tools/ptx.sh's. 16 is where every card starts; the bigger windows
+/// are those the tuning (src/tuning.rs) may move a card with the memory to.
+/// 22 and 24 are mixed schedules: 12 digits of 21 and 22 bits, 11 of 23 and
+/// 24 (`BC3_WIDE` in the kernel). 10-14 never beat 16 on any card measured,
+/// and cost 2.4 MB each.
+const KERNELS: [Kernel; 7] = [
+    Kernel { stem: "bc3hash_w16", defines: &["BC3_WINDOW=16"] },
+    Kernel { stem: "bc3hash_w18", defines: &["BC3_WINDOW=18"] },
+    Kernel { stem: "bc3hash_w19", defines: &["BC3_WINDOW=19"] },
+    Kernel { stem: "bc3hash_w20", defines: &["BC3_WINDOW=20"] },
+    Kernel { stem: "bc3hash_w22", defines: &["BC3_WINDOW=21", "BC3_WIDE=4"] },
+    Kernel { stem: "bc3hash_w24", defines: &["BC3_WINDOW=23", "BC3_WIDE=3"] },
+    Kernel { stem: "bc3hash_build", defines: &["BC3_BUILD_ONLY"] },
+];
 
 /// Lowest architecture the PTX must be JITable for (Maxwell and upwards).
 const ARCH: &str = "compute_52";
@@ -57,25 +72,22 @@ const ARCH: &str = "compute_52";
 /// carry-chain arithmetic, all of it there since Maxwell.
 const MAX_PTX_ISA: (u32, u32) = (8, 0);
 
-/// One PTX: the window it is built for, and the names that go with it.
+/// One PTX: its file stem - in src/kernels/ and in OUT_DIR - and the defines
+/// it is built with.
 struct Kernel {
-    window: u32,
+    stem: &'static str,
+    defines: &'static [&'static str],
 }
 
 impl Kernel {
-    /// The file stem, in src/kernels/ and in OUT_DIR.
-    fn name(&self) -> String {
-        format!("bc3hash_w{}", self.window)
-    }
-
     /// The environment variable that can name a PTX for it.
     fn path_env(&self) -> String {
-        format!("BC3_BC3HASH_W{}_PTX_PATH", self.window)
+        format!("BC3_{}_PTX_PATH", self.stem.to_uppercase())
     }
 
     /// The variable the embedded path is handed to the crate in.
     fn rustc_env(&self) -> String {
-        format!("BC3_BC3HASH_W{}_PTX", self.window)
+        format!("BC3_{}_PTX", self.stem.to_uppercase())
     }
 }
 
@@ -86,8 +98,8 @@ fn main() {
     }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR is not set"));
     println!("cargo:rerun-if-changed={SOURCE}");
-    for window in WINDOWS {
-        build_kernel(&Kernel { window }, &out_dir);
+    for k in &KERNELS {
+        build_kernel(k, &out_dir);
     }
     embed_sass(&out_dir);
 }
@@ -97,9 +109,9 @@ fn main() {
 /// sm_120 on sm_121. Anything else (sm_70, sm_80, sm_90, sm_100) JITs the PTX.
 const SASS_ARCHS: [u32; 5] = [61, 75, 86, 89, 120];
 
-/// Embed the kernel's machine code from tools/sass.sh - BC3_SASS_DIR, else
+/// Embed the kernels' machine code from tools/sass.sh - BC3_SASS_DIR, else
 /// src/kernels/sass - deflated, and write `sass.rs` to OUT_DIR: the table the
-/// CUDA backend loads a card's code from. A window's code goes in only if the
+/// CUDA backend loads a card's code from. A kernel's code goes in only if the
 /// manifest says it was made from the very PTX this build embeds; stale code
 /// would at best fail the cards' self-test. With BC3_REQUIRE_SASS set, as in
 /// the release workflow, anything missing fails the build. Without it the
@@ -116,8 +128,8 @@ fn embed_sass(out_dir: &Path) {
 
     let mut entries = Vec::new();
     let mut missing = Vec::new();
-    for window in WINDOWS {
-        let name = Kernel { window }.name();
+    for k in &KERNELS {
+        let name = k.stem;
         // The PTX embedded beside it, its line endings as tools/sass.sh hashed
         // them: a Windows checkout has CRLF.
         let ptx = std::fs::read(out_dir.join(format!("{name}.ptx"))).expect("the embedded PTX");
@@ -130,8 +142,8 @@ fn embed_sass(out_dir: &Path) {
         if made_from.as_deref() != Some(digest.as_str()) {
             if !manifest.is_empty() {
                 println!(
-                    "cargo:warning=no machine code for window {window}: {} was made from another \
-                     PTX - run tools/sass.sh again",
+                    "cargo:warning=no machine code for {name}: {} was made from another PTX - \
+                     run tools/sass.sh again",
                     dir.display()
                 );
             }
@@ -146,7 +158,7 @@ fn embed_sass(out_dir: &Path) {
             let file = format!("{name}_sm{sm}.cubin.z");
             std::fs::write(out_dir.join(&file), miniz_oxide::deflate::compress_to_vec(&code, 10))
                 .expect("write the packed machine code");
-            entries.push((window, sm, file));
+            entries.push((name, sm, file));
         }
     }
     if require && !missing.is_empty() {
@@ -157,12 +169,12 @@ fn embed_sass(out_dir: &Path) {
         );
     }
     let mut src = String::from(
-        "/// The BC3Hash kernel's machine code, deflated: (window, sm, bytes). See build.rs.\n\
-         pub static SASS: &[(u32, u32, &[u8])] = &[\n",
+        "/// The BC3Hash kernels' machine code, deflated: (PTX stem, sm, bytes). See build.rs.\n\
+         pub static SASS: &[(&str, u32, &[u8])] = &[\n",
     );
-    for (window, sm, file) in &entries {
+    for (name, sm, file) in &entries {
         src.push_str(&format!(
-            "    ({window}, {sm}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"))),\n"
+            "    (\"{name}\", {sm}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"))),\n"
         ));
     }
     src.push_str("];\n");
@@ -175,7 +187,7 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 fn build_kernel(k: &Kernel, out_dir: &Path) {
-    let name = k.name();
+    let name = k.stem;
     let path_env = k.path_env();
     let checked_in = format!("src/kernels/{name}.ptx");
     println!("cargo:rerun-if-changed={checked_in}");
@@ -197,7 +209,7 @@ fn build_kernel(k: &Kernel, out_dir: &Path) {
     // all - over a file that is checked in and already correct. Warn and use
     // the committed PTX instead. The panic is kept for the two paths where a
     // human chose the file: the env path and the checked-in PTX itself.
-    if compile_with_nvcc(k.window, &out_ptx) {
+    if compile_with_nvcc(k, &out_ptx) {
         match ptx_isa(&out_ptx) {
             Ok(v) if v <= MAX_PTX_ISA => {
                 emit(k, &out_ptx);
@@ -229,12 +241,14 @@ fn build_kernel(k: &Kernel, out_dir: &Path) {
     );
 }
 
-/// Compile the kernel for one window with nvcc. `false` if nvcc is missing.
-fn compile_with_nvcc(window: u32, out_ptx: &Path) -> bool {
+/// Compile one kernel with nvcc. `false` if nvcc is missing.
+fn compile_with_nvcc(k: &Kernel, out_ptx: &Path) -> bool {
     let nvcc = std::env::var("NVCC").unwrap_or_else(|_| "nvcc".to_string());
     let mut cmd = Command::new(&nvcc);
     cmd.arg("--ptx").arg("-arch").arg(ARCH).arg("-O3");
-    cmd.arg(format!("-DBC3_WINDOW={window}"));
+    for define in k.defines {
+        cmd.arg(format!("-D{define}"));
+    }
     // The kernel source is .cl (shared with OpenCL) - force the CUDA C++
     // frontend.
     cmd.arg("-x").arg("cu").arg(SOURCE).arg("-o").arg(out_ptx);
@@ -242,7 +256,8 @@ fn compile_with_nvcc(window: u32, out_ptx: &Path) -> bool {
     match cmd.output() {
         Ok(out) if out.status.success() => true,
         Ok(out) => panic!(
-            "nvcc failed on {SOURCE} (window {window}):\n{}\n{}",
+            "nvcc failed on {SOURCE} ({}):\n{}\n{}",
+            k.stem,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ),
@@ -278,13 +293,11 @@ fn check_ptx_isa(k: &Kernel, ptx: &Path) {
             "{} declares PTX ISA {major}.{minor}, but the highest we ship is {}.{}.\n\
              A driver older than that version's cannot JIT the kernel, and the miner then\n\
              finds the GPU and hashes nothing on it.\n\
-             Rebuild the kernel with the CUDA 12.0 toolkit (ISA 8.0):\n  \
-             nvcc --ptx -arch {ARCH} -O3 -DBC3_WINDOW={window} -x cu {SOURCE} -o src/kernels/{name}.ptx",
+             Rebuild {} with the CUDA 12.0 toolkit (ISA 8.0): tools/ptx.sh, see AGENTS.md.",
             ptx.display(),
             MAX_PTX_ISA.0,
             MAX_PTX_ISA.1,
-            window = k.window,
-            name = k.name(),
+            k.stem,
         );
     }
 }

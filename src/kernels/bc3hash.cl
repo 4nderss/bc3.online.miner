@@ -26,6 +26,7 @@
   #define DEVICE_FN   static inline
   #define DEVICE_BIG  static
   #define GLOBAL_ID() ((u32)get_global_id(0))
+  #define GLOBAL_SIZE() ((u32)get_global_size(0))
   #define ATOMIC_INC_U32(p) atomic_inc(p)
   #define MULHI64(a, b) mul_hi((ulong)(a), (ulong)(b))
   #define CONST_PTR   __constant
@@ -41,6 +42,7 @@
   #define DEVICE_FN   static __device__ __forceinline__
   #define DEVICE_BIG  static __device__ __noinline__
   #define GLOBAL_ID() (blockIdx.x * blockDim.x + threadIdx.x)
+  #define GLOBAL_SIZE() (gridDim.x * blockDim.x)
   #define ATOMIC_INC_U32(p) atomicAdd((p), 1u)
   #define MULHI64(a, b) __umul64hi((a), (b))
   #define CONST_PTR
@@ -51,15 +53,34 @@
 #ifndef BC3_WINDOW
   #define BC3_WINDOW 10
 #endif
+// Digits of BC3_WINDOW + 1 bits above the BC3_WINDOW-bit ones. 0: a uniform
+// window, whose last digit takes the bits that are left. A mixed schedule has
+// the fewest digits for its table size - 12 digits of 21 and 22 bits are
+// 8.6 GB of tables, 12 of 22 bits 12.9 GB - and covers the 256 bits exactly.
+#ifndef BC3_WIDE
+  #define BC3_WIDE 0
+#endif
+#if BC3_WIDE == 0
 #define BC3_DIGITS  ((256 + BC3_WINDOW - 1) / BC3_WINDOW)
 #define BC3_ENTRIES ((1u << BC3_WINDOW) - 1u)
 #define BC3_CURVE_POINTS (BC3_DIGITS * BC3_ENTRIES)
+#else
+#define BC3_NARROW  ((256 - BC3_WIDE * (BC3_WINDOW + 1)) / BC3_WINDOW)
+#define BC3_DIGITS  (BC3_NARROW + BC3_WIDE)
+#define BC3_ENTRIES ((1u << BC3_WINDOW) - 1u)
+#define BC3_WIDE_ENTRIES ((1u << (BC3_WINDOW + 1)) - 1u)
+#define BC3_CURVE_POINTS (BC3_NARROW * BC3_ENTRIES + BC3_WIDE * BC3_WIDE_ENTRIES)
+#if BC3_NARROW * BC3_WINDOW + BC3_WIDE * (BC3_WINDOW + 1) != 256
+  #error "a mixed schedule must cover the 256 bits exactly"
+#endif
+#endif
 
 // One table buffer, in u64 units:
 //   pow64   8 rows x 256 x 1 limb      (g64^(b*256^i) mod 2^64-1469)
 //   pow128  16 rows x 256 x 2 limbs    (mod 2^128-15449)
 //   pow256  32 rows x 256 x 4 limbs    (mod 2^256-36113)
-//   curves  4 x BC3_CURVE_POINTS x (x[4], y[4])   affine, b*2^(w*i)*P
+//   curves  4 x BC3_CURVE_POINTS x (x[4], y[4])   affine, b * 2^pos * P for
+//           each digit, pos its lowest bit; the narrow digits first
 #define BC3_TABLE_POW64   0
 #define BC3_TABLE_POW128  (BC3_TABLE_POW64 + 8 * 256 * 1)
 // pow256 table rows of BC3_POW256_BITS bits (8: 32 rows, 256 KiB; 12: 22 rows,
@@ -2586,6 +2607,7 @@ DEVICE_BIG void curve_sum(GLOBAL const u64* tab, u256 k, u256* X, u256* Y, u256*
   *Y = *X;
   *Z = mk256(1, 0, 0, 0);
   int inf = 1;
+#if BC3_WIDE == 0
   for (u32 i = 0; i < BC3_DIGITS; i++) {
     u32 pos = i * BC3_WINDOW, limb = pos >> 6, shift = pos & 63u;
     u64 b = k.v[limb] >> shift;
@@ -2596,6 +2618,23 @@ DEVICE_BIG void curve_sum(GLOBAL const u64* tab, u256 k, u256* X, u256* Y, u256*
       jac_add_affine(X, Y, Z, &inf, mk256(p[0], p[1], p[2], p[3]), mk256(p[4], p[5], p[6], p[7]));
     }
   }
+#else
+  // The narrow digits from bit 0, the wide ones above them; a row per digit.
+  for (u32 i = 0; i < BC3_DIGITS; i++) {
+    u32 wide = i >= (u32)BC3_NARROW;
+    u32 j = wide ? i - (u32)BC3_NARROW : i;
+    u32 pos = wide ? (u32)(BC3_NARROW * BC3_WINDOW) + j * (BC3_WINDOW + 1u) : i * BC3_WINDOW;
+    u32 limb = pos >> 6, shift = pos & 63u;
+    u64 b = k.v[limb] >> shift;
+    if (shift && limb + 1 < 4) b |= k.v[limb + 1] << (64u - shift);
+    b &= wide ? (u64)BC3_WIDE_ENTRIES : (u64)BC3_ENTRIES;
+    if (b) {
+      u64 row = wide ? (u64)BC3_NARROW * BC3_ENTRIES + (u64)j * BC3_WIDE_ENTRIES : (u64)i * BC3_ENTRIES;
+      GLOBAL const u64* p = tab + (row + b - 1) * 8u;
+      jac_add_affine(X, Y, Z, &inf, mk256(p[0], p[1], p[2], p[3]), mk256(p[4], p[5], p[6], p[7]));
+    }
+  }
+#endif
   // k in [1, n-1]: the sum is never the point at infinity.
 }
 
@@ -3173,6 +3212,7 @@ DEVICE_BIG void bc3hash80(GLOBAL const u64* tables, const u8* header, u8* out) {
 #define BC3_BOUNDS __launch_bounds__(64, BC3_MIN_BLOCKS)
 #endif
 
+#ifndef BC3_BUILD_ONLY
 // Test/verification: BC3Mix of `count` 64-byte inputs.
 KERNEL_FN void BC3_BOUNDS bc3mix_batch(GLOBAL const u64* tables, GLOBAL const u8* in, u32 count, GLOBAL u8* out) {
   u32 gid = GLOBAL_ID();
@@ -3219,3 +3259,66 @@ KERNEL_FN void BC3_BOUNDS bc3hash_scan(GLOBAL const u64* tables, GLOBAL const u8
     if (idx < max_hits) hits[idx + 1] = nonce;
   }
 }
+#endif // BC3_BUILD_ONLY
+
+// =========================================================================
+// The curve tables, built on the GPU (-DBC3_BUILD_ONLY: this kernel alone, a
+// PTX of its own; the hash kernels compile as without it). The host has
+// neither the memory nor the time for the big windows' tables - 30 GB at
+// window 24 - and building even window 16's on every core took a laptop's
+// GPU from 40 to 27 W. Row r of a curve holds b * B for b = 1 .. count,
+// B = 2^pos * P (affine, from the host). Each thread makes one stretch of
+// consecutive entries, as many as it takes for the launch's threads to cover
+// the row in whole runs of BC3_BUILD_RUN - any launch size builds every
+// entry: the first by double-and-add, each next one by adding B, in
+// Jacobian coordinates, and a run at a time affine with one inversion
+// (Montgomery's trick). The field operations are canonical, so the entries
+// are bit for bit what the host builds with libsecp256k1. A run of 16 keeps
+// the stack at 2 KB, under the hash kernels' (the driver reserves a launch's
+// stack for every thread the card can hold); 32 was 15 % faster at 4 KB.
+// =========================================================================
+#if defined(BC3_BUILD_ONLY) || defined(BC3_WITH_BUILDER)
+#ifndef BC3_BUILD_RUN
+#define BC3_BUILD_RUN 16
+#endif
+KERNEL_FN void bc3hash_build_row(GLOBAL u64* row, GLOBAL const u64* base, u32 count) {
+  u32 runs = (count + (u32)BC3_BUILD_RUN - 1u) / (u32)BC3_BUILD_RUN;
+  u32 threads = (u32)GLOBAL_SIZE();
+  u32 stretch = (runs + threads - 1u) / threads * (u32)BC3_BUILD_RUN;
+  u32 first = 1u + (u32)GLOBAL_ID() * stretch;
+  if (stretch == 0u || first > count) return;
+  u32 last = count - first < stretch ? count : first + stretch - 1u;
+  u256 bx = mk256(base[0], base[1], base[2], base[3]);
+  u256 by = mk256(base[4], base[5], base[6], base[7]);
+  u256 X = mk256(0, 0, 0, 0), Y = X, Z = mk256(1, 0, 0, 0);
+  int inf = 1;
+  for (int bit = 31; bit >= 0; bit--) {
+    if (!inf) jac_double(&X, &Y, &Z);
+    if ((first >> bit) & 1u) jac_add_affine(&X, &Y, &Z, &inf, bx, by);
+  }
+  u256 xs[BC3_BUILD_RUN], ys[BC3_BUILD_RUN], zs[BC3_BUILD_RUN], acc[BC3_BUILD_RUN];
+  for (u32 b0 = first;; b0 += (u32)BC3_BUILD_RUN) {
+    u32 n = last - b0 < (u32)BC3_BUILD_RUN ? last - b0 + 1u : (u32)BC3_BUILD_RUN;
+    for (u32 j = 0; j < n; j++) {
+      xs[j] = X;
+      ys[j] = Y;
+      zs[j] = Z;
+      acc[j] = j ? fmul(acc[j - 1], Z) : Z;
+      if (b0 + j < last) jac_add_affine(&X, &Y, &Z, &inf, bx, by);
+    }
+    u256 inv = inv_secp(acc[n - 1]);
+    for (u32 j = n; j-- > 0;) {
+      u256 zi = j ? fmul(inv, acc[j - 1]) : inv;
+      if (j) inv = fmul(inv, zs[j]);
+      u256 zi2 = fsq(zi);
+      u256 x = fmul(xs[j], zi2), y = fmul(fmul(ys[j], zi2), zi);
+      GLOBAL u64* p = row + (u64)(b0 - 1u + j) * 8u;
+      for (int l = 0; l < 4; l++) {
+        p[l] = x.v[l];
+        p[4 + l] = y.v[l];
+      }
+    }
+    if (last - b0 < (u32)BC3_BUILD_RUN) break;
+  }
+}
+#endif

@@ -593,6 +593,12 @@ impl OpenClBackend {
     /// tables to the device. The runtime compiles a kernel this size for a
     /// while - once per window and run.
     fn build_bc3(&self, window: u32) -> Result<Bc3Program, String> {
+        // The host builds an OpenCL card's tables, and those of the uniform
+        // windows only; 22 and 24 - mixed schedules, 8 and 28 GiB - only a
+        // CUDA card builds, on itself.
+        if !(2..=20).contains(&window) {
+            return Err(format!("window {window} is for CUDA cards only"));
+        }
         let cl = cl()?;
         // Owned from the start, so every early return releases what exists.
         let mut k = Bc3Program {

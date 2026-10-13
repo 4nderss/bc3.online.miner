@@ -165,6 +165,54 @@ int bc3hash_gpu_curve_row(unsigned window, int curve, unsigned row, std::uint64_
     }
 }
 
+// b * 2^pos * P, P curve `curve` (0..3: H, J, K, L), as a table holds it:
+// x[4], y[4], least significant limb first. A CUDA card builds its tables
+// from these points (b = 1, a row's base) and is checked against it. 0 = ok,
+// -1 = failed, -2 = wrong curve, pos or b.
+int bc3hash_gpu_point(int curve, unsigned pos, std::uint64_t b, std::uint64_t* out) noexcept
+{
+    try {
+        if (curve < 0 || curve > 3 || pos > 255 || b == 0) return -2;
+        using namespace bc3::detail::constants;
+        const U256 xs[4] = {H_x, J_x, K_x, L_x};
+        const U256 ys[4] = {H_y, J_y, K_y, L_y};
+        struct Context {
+            secp256k1_context* p = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+            ~Context() { secp256k1_context_destroy(p); }
+        } ctx;
+        if (!ctx.p) return -1;
+        std::array<unsigned char, 65> encoded{};
+        encoded[0] = 4;
+        xs[curve].store(encoded.data() + 1);
+        ys[curve].store(encoded.data() + 33);
+        secp256k1_pubkey point;
+        if (!secp256k1_ec_pubkey_parse(ctx.p, &point, encoded.data(), 65)) return -1;
+        // Two multiplications, each by a scalar below n: 2^pos (pos <= 255)
+        // and b; their product could reach n.
+        std::array<unsigned char, 32> scalar{};
+        if (pos) {
+            scalar[31 - pos / 8] = static_cast<unsigned char>(1u << (pos % 8));
+            if (!secp256k1_ec_pubkey_tweak_mul(ctx.p, &point, scalar.data())) return -1;
+        }
+        if (b != 1) {
+            scalar.fill(0);
+            for (unsigned i = 0; i < 8; ++i) scalar[31 - i] = static_cast<unsigned char>(b >> (8 * i));
+            if (!secp256k1_ec_pubkey_tweak_mul(ctx.p, &point, scalar.data())) return -1;
+        }
+        std::size_t length = 65;
+        if (!secp256k1_ec_pubkey_serialize(ctx.p, encoded.data(), &length, &point, SECP256K1_EC_UNCOMPRESSED))
+            return -1;
+        const auto x = U256::load(encoded.data() + 1), y = U256::load(encoded.data() + 33);
+        for (std::size_t l = 0; l < 4; ++l) {
+            out[l] = x.v[l];
+            out[4 + l] = y.v[l];
+        }
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 
 // The GPU table buffer for a curve window of `window` bits comes in five
 // parts, in this order - the BC3_TABLE_* layout of src/kernels/bc3hash.cl:

@@ -14,7 +14,8 @@
 //! exponentiations. This is the CPU's BC3Hash, and the reference the miner's
 //! GPU kernel (src/kernels/bc3hash.cl) is checked against: its self-test,
 //! and every hit before it is submitted. The kernel's tables come from here
-//! too (`gpu_tables`).
+//! too: whole for an OpenCL card (`gpu_tables`), as the points a CUDA card
+//! builds its own from and is checked against (`gpu_point`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -32,6 +33,7 @@ extern "C" {
     fn bc3hash_gpu_rows(window: u32) -> u32;
     fn bc3hash_gpu_row_u64(window: u32) -> usize;
     fn bc3hash_gpu_curve_row(window: u32, curve: i32, row: u32, out: *mut u64, len: usize) -> i32;
+    fn bc3hash_gpu_point(curve: i32, pos: u32, b: u64, out: *mut u64) -> i32;
 }
 
 /// The lookup tables the GPU kernel (src/kernels/bc3hash.cl in the miner)
@@ -87,6 +89,33 @@ pub fn gpu_tables(window: u32) -> Result<Vec<u64>, String> {
         Err(format!("building the BC3Hash GPU tables (window {window}) failed"))
     } else {
         Ok(out)
+    }
+}
+
+/// The power tables at the start of the GPU tables, the same for every
+/// window - for a card that builds the curve tables after them itself.
+pub fn gpu_power_tables() -> Result<Vec<u64>, String> {
+    // SAFETY: plain integer arguments; the slice is exactly the part's
+    // length, as the call checks.
+    let len = unsafe { bc3hash_gpu_part_u64(16, 0) };
+    let mut out = vec![0u64; len];
+    match unsafe { bc3hash_gpu_table_part(16, 0, out.as_mut_ptr(), len) } {
+        0 => Ok(out),
+        rc => Err(format!("building the BC3Hash power tables failed ({rc})")),
+    }
+}
+
+/// b * 2^pos * P for the kernel's curve point P number `curve` (0-3), as the
+/// GPU tables hold a point: affine x and y, four limbs each, least
+/// significant first. A CUDA card builds its curve tables on itself from the
+/// rows' bases (b = 1), and its entries are checked against this.
+pub fn gpu_point(curve: usize, pos: u32, b: u64) -> Result<[u64; 8], String> {
+    let mut out = [0u64; 8];
+    let curve_arg = i32::try_from(curve).unwrap_or(-1);
+    // SAFETY: `out` has the 8 limbs the call writes.
+    match unsafe { bc3hash_gpu_point(curve_arg, pos, b, out.as_mut_ptr()) } {
+        0 => Ok(out),
+        rc => Err(format!("no point {b} * 2^{pos} on curve {curve} ({rc})")),
     }
 }
 
@@ -407,6 +436,34 @@ mod tests {
         assert!(t[last_row - 8..last_row].iter().any(|&v| v != 0));
         assert!(gpu_tables(1).is_err());
         assert_eq!(header_vectors().len(), 2);
+    }
+
+    /// What a card that builds its own curve tables starts from and is
+    /// checked against: the power tables, and b * 2^pos * P - the entries of
+    /// the host's tables, the last row of a window that does not divide 256
+    /// included.
+    #[test]
+    fn gpu_points_are_the_tables_entries() {
+        let window = 5u32;
+        let t = gpu_tables(window).unwrap();
+        let pow = gpu_power_tables().unwrap();
+        assert_eq!(pow[..], t[..pow.len()]);
+        let (rows, row_u64) = (52usize, 31 * 8);
+        for curve in 0..4 {
+            for row in [0, 1, 26, 50, 51] {
+                let pos = window * row as u32;
+                let bits = window.min(256 - pos);
+                for b in [1u64, 2, 7, 31].into_iter().filter(|&b| b < 1 << bits) {
+                    let at = pow.len() + (curve * rows + row) * row_u64 + (b as usize - 1) * 8;
+                    assert_eq!(gpu_point(curve, pos, b).unwrap(), t[at..at + 8], "curve {curve}, row {row}, b {b}");
+                }
+            }
+        }
+        // b * 2^pos itself past n: two scalars below it.
+        assert!(gpu_point(3, 255, (1 << 24) - 1).is_ok());
+        assert!(gpu_point(4, 0, 1).is_err());
+        assert!(gpu_point(0, 256, 1).is_err());
+        assert!(gpu_point(0, 0, 0).is_err());
     }
 
     /// The row-parallel build gives exactly the table the curve-by-curve one

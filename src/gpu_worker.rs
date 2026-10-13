@@ -25,17 +25,6 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The tables built ahead of a window switch (backend::bc3). A build without a
-/// GPU backend has no GPU to switch, and no tuning ever begins there.
-#[cfg(any(feature = "cuda", feature = "opencl"))]
-use crate::backend::bc3::{prebuild as prebuild_tables, release as release_tables};
-#[cfg(not(any(feature = "cuda", feature = "opencl")))]
-fn prebuild_tables(_window: u32) -> Receiver<Result<(), String>> {
-    std::sync::mpsc::channel().1
-}
-#[cfg(not(any(feature = "cuda", feature = "opencl")))]
-fn release_tables(_window: u32) {}
-
 /// Autotune limits for the batch size (nonces per kernel launch) and the time
 /// a launch aims for. BC3Hash is about 110 kH/s on an RTX 3050 Ti. Launches
 /// start at the floor: 256 nonces are 2 ms there, and still far from the
@@ -74,7 +63,8 @@ const MAX_SCAN_ERRORS: u32 = 5;
 
 /// This card's BC3Hash window tuning (src/tuning.rs), as the worker drives
 /// it: the window the card should be at, the tuner while it runs, and the
-/// background build of the tables it is to switch to.
+/// compile ahead of the kernel it is to switch to. Its tables the card
+/// builds itself, at the switch.
 struct Tune {
     want: u32,
     tuner: Option<Tuner>,
@@ -83,13 +73,10 @@ struct Tune {
     key: String,
     name: String,
     slot: usize,
-    built: Option<Receiver<Result<(), String>>>,
-    /// The tables' outcome once known, waiting for the kernel's compile.
-    tables: Option<bool>,
+    /// The tuner waits for the target to be ready (`Action::Build`).
+    preparing: bool,
     /// The compile of the target's kernel ahead, while it runs.
     jit: Option<Receiver<()>>,
-    /// The window whose ahead-built tables this card holds (bc3::release).
-    held: Option<u32>,
     /// A switch the launch loop is to stop for; the main loop makes it.
     switch_to: Option<u32>,
 }
@@ -103,10 +90,8 @@ impl Tune {
             key: String::new(),
             name: String::new(),
             slot,
-            built: None,
-            tables: None,
+            preparing: false,
             jit: None,
-            held: None,
             switch_to: None,
         }
     }
@@ -123,7 +108,7 @@ impl Tune {
     }
 
     /// Once the card mines at the start window: decide what to try, from its
-    /// free memory and the host's, or recall what was chosen before.
+    /// free memory, or recall what was chosen before.
     fn begin(&mut self, shared: &Shared, backend: &dyn MiningBackend) {
         if self.begun || shared.bc3_window_set() || backend.bc3hash_window() != Some(START_WINDOW) {
             return;
@@ -136,7 +121,8 @@ impl Tune {
         };
         let driver = crate::telemetry::Telemetry::open().driver_version();
         self.key = crate::tuning::key(&self.name, total, driver.as_deref());
-        let fitting = crate::tuning::largest_fitting(free, crate::tuning::available_ram());
+        // The start window's tables go before the bigger ones come.
+        let fitting = crate::tuning::largest_fitting(free + crate::tuning::table_bytes(START_WINDOW));
         let recalled = crate::tuning::recall(&self.key);
         let Some((tuner, first)) = Tuner::start(fitting, recalled) else {
             match recalled {
@@ -156,23 +142,22 @@ impl Tune {
         let gib = crate::tuning::table_bytes(target) as f64 / f64::from(1u32 << 30);
         if recalled.is_some() {
             crate::human!(
-                "[gpu] {}: building the tables of BC3Hash window {target} ({gib:.1} GiB), remembered for \
-                 this card - switching when they are ready",
+                "[gpu] {}: BC3Hash window {target} ({gib:.1} GiB of tables) was chosen for this card - \
+                 switching to it",
                 self.name
             );
         } else {
             crate::human!(
-                "[gpu] {}: tuning the BC3Hash window - building window {target} ({gib:.1} GiB of tables) \
-                 meanwhile, then measuring it against {START_WINDOW}",
+                "[gpu] {}: tuning the BC3Hash window - measuring window {target} ({gib:.1} GiB of tables, \
+                 built on the card) against {START_WINDOW} over the next few minutes",
                 self.name
             );
         }
         self.tuner = Some(tuner);
         self.announce(recalled.is_none());
         if let Action::Build(w) = first {
-            self.built = Some(prebuild_tables(w));
-            self.held = Some(w);
             self.jit = backend.compile_bc3hash_ahead(w);
+            self.preparing = true;
         }
     }
 
@@ -180,34 +165,12 @@ impl Tune {
     fn launched(&mut self, window: u32, hashes: u64, busy: Duration) {
         let Some(tuner) = self.tuner.as_mut() else { return };
         let mut action = Action::Wait;
-        if let Some(rx) = &self.built {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.built = None;
-                    if let Err(e) = &result {
-                        eprintln!("[gpu] {}: the tables of window {} could not be built: {e}", self.name, tuner.target());
-                    }
-                    self.tables = Some(result.is_ok());
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    self.built = None;
-                    self.tables = Some(false);
-                }
-            }
-        }
-        if let Some(rx) = &self.jit {
-            if !matches!(rx.try_recv(), Err(TryRecvError::Empty)) {
-                self.jit = None;
-            }
-        }
-        // Ready when the tables are and the kernel's compile is over - or at
-        // once if the tables failed: there is nothing to switch to.
-        if let Some(ok) = self.tables {
-            if self.jit.is_none() || !ok {
-                self.tables = None;
-                action = tuner.built(ok);
-            }
+        // Ready once the compile ahead is over, however it went: a switch
+        // without its result compiles the kernel itself.
+        if self.preparing && !self.jit.as_ref().is_some_and(|rx| matches!(rx.try_recv(), Err(TryRecvError::Empty))) {
+            self.preparing = false;
+            self.jit = None;
+            action = tuner.ready();
         }
         if action == Action::Wait {
             action = tuner.launched(window, hashes, busy);
@@ -221,9 +184,12 @@ impl Tune {
         if !ok {
             self.want = START_WINDOW;
         }
-        // The target's tables are held until the tuning is done: the card
-        // goes back to 16 to measure it again, and then maybe to the target.
         let action = tuner.switched(window, ok);
+        match action {
+            Action::Switch(next) if !ok => crate::human!("[gpu] {}: trying BC3Hash window {next} instead", self.name),
+            Action::Done { .. } if !ok => crate::human!("[gpu] {}: staying at BC3Hash window {START_WINDOW}", self.name),
+            _ => {}
+        }
         self.act(action);
     }
 
@@ -236,7 +202,8 @@ impl Tune {
             }
             Action::Done { choice, remember } => {
                 self.tuner = None;
-                self.release();
+                self.preparing = false;
+                self.jit = None;
                 let mut measured = None;
                 if choice.start_rate > 0.0 && choice.tried_rate > 0.0 {
                     let gain = (choice.tried_rate / choice.start_rate - 1.0) * 100.0;
@@ -266,15 +233,6 @@ impl Tune {
         }
     }
 
-    fn release(&mut self) {
-        if let Some(w) = self.held.take() {
-            release_tables(w);
-        }
-        self.built = None;
-        self.tables = None;
-        self.jit = None;
-    }
-
     /// Tell the GUI the window this card mines at, and whether it is tuning.
     fn announce(&self, tuning: bool) {
         self.emit(tuning, None);
@@ -291,12 +249,6 @@ impl Tune {
             tried: measured.map(|m| m.0),
             gain_pct: measured.map(|m| m.1),
         });
-    }
-}
-
-impl Drop for Tune {
-    fn drop(&mut self) {
-        self.release();
     }
 }
 
@@ -354,7 +306,8 @@ pub fn run_gpu_worker(
             None => shared.wait_for_job(),
         };
         if job.algo == PowAlgo::Bc3Hash && backend.has_kernel(PowAlgo::Bc3Hash) {
-            if let Some(window) = w.tune.switch_to.take() {
+            // A switch that fails may make way for another window at once.
+            while let Some(window) = w.tune.switch_to.take() {
                 let ok = switch_bc3(&shared, &mut *backend, slot, window);
                 w.tune.switched(window, ok);
             }
@@ -864,11 +817,13 @@ impl MiningBackend for Closed {
     fn abandon(&mut self) {}
 }
 
-/// Switch the card to BC3Hash window `window` for its tuning: the tables
-/// were built ahead and the kernel compiled ahead, so the card stops for the
-/// upload and the self-test only. A failure is no failure of the card - the
-/// tuning goes back to the start window, which worked - so unlike
-/// `prepare_bc3` it neither hands BC3Hash to the CPU nor says so in red.
+/// Switch the card to BC3Hash window `window` for its tuning: the kernel was
+/// compiled ahead where the card has no machine code for it, so the card
+/// stops for its tables - built on the card, about a second even at window
+/// 24 - and the self-test. A failure is no failure of the card - the tuning
+/// tries a smaller window or goes back to the start window, which worked -
+/// so unlike `prepare_bc3` it neither hands BC3Hash to the CPU nor says so in
+/// red.
 fn switch_bc3(shared: &Shared, backend: &mut dyn MiningBackend, slot: usize, window: u32) -> bool {
     if backend.bc3hash_window() == Some(window) {
         return true;
@@ -885,7 +840,7 @@ fn switch_bc3(shared: &Shared, backend: &mut dyn MiningBackend, slot: usize, win
             true
         }
         Err(e) => {
-            eprintln!("[gpu] {}: switching to BC3Hash window {window} failed ({e}) - staying at {START_WINDOW}", backend.name());
+            eprintln!("[gpu] {}: switching to BC3Hash window {window} failed: {e}", backend.name());
             false
         }
     }

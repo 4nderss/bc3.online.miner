@@ -1,23 +1,27 @@
 //! The BC3Hash table window of each GPU, chosen while it mines.
 //!
 //! A bigger secp256k1 table window means fewer point additions per scalar
-//! multiplication - 16 digits at 16 bits, 13 at 20 - for more GPU memory:
-//! 256 MiB of tables at 16 bits, 3.3 GiB at 20. On an RTX 4090 (24 GiB, 72 MiB
-//! of L2, at its 450 W limit throughout) window 20 hashed 5.6 % faster than 16
-//! (2.66 against 2.52 MH/s, 60 s runs), 19 3.6 % and 18 1.6 %; on an RTX 3050
-//! Ti laptop (4 GiB) 19 was 2-5 % faster. Whether a card gains depends on
-//! its memory and its caches, and nobody can try every card, so the miner
-//! measures rather than guesses: it mines at 16 at once, builds the tables of
-//! the largest window that fits while it does, then measures 16, the bigger
-//! window, and 16 again, and keeps the bigger window only if the card hashes
-//! faster with it than with 16 on average. The choice is remembered per card
-//! model, memory size, driver and miner version, so the next start goes
-//! straight there; a new driver or miner version measures again.
+//! multiplication - 16 digits at 16 bits, 13 at 20, 11 at 24 - for more GPU
+//! memory: 256 MiB of tables at 16 bits, 3.3 GiB at 20, 28 GiB at 24. On an
+//! RTX 4090 (24 GiB, 72 MiB of L2, at its 450 W limit throughout) window 20
+//! hashed 5.6 % faster than 16 (2.66 against 2.52 MH/s, 60 s runs), 19 3.6 %
+//! and 18 1.6 % - about 2 % a digit; on an RTX 3050 Ti laptop (4 GiB) 19 was
+//! 2-5 % faster. Whether a card gains depends on its memory and its caches,
+//! and nobody can try every card, so the miner measures rather than guesses:
+//! it mines at 16 at once, then measures 16, the largest window that fits,
+//! and 16 again, and keeps the bigger window only if the card hashes faster
+//! with it than with 16 on average. The choice is remembered per card model,
+//! memory size, driver and miner version, so the next start goes straight
+//! there; a new driver or miner version measures again.
 //!
 //! Only CUDA cards tune (see `MiningBackend::memory`); the others stay at 16.
+//! A CUDA card builds its tables itself, at the switch (the kernel's
+//! `bc3hash_build_row`), so a window needs the card's memory and nothing of
+//! the host's.
 //!
 //! This module is the decision, driven by events and free of I/O but for the
-//! file the choices are kept in - so that it can be tested without a GPU.
+//! file the choices are kept in - so that it can be tested without a GPU -
+//! and the tables' layout, which decides their size.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -25,35 +29,35 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Every card starts here: small enough for any card, its tables built in
-/// about a second.
+/// well under a second.
 pub const START_WINDOW: u32 = 16;
 
 /// The windows tried above START_WINDOW, largest first. 21 has the same 13
-/// digits as 20 and so no fewer additions; 22 (12 digits) would need 12.9 GiB
-/// of tables, built in host memory first.
-pub const BIGGER: [u32; 3] = [20, 19, 18];
+/// digits as 20 and so no fewer additions; 22 and 24 are mixed schedules
+/// (`digits`), 12 and 11 digits in 8 and 28 GiB - a 32 GB card for 24.
+pub const BIGGER: [u32; 5] = [24, 22, 20, 19, 18];
 
-/// GPU memory left free beside the tables: the kernel's own local memory
-/// (3.4 KiB a thread, ~170 MiB on a big card), the launch buffers, the
-/// driver, and whatever else runs on the card - a desktop, a browser.
+/// GPU memory left free beside the tables, of what is free while the card
+/// mines at the start window - its local memory and launch buffers already
+/// taken: room for whatever else comes to run on the card, a desktop or a
+/// browser, and for the driver.
 const VRAM_SPARE: u64 = 1 << 30;
-/// Host memory left free beside the tables while they are built: the CPU's
-/// own BC3Hash tables, the GUI, the operating system.
-const RAM_SPARE: u64 = 2 << 30;
 
 /// How long each window is measured, in GPU time. A minute keeps one launch
 /// (~0.2-0.4 s) under 1 % of a rate, and the RTX 4090's rates held within
 /// 0.5 % over its 60 s runs.
 pub const MEASURE: Duration = Duration::from_secs(60);
-/// Mining between the end of the build - the bigger window's tables and its
-/// kernel - and the first measurement. The build keeps every core busy, and
-/// in a laptop the CPU and the GPU share one power budget and one cooling
-/// system, which the GPU gets back slowly: an RTX 3050 Ti laptop
-/// (i9-12900HK, the GPU holding at 74 C) dropped from 40 to 27 W while the
-/// build ran, and was back at 40 W only 90 s after it. Its first
-/// measurement of 16 right after the build came out 20 % low, and window 19
-/// looked 11.5 % faster; with this warm-up the tuning measured +3.7 %, where
-/// alternated runs give 2-5 %. The card warms up meanwhile, too.
+/// Mining between the bigger window being ready - its kernel compiled ahead,
+/// where the card has no machine code for it - and the first measurement:
+/// the card warms up, and its clock falls with it. In 2.1 the host built the
+/// bigger window's tables meanwhile, on every core, and in a laptop the CPU
+/// and the GPU share one power budget and one cooling system, which the GPU
+/// gets back slowly: an RTX 3050 Ti laptop (i9-12900HK, the GPU holding at
+/// 74 C) dropped from 40 to 27 W while the build ran, and was back at 40 W
+/// only 90 s after it. Its first measurement of 16 right after the build
+/// came out 20 % low, and window 19 looked 11.5 % faster; with this warm-up
+/// the tuning measured +3.7 %, where alternated runs give 2-5 %. The card
+/// builds its tables itself now, at the switch.
 pub const WARM_UP: Duration = Duration::from_secs(90);
 /// After a switch, before the new window is measured. The switch idles the
 /// card for a second or two, and a power-limited card comes back faster than
@@ -71,71 +75,65 @@ pub const MIN_GAIN: f64 = 0.005;
 /// still held down (see WARM_UP) was 20 % off.
 pub const MAX_DRIFT: f64 = 0.05;
 
-/// Size of the GPU tables at `window` (bc3hash::gpu_tables): the three power
-/// tables, then four curves of (256 / w rounded up) rows of 2^w - 1 points of
-/// 64 bytes.
+/// The widths of the digits a 256-bit scalar is cut into at `window`, least
+/// significant first: one row of each curve's table per digit, in this order.
+/// A uniform window w has 256 / w digits, rounded up, of w bits, the last one
+/// holding what is left; 22 and 24 are mixed schedules, digits of two widths
+/// that cover the 256 bits exactly - the fewest digits for the memory: 12 of
+/// 21 and 22 bits are 8 GiB of tables where 12 of 22 bits would be 12 GiB.
+/// What the kernel is built with for each (`BC3_WINDOW`, `BC3_WIDE`) is in
+/// tools/ptx.sh; the card's self-test catches the two disagreeing. None for a
+/// window there is no kernel for.
+pub fn digits(window: u32) -> Option<Vec<u32>> {
+    match window {
+        2..=20 => Some(vec![window; 256u32.div_ceil(window) as usize]),
+        22 => Some([vec![21; 8], vec![22; 4]].concat()),
+        24 => Some([vec![23; 8], vec![24; 3]].concat()),
+        _ => None,
+    }
+}
+
+/// One row of a curve's table: the lowest bit of its digit, the places in it
+/// (2^width - 1 points of 64 bytes, b * 2^pos * P for b = 1, 2, ...) and how
+/// many of them hold a point - fewer only in the last row of a uniform
+/// window, whose digit is shorter; zeros fill the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Row {
+    pub pos: u32,
+    pub places: u64,
+    pub points: u64,
+}
+
+/// The rows of each curve's table at `window` (see `digits`).
+pub fn rows(window: u32) -> Option<Vec<Row>> {
+    let mut pos = 0;
+    let rows = digits(window)?
+        .into_iter()
+        .map(|width| {
+            let bits = width.min(256 - pos);
+            let row = Row { pos, places: (1u64 << width) - 1, points: (1u64 << bits) - 1 };
+            pos += bits;
+            row
+        })
+        .collect();
+    Some(rows)
+}
+
+/// The power tables at the start of the buffer, in u64 (pow64: 8 rows of 256,
+/// pow128: 16 of 256 x 2, pow256: 32 of 256 x 4) - `BC3_TABLE_CURVE` of the
+/// kernel. Four curves follow them (`rows`), x[4] and y[4] a point.
+pub const POWER_TABLES_U64: u64 = 8 * 256 + 16 * 256 * 2 + 32 * 256 * 4;
+
+/// Size of the GPU tables at `window`, 0 for a window there is no kernel for.
 pub fn table_bytes(window: u32) -> u64 {
-    let rows = u64::from(256u32.div_ceil(window));
-    let pow = (8 * 256 + 16 * 256 * 2 + 32 * 256 * 4) * 8;
-    pow + 4 * rows * ((1u64 << window) - 1) * 64
+    rows(window).map_or(0, |rows| (POWER_TABLES_U64 + 4 * rows.iter().map(|r| r.places).sum::<u64>() * 8) * 8)
 }
 
-/// The largest window above START_WINDOW whose tables fit on the card and,
-/// while they are built, in the host's memory - with room to spare in both.
-/// None when nothing bigger fits, or the free host memory is unknown.
-pub fn largest_fitting(free_vram: u64, avail_ram: Option<u64>) -> Option<u32> {
-    let avail_ram = avail_ram?;
-    BIGGER.iter().copied().find(|&w| {
-        let t = table_bytes(w);
-        t + VRAM_SPARE <= free_vram && t + RAM_SPARE <= avail_ram
-    })
-}
-
-/// The host memory available to a new allocation, where the platform says.
-pub fn available_ram() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
-        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kib * 1024)
-    }
-    #[cfg(windows)]
-    {
-        #[repr(C)]
-        struct MemoryStatusEx {
-            length: u32,
-            memory_load: u32,
-            total_phys: u64,
-            avail_phys: u64,
-            total_page_file: u64,
-            avail_page_file: u64,
-            total_virtual: u64,
-            avail_virtual: u64,
-            avail_extended_virtual: u64,
-        }
-        extern "system" {
-            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
-        }
-        let mut s = MemoryStatusEx {
-            length: std::mem::size_of::<MemoryStatusEx>() as u32,
-            memory_load: 0,
-            total_phys: 0,
-            avail_phys: 0,
-            total_page_file: 0,
-            avail_page_file: 0,
-            total_virtual: 0,
-            avail_virtual: 0,
-            avail_extended_virtual: 0,
-        };
-        // SAFETY: a correctly sized, writable struct with its length set, as
-        // the function requires; kernel32 is always linked on Windows.
-        (unsafe { GlobalMemoryStatusEx(&mut s) } != 0).then_some(s.avail_phys)
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        None
-    }
+/// The largest window above START_WINDOW whose tables fit on the card with
+/// room to spare, `free_vram` counting the start window's tables, which go
+/// before the bigger ones come. None when nothing bigger fits.
+pub fn largest_fitting(free_vram: u64) -> Option<u32> {
+    BIGGER.iter().copied().find(|&w| table_bytes(w) + VRAM_SPARE <= free_vram)
 }
 
 /// A window chosen for a card, and the rates it was chosen on (hashes per
@@ -218,10 +216,11 @@ fn read_all(path: &std::path::Path) -> HashMap<String, Choice> {
 pub enum Action {
     /// Nothing.
     Wait,
-    /// Start building the tables of this window in the background (and
-    /// compiling its kernel ahead), and say when they are ready.
+    /// Get this window ready to switch to - its kernel compiled ahead where
+    /// the card has no machine code for it - and say when it is (`ready`).
+    /// Its tables the card builds at the switch.
     Build(u32),
-    /// Switch the card to this window now: its tables are ready.
+    /// Switch the card to this window now.
     Switch(u32),
     /// The tuning is over: the card stays at `choice.window`. `remember`:
     /// whether the choice is sound enough for the next start to go straight
@@ -231,8 +230,8 @@ pub enum Action {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Phase {
-    /// Mining at START_WINDOW while the target's tables are built, and then
-    /// for the warm-up; only the time after the build counts.
+    /// Mining at START_WINDOW while the target is made ready, and then for
+    /// the warm-up; only the time after it is ready counts.
     WarmUp { mined: Duration },
     /// Measuring START_WINDOW.
     MeasureStart { rate: Rate },
@@ -272,7 +271,12 @@ impl Rate {
 #[derive(Debug)]
 pub struct Tuner {
     target: u32,
-    built: bool,
+    /// The smaller windows that fit, largest first: tried in turn when the
+    /// card cannot switch to the target - its tables did not fit after all
+    /// (28 GiB on a 32 GB card that drives a desktop), or its kernel failed
+    /// the self-test.
+    fallback: Vec<u32>,
+    ready: bool,
     phase: Phase,
 }
 
@@ -286,12 +290,14 @@ impl Tuner {
         if let Some(c) = recalled {
             // A remembered bigger window still has to fit today.
             return (c.window > START_WINDOW && c.window <= fitting).then(|| {
-                let t = Tuner { target: c.window, built: false, phase: Phase::Recalled { window: c.window } };
+                let phase = Phase::Recalled { window: c.window };
+                let t = Tuner { target: c.window, fallback: Vec::new(), ready: false, phase };
                 (t, Action::Build(c.window))
             });
         }
-        let t = Tuner { target: fitting, built: false, phase: Phase::WarmUp { mined: Duration::ZERO } };
-        // The card mines at the start window while the tables are built.
+        let fallback = BIGGER.iter().copied().filter(|&w| w < fitting).collect();
+        let t = Tuner { target: fitting, fallback, ready: false, phase: Phase::WarmUp { mined: Duration::ZERO } };
+        // The card mines at the start window while the target is made ready.
         Some((t, Action::Build(fitting)))
     }
 
@@ -306,7 +312,7 @@ impl Tuner {
     pub fn launched(&mut self, window: u32, hashes: u64, busy: Duration) -> Action {
         let target = self.target;
         match &mut self.phase {
-            Phase::WarmUp { mined } if window == START_WINDOW && self.built => {
+            Phase::WarmUp { mined } if window == START_WINDOW && self.ready => {
                 *mined += busy;
                 if *mined >= WARM_UP {
                     self.phase = Phase::MeasureStart { rate: Rate::default() };
@@ -370,16 +376,9 @@ impl Tuner {
         }
     }
 
-    /// The target's tables are built (`ok`) or could not be.
-    pub fn built(&mut self, ok: bool) -> Action {
-        if !ok {
-            // Nothing to switch to: stay at the start window, and do not
-            // remember it - the next start may have the memory.
-            self.phase = Phase::Finished;
-            let choice = Choice { window: START_WINDOW, start_rate: 0.0, tried: self.target, tried_rate: 0.0 };
-            return Action::Done { choice, remember: false };
-        }
-        self.built = true;
+    /// The target is ready to switch to (`Action::Build`).
+    pub fn ready(&mut self) -> Action {
+        self.ready = true;
         match self.phase {
             Phase::Recalled { window } => Action::Switch(window),
             _ => Action::Wait,
@@ -387,8 +386,9 @@ impl Tuner {
     }
 
     /// The card switched to `window` (`ok`), or the switch failed - its
-    /// self-test, its memory. Every failure ends the tuning at the start
-    /// window.
+    /// self-test, its memory. A first switch to the target that fails tries
+    /// the next smaller window that fits, measured against the same 16; any
+    /// other failure ends the tuning at the start window.
     pub fn switched(&mut self, window: u32, ok: bool) -> Action {
         let unmeasured = |window, tried| Choice { window, start_rate: 0.0, tried, tried_rate: 0.0 };
         let done = match self.phase {
@@ -396,6 +396,11 @@ impl Tuner {
             // Already in the file: nothing to write again.
             Phase::Recalled { .. } if ok => Action::Done { choice: unmeasured(window, window), remember: false },
             _ if ok => return Action::Wait,
+            Phase::Settle { before, .. } if window == self.target && !self.fallback.is_empty() => {
+                self.target = self.fallback.remove(0);
+                self.phase = Phase::Settle { before, mined: Duration::ZERO };
+                return Action::Switch(self.target);
+            }
             // A target that fails is remembered as such: the card stays at the
             // start window until a new driver or miner version.
             _ if window != START_WINDOW => Action::Done { choice: unmeasured(START_WINDOW, window), remember: true },
@@ -427,31 +432,58 @@ mod tests {
         assert!((mib(18) - 960.3).abs() < 0.1);
         assert!((mib(19) - 1792.3).abs() < 0.1);
         assert!((mib(20) - 3328.3).abs() < 0.1);
+        // 8 x (2^21 - 1) + 4 x (2^22 - 1) and 8 x (2^23 - 1) + 3 x (2^24 - 1)
+        // points a curve.
+        assert!((mib(22) - 8192.3).abs() < 0.1);
+        assert!((mib(24) - 28672.3).abs() < 0.1);
+        assert_eq!(table_bytes(21), 0, "no kernel for 21");
     }
 
     #[test]
-    fn the_largest_window_that_fits_both_memories() {
-        // A 24 GiB card with 22 free and plenty of RAM: 20.
-        assert_eq!(largest_fitting(22 * GIB, Some(32 * GIB)), Some(20));
+    fn every_window_cuts_the_256_bits_into_its_rows() {
+        for w in [2, 16, 18, 19, 20, 22, 24] {
+            let rows = rows(w).unwrap();
+            let bits: u32 = rows.iter().map(|r| r.points.trailing_ones()).sum();
+            assert_eq!(bits, 256, "window {w}");
+            assert_eq!(rows[0].pos, 0);
+            for pair in rows.windows(2) {
+                assert_eq!(pair[1].pos, pair[0].pos + pair[0].points.trailing_ones(), "window {w}");
+            }
+            // Every place holds a point, but in the last row of a uniform
+            // window that does not divide 256.
+            for r in &rows[..rows.len() - 1] {
+                assert_eq!(r.points, r.places, "window {w}");
+            }
+        }
+        assert_eq!(digits(20).unwrap().len(), 13);
+        assert_eq!(rows(20).unwrap()[12], Row { pos: 240, places: (1 << 20) - 1, points: (1 << 16) - 1 });
+        assert_eq!(digits(22).unwrap(), [21, 21, 21, 21, 21, 21, 21, 21, 22, 22, 22, 22]);
+        assert_eq!(digits(24).unwrap(), [23, 23, 23, 23, 23, 23, 23, 23, 24, 24, 24]);
+        assert_eq!(rows(24).unwrap()[8].pos, 184);
+        // The kernels there are (build.rs) and those the tuning tries.
+        assert!(BIGGER.iter().all(|&w| digits(w).is_some()));
+        assert!(BIGGER.windows(2).all(|p| table_bytes(p[0]) > table_bytes(p[1])), "largest first");
+    }
+
+    #[test]
+    fn the_largest_window_that_fits() {
+        // A 32 GB RTX 5090 with nothing else on it: 24 (28 GiB + 1 spare).
+        assert_eq!(largest_fitting(30 * GIB), Some(24));
+        // A 24 GiB card with 22 free: 22 (8 + 1); 8 free: 20 (3.25 + 1).
+        assert_eq!(largest_fitting(22 * GIB), Some(22));
+        assert_eq!(largest_fitting(8 * GIB), Some(20));
         // 4 GiB free: 20 needs 3.25 + 1 spare, 19 needs 1.75 + 1.
-        assert_eq!(largest_fitting(4 * GIB, Some(32 * GIB)), Some(19));
-        // Plenty of VRAM, but 4 GiB of RAM: 19 needs 1.75 + 2.
-        assert_eq!(largest_fitting(22 * GIB, Some(4 * GIB)), Some(19));
-        // 3 GiB of RAM: 18 (0.94 + 2).
-        assert_eq!(largest_fitting(22 * GIB, Some(3 * GIB)), Some(18));
-        assert_eq!(largest_fitting(22 * GIB, Some(2 * GIB)), None);
+        assert_eq!(largest_fitting(4 * GIB), Some(19));
         // 2 GiB free on the card: 18 (0.94 + 1); 1.5 GiB: nothing above 16.
-        assert_eq!(largest_fitting(2 * GIB, Some(32 * GIB)), Some(18));
-        assert_eq!(largest_fitting(3 * GIB / 2, Some(32 * GIB)), None);
-        // Unknown host memory: do not risk it.
-        assert_eq!(largest_fitting(22 * GIB, None), None);
+        assert_eq!(largest_fitting(2 * GIB), Some(18));
+        assert_eq!(largest_fitting(3 * GIB / 2), None);
     }
 
     /// Drive a tuner through launches of `busy` each at the window the card
-    /// is at, applying its actions; `built_after` launches until the tables
-    /// are ready, `rate_at(window, launch)` the card's rate. Returns the
+    /// is at, applying its actions; `ready_after` launches until the target
+    /// is ready, `rate_at(window, launch)` the card's rate. Returns the
     /// actions seen.
-    fn run(tuner: &mut Tuner, first: Action, rate_at: impl Fn(u32, usize) -> f64, built_after: usize) -> Vec<Action> {
+    fn run(tuner: &mut Tuner, first: Action, rate_at: impl Fn(u32, usize) -> f64, ready_after: usize) -> Vec<Action> {
         let busy = Duration::from_millis(250);
         let mut window = START_WINDOW;
         let mut actions = vec![first];
@@ -468,8 +500,8 @@ mod tests {
             }
         };
         for n in 0..5000 {
-            if n == built_after {
-                let a = tuner.built(true);
+            if n == ready_after {
+                let a = tuner.ready();
                 apply(a, &mut window, tuner, &mut actions);
             }
             if tuner.finished() {
@@ -549,35 +581,36 @@ mod tests {
     }
 
     #[test]
-    fn slow_tables_are_waited_for() {
-        // The tables come long after the warm-up; the start window's rate
-        // while they were built (here 2.0, the CPU busy) must not count.
+    fn a_slow_compile_ahead_is_waited_for() {
+        // The target is ready long after the warm-up - the driver compiling
+        // its kernel ahead; the start window's rate meanwhile (here 2.0, the
+        // CPU busy) must not count.
         let (mut t, first) = Tuner::start(Some(20), None).unwrap();
-        let built_after = 1000;
-        let rate = |w: u32, n: usize| match (w, n < built_after) {
+        let ready_after = 1000;
+        let rate = |w: u32, n: usize| match (w, n < ready_after) {
             (START_WINDOW, true) => 2.0e6,
             (START_WINDOW, false) => 2.5e6,
             _ => 2.6e6,
         };
-        let actions = run(&mut t, first, rate, built_after);
+        let actions = run(&mut t, first, rate, ready_after);
         let (c, _) = done(&actions);
         assert_eq!(c.window, 20);
-        assert!((c.start_rate - 2.5e6).abs() < 1e3, "start rate {} includes the build", c.start_rate);
+        assert!((c.start_rate - 2.5e6).abs() < 1e3, "start rate {} includes the compile", c.start_rate);
     }
 
     #[test]
-    fn the_start_window_is_measured_after_the_build_and_the_warm_up() {
-        // Launches of 0.25 s: the warm-up is 360 of them after the build,
-        // the measurement 240 more.
+    fn the_start_window_is_measured_after_the_target_is_ready_and_the_warm_up() {
+        // Launches of 0.25 s: the warm-up is 360 of them after the target is
+        // ready, the measurement 240 more.
         let (mut t, _) = Tuner::start(Some(20), None).unwrap();
         let busy = Duration::from_millis(250);
-        let built_after = 1000;
-        for n in 0..built_after + 360 + 240 {
-            if n == built_after {
-                assert_eq!(t.built(true), Action::Wait);
+        let ready_after = 1000;
+        for n in 0..ready_after + 360 + 240 {
+            if n == ready_after {
+                assert_eq!(t.ready(), Action::Wait);
             }
             let a = t.launched(START_WINDOW, 625_000, busy);
-            let expect = if n + 1 == built_after + 360 + 240 { Action::Switch(20) } else { Action::Wait };
+            let expect = if n + 1 == ready_after + 360 + 240 { Action::Switch(20) } else { Action::Wait };
             assert_eq!(a, expect, "launch {n}");
         }
     }
@@ -590,7 +623,7 @@ mod tests {
         let actions = run(&mut t, first, |w, _| if w == 20 { 2.6e6 } else { 2.5e6 }, 10);
         let (c, _) = done(&actions);
         let (mut u, _) = Tuner::start(Some(20), None).unwrap();
-        assert_eq!(u.built(true), Action::Wait);
+        assert_eq!(u.ready(), Action::Wait);
         let busy = Duration::from_millis(250);
         let mut window = START_WINDOW;
         let mut result = None;
@@ -622,7 +655,7 @@ mod tests {
         let (mut t, first) = Tuner::start(Some(20), Some(c)).unwrap();
         assert_eq!(first, Action::Build(19));
         assert_eq!(t.launched(START_WINDOW, 1000, Duration::from_secs(100)), Action::Wait);
-        assert_eq!(t.built(true), Action::Switch(19));
+        assert_eq!(t.ready(), Action::Switch(19));
         // Already in the file: nothing to write again.
         assert!(matches!(t.switched(19, true), Action::Done { choice: Choice { window: 19, .. }, remember: false }));
         assert!(t.finished());
@@ -639,26 +672,70 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_build_or_switch_stays_at_the_start_window() {
-        // Tables that could not be built: nothing remembered, the next start
-        // may have the memory.
-        let (mut t, _) = Tuner::start(Some(20), None).unwrap();
+    fn a_target_the_card_cannot_switch_to_gives_way_to_the_next() {
+        // 24 does not load - 28 GiB that did not fit after all - and 22 is
+        // measured in its place, against the 16 measured before.
+        let (mut t, first) = Tuner::start(Some(24), None).unwrap();
+        assert_eq!(first, Action::Build(24));
+        let busy = Duration::from_millis(250);
+        assert_eq!(t.ready(), Action::Wait);
+        let mut n = 0;
+        let a = loop {
+            n += 1;
+            let a = t.launched(START_WINDOW, 625_000, busy);
+            if a != Action::Wait {
+                break a;
+            }
+        };
+        assert_eq!((a, n), (Action::Switch(24), 360 + 240));
+        assert_eq!(t.switched(24, false), Action::Switch(22));
+        assert_eq!(t.switched(22, true), Action::Wait);
+        assert_eq!(t.target(), 22);
+        let mut window = 22;
+        let choice = loop {
+            let rate = if window == 22 { 2.7e6 } else { 2.5e6 };
+            match t.launched(window, (rate * 0.25) as u64, busy) {
+                Action::Switch(w) => {
+                    window = w;
+                    if let Action::Done { choice, .. } = t.switched(w, true) {
+                        break choice;
+                    }
+                }
+                Action::Done { choice, .. } => break choice,
+                Action::Wait => {}
+                a => panic!("{a:?}"),
+            }
+        };
+        assert_eq!((choice.window, choice.tried), (22, 22));
+        assert!((choice.start_rate - 2.5e6).abs() < 1e3, "{choice:?}");
+        // Every smaller window failing too: 16, the last one tried remembered.
+        let (mut t, _) = Tuner::start(Some(19), None).unwrap();
+        t.ready();
+        while t.launched(START_WINDOW, 625_000, busy) == Action::Wait {}
+        assert_eq!(t.switched(19, false), Action::Switch(18));
         assert!(matches!(
-            t.built(false),
-            Action::Done { choice: Choice { window: START_WINDOW, tried: 20, .. }, remember: false }
+            t.switched(18, false),
+            Action::Done { choice: Choice { window: START_WINDOW, tried: 18, .. }, remember: true }
         ));
-        assert!(t.finished());
+    }
+
+    #[test]
+    fn a_failed_switch_otherwise_stays_at_the_start_window() {
         // A switch that failed - the self-test, the card's memory - is
         // remembered: the card stays at 16 until a new driver or version.
-        let (mut t, _) = Tuner::start(Some(20), None).unwrap();
+        let (mut t, _) = Tuner::start(Some(18), None).unwrap();
+        t.ready();
+        while t.launched(START_WINDOW, 625_000, Duration::from_millis(250)) == Action::Wait {}
         assert!(matches!(
-            t.switched(20, false),
-            Action::Done { choice: Choice { window: START_WINDOW, tried: 20, .. }, remember: true }
+            t.switched(18, false),
+            Action::Done { choice: Choice { window: START_WINDOW, tried: 18, .. }, remember: true }
         ));
-        // So is a remembered window that fails.
+        assert!(t.finished());
+        // So is a remembered window that fails: it was measured on this card
+        // before, and something has changed since.
         let c = Choice { window: 19, start_rate: 1.0, tried: 19, tried_rate: 2.0 };
         let (mut t, _) = Tuner::start(Some(20), Some(c)).unwrap();
-        assert_eq!(t.built(true), Action::Switch(19));
+        assert_eq!(t.ready(), Action::Switch(19));
         assert!(matches!(
             t.switched(19, false),
             Action::Done { choice: Choice { window: START_WINDOW, tried: 19, .. }, remember: true }

@@ -32,17 +32,32 @@ use std::time::Duration;
 /// The BC3Hash kernel, one PTX per secp256k1 table window. Every card starts
 /// at 16; a card with the memory for them is moved to a bigger window while it
 /// mines, if it hashes faster there (src/tuning.rs).
-const BC3HASH_PTX: [(u32, &str); 4] = [
+const BC3HASH_PTX: [(u32, &str); 6] = [
     (16, include_str!(env!("BC3_BC3HASH_W16_PTX"))),
     (18, include_str!(env!("BC3_BC3HASH_W18_PTX"))),
     (19, include_str!(env!("BC3_BC3HASH_W19_PTX"))),
     (20, include_str!(env!("BC3_BC3HASH_W20_PTX"))),
+    (22, include_str!(env!("BC3_BC3HASH_W22_PTX"))),
+    (24, include_str!(env!("BC3_BC3HASH_W24_PTX"))),
 ];
+
+/// The kernel that builds the curve tables on the card, one row at a time,
+/// for every window (`bc3hash_build_row`; the source built with
+/// `-DBC3_BUILD_ONLY`).
+const BUILD_PTX: &str = include_str!(env!("BC3_BC3HASH_BUILD_PTX"));
 
 /// Threads per block for BC3Hash. Must stay 64: the kernel declares
 /// `__launch_bounds__(64, 6)` - its register budget - and a larger block does
 /// not launch. A small block also keeps the tail of a launch short.
 const BC3_BLOCK_DIM: u32 = 64;
+
+/// The table builder's launches: blocks of 64, eight an SM - 96-106
+/// registers a thread let ten fit. Each thread makes a stretch of a row's
+/// points, so any number of threads builds all of them, and the fewer the
+/// threads the longer the stretches over which a thread's first point - 24
+/// doublings - is paid for.
+const BUILD_BLOCK_DIM: u32 = 64;
+const BUILD_BLOCKS_PER_SM: u32 = 8;
 
 /// The oldest driver that can load the kernel, as `cuDriverGetVersion` reports
 /// it (1000 x major + 10 x minor of the CUDA version it supports): the PTX
@@ -166,23 +181,23 @@ fn check_driver() -> Result<(), String> {
     Ok(())
 }
 
-/// The kernel's machine code, by window and architecture (build.rs).
+/// The kernels' machine code, by PTX and architecture (build.rs).
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/sass.rs"));
 }
 
-/// The machine code for a card of architecture `sm` (major * 10 + minor) at
-/// `window`, and the architecture it was made for: the card's own, or the
-/// newest earlier minor of its major - machine code runs on the later minors
-/// of its own major (sm_86 code on sm_87), never on an earlier one or another
-/// major. None: the card JITs the PTX.
+/// The machine code of the PTX named `stem` for a card of architecture `sm`
+/// (major * 10 + minor), and the architecture it was made for: the card's
+/// own, or the newest earlier minor of its major - machine code runs on the
+/// later minors of its own major (sm_86 code on sm_87), never on an earlier
+/// one or another major. None: the card JITs the PTX.
 fn pick_sass(
-    sass: &'static [(u32, u32, &'static [u8])],
-    window: u32,
+    sass: &'static [(&'static str, u32, &'static [u8])],
+    stem: &str,
     sm: u32,
 ) -> Option<(u32, &'static [u8])> {
     sass.iter()
-        .filter(|(w, s, _)| *w == window && s / 10 == sm / 10 && *s <= sm)
+        .filter(|(name, s, _)| *name == stem && s / 10 == sm / 10 && *s <= sm)
         .max_by_key(|(_, s, _)| *s)
         .map(|(_, s, code)| (*s, *code))
 }
@@ -194,6 +209,11 @@ fn bc3hash_ptx(window: u32) -> Result<&'static str, String> {
         .find(|(w, _)| *w == window)
         .map(|(_, ptx)| *ptx)
         .ok_or_else(|| format!("no BC3Hash kernel for a window of {window} bits"))
+}
+
+/// The name of the PTX for `window`, as build.rs and tools/ptx.sh have it.
+fn bc3hash_stem(window: u32) -> String {
+    format!("bc3hash_w{window}")
 }
 
 /// Compile the BC3Hash kernel for `window` into the driver's JIT cache, so
@@ -229,9 +249,13 @@ pub struct CudaBackend {
     next_slot: usize,
     /// The BC3Hash kernel in use - loaded on demand, for one window at a time.
     bc3: Option<Bc3Kernel>,
+    /// The table builder, loaded with the first tables and kept.
+    builder: Option<CudaFunction>,
     /// The card's architecture, major * 10 + minor: which machine code it
     /// takes (`pick_sass`).
     sm: u32,
+    /// Its multiprocessors.
+    sms: u32,
     /// Whether the card has been told that it JITs the PTX - said once.
     told_jit: bool,
 }
@@ -254,8 +278,10 @@ impl CudaBackend {
         use sys::CUdevice_attribute::{
             CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR as MAJOR,
             CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR as MINOR,
+            CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT as SMS,
         };
         let sm = (ctx.attribute(MAJOR).unwrap_or(0) * 10 + ctx.attribute(MINOR).unwrap_or(0)).max(0) as u32;
+        let sms = ctx.attribute(SMS).unwrap_or(1).max(1) as u32;
         Ok(Self {
             index,
             ctx,
@@ -265,16 +291,19 @@ impl CudaBackend {
             queued: VecDeque::new(),
             next_slot: 0,
             bc3: None,
+            builder: None,
             sm,
+            sms,
             told_jit: false,
         })
     }
 
-    /// The BC3Hash kernel for `window`: the machine code built for this
+    /// The module of the PTX named `stem`: the machine code built for this
     /// card's architecture where this build has it, else the PTX, which the
-    /// driver JITs - 20-60 s, unless its cache has the result.
-    fn load_module(&mut self, window: u32) -> Result<Arc<cudarc::driver::CudaModule>, String> {
-        match pick_sass(embedded::SASS, window, self.sm) {
+    /// driver JITs - 20-60 s for a window's kernel, unless its cache has the
+    /// result.
+    fn load_module(&mut self, stem: &str, ptx: &'static str) -> Result<Arc<cudarc::driver::CudaModule>, String> {
+        match pick_sass(embedded::SASS, stem, self.sm) {
             Some((sm, packed)) => match miniz_oxide::inflate::decompress_to_vec(packed) {
                 Ok(code) => match self.ctx.load_module(cudarc::nvrtc::Ptx::from_binary(code)) {
                     Ok(module) => return Ok(module),
@@ -296,35 +325,122 @@ impl CudaBackend {
         }
         self.told_jit = true;
         self.ctx
-            .load_module(cudarc::nvrtc::Ptx::from_src(bc3hash_ptx(window)?))
-            .map_err(|e| format!("could not load the BC3Hash kernel (window {window}): {e}"))
+            .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
+            .map_err(|e| format!("could not load the BC3Hash kernel {stem}: {e}"))
     }
 
-    /// Load the BC3Hash kernel for `window` and upload its tables.
+    /// Load the BC3Hash kernel for `window` and build its tables.
     fn load_bc3(&mut self, window: u32) -> Result<Bc3Kernel, String> {
-        let module = self.load_module(window)?;
+        let module = self.load_module(&bc3hash_stem(window), bc3hash_ptx(window)?)?;
         let scan = module
             .load_function("bc3hash_scan")
             .map_err(|e| format!("load_function bc3hash_scan: {e}"))?;
         let batch = module
             .load_function("bc3hash_batch")
             .map_err(|e| format!("load_function bc3hash_batch: {e}"))?;
-        let tables = super::bc3::host_tables(window)?;
-        let d_tables = self
-            .stream
-            .clone_htod(&tables[..])
-            .map_err(|e| format!("upload BC3Hash tables ({} MiB): {e}", (tables.len() * 8) >> 20))?;
-        let sms = self
-            .ctx
-            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
-            .unwrap_or(1)
-            .max(1) as u32;
+        let d_tables = self.build_tables(window)?;
         let per_sm = scan
             .occupancy_max_active_blocks_per_multiprocessor(BC3_BLOCK_DIM, 0, None)
             .unwrap_or(1)
             .max(1);
-        let wave = sms * per_sm * BC3_BLOCK_DIM;
+        let wave = self.sms * per_sm * BC3_BLOCK_DIM;
         Ok(Bc3Kernel { window, scan, batch, d_tables, wave })
+    }
+
+    /// The table builder, loaded with the first tables and kept.
+    fn builder(&mut self) -> Result<CudaFunction, String> {
+        if let Some(f) = &self.builder {
+            return Ok(f.clone());
+        }
+        let f = self
+            .load_module("bc3hash_build", BUILD_PTX)?
+            .load_function("bc3hash_build_row")
+            .map_err(|e| format!("load_function bc3hash_build_row: {e}"))?;
+        self.builder = Some(f.clone());
+        Ok(f)
+    }
+
+    /// The tables of `window`, built on the card: the power tables from the
+    /// host, then every row of the four curves by `bc3hash_build_row`, from
+    /// the row's base 2^pos * P, which the host works out. Until 2.1 the host
+    /// built all of it, on every core, and uploaded it: 18.7 s for window 20
+    /// on 20 threads and 3.3 GiB of host memory, a laptop's GPU down from 40
+    /// to 27 W meanwhile - and window 24's 28 GiB out of reach. On an RTX 3050
+    /// Ti window 20 takes 0.4 s, and the host's work is a few dozen scalar
+    /// multiplications. Some entries of every row are checked against the
+    /// host's own (`check_tables`).
+    fn build_tables(&mut self, window: u32) -> Result<CudaSlice<u64>, String> {
+        let rows = crate::tuning::rows(window).ok_or_else(|| format!("no tables for a window of {window} bits"))?;
+        let build = self.builder()?;
+        let power = bc3hash::gpu_power_tables()?;
+        let curve_u64: usize = rows.iter().map(|r| r.places as usize * 8).sum();
+        let total = power.len() + 4 * curve_u64;
+        // Zeroed: the places past the last point of a uniform window's last
+        // row hold zeros, as the host's tables have them.
+        let mut tables = self
+            .stream
+            .alloc_zeros::<u64>(total)
+            .map_err(|e| format!("could not allocate {} MiB for the BC3Hash tables: {e}", (total * 8) >> 20))?;
+        self.stream
+            .memcpy_htod(&power[..], &mut tables.slice_mut(..power.len()))
+            .map_err(|e| format!("htod power tables: {e}"))?;
+        let mut bases = Vec::with_capacity(4 * rows.len() * 8);
+        for curve in 0..4 {
+            for row in &rows {
+                bases.extend_from_slice(&bc3hash::gpu_point(curve, row.pos, 1)?);
+            }
+        }
+        let bases = self.stream.clone_htod(&bases[..]).map_err(|e| format!("htod row bases: {e}"))?;
+        let most = self.sms * BUILD_BLOCKS_PER_SM;
+        let mut at = power.len();
+        for curve in 0..4 {
+            for (i, row) in rows.iter().enumerate() {
+                let places = row.places as usize * 8;
+                let count = row.points as u32;
+                let base_at = (curve * rows.len() + i) * 8;
+                let mut out = tables.slice_mut(at..at + places);
+                let base = bases.slice(base_at..base_at + 8);
+                let blocks = count.div_ceil(BUILD_BLOCK_DIM).clamp(1, most);
+                let mut launch = self.stream.launch_builder(&build);
+                launch.arg(&mut out).arg(&base).arg(&count);
+                let config = LaunchConfig { grid_dim: (blocks, 1, 1), block_dim: (BUILD_BLOCK_DIM, 1, 1), shared_mem_bytes: 0 };
+                // SAFETY: the kernel writes `count` points of 8 limbs into
+                // `out`, which has room for `places >= count` of them, and
+                // reads the 8 limbs of `base`.
+                unsafe { launch.launch(config) }.map_err(|e| format!("bc3hash_build_row launch: {e}"))?;
+                at += places;
+            }
+        }
+        self.stream.synchronize().map_err(|e| format!("building the BC3Hash tables: {e}"))?;
+        self.check_tables(&tables, power.len(), &rows)?;
+        Ok(tables)
+    }
+
+    /// The first, a middle and the last point of every row the card built,
+    /// against the host's b * 2^pos * P: a row built from the wrong base, at
+    /// the wrong place or not to its end shows here by name, where the
+    /// self-test after it could only say that hashes come out wrong.
+    fn check_tables(&self, tables: &CudaSlice<u64>, power: usize, rows: &[crate::tuning::Row]) -> Result<(), String> {
+        let curve_u64: usize = rows.iter().map(|r| r.places as usize * 8).sum();
+        let mut samples = Vec::new();
+        for curve in 0..4 {
+            let mut at = power + curve * curve_u64;
+            for (i, row) in rows.iter().enumerate() {
+                for b in [1, row.points / 2 + 1, row.points] {
+                    let e = at + (b as usize - 1) * 8;
+                    let got = self.stream.clone_dtoh(&tables.slice(e..e + 8)).map_err(|e| format!("dtoh: {e}"))?;
+                    samples.push((curve, i, row.pos, b, got));
+                }
+                at += row.places as usize * 8;
+            }
+        }
+        self.stream.synchronize().map_err(|e| format!("synchronize: {e}"))?;
+        for (curve, i, pos, b, got) in samples {
+            if got[..] != bc3hash::gpu_point(curve, pos, b)? {
+                return Err(format!("the tables built on the card are wrong: curve {curve}, row {i}, point {b}"));
+            }
+        }
+        Ok(())
     }
 
     /// BC3Hash of 80-byte headers on the GPU, through the kernel's batch
@@ -449,7 +565,7 @@ impl MiningBackend for CudaBackend {
 
     fn compile_bc3hash_ahead(&self, window: u32) -> Option<std::sync::mpsc::Receiver<()>> {
         // Machine code for the card: the switch loads it as it is.
-        if pick_sass(embedded::SASS, window, self.sm).is_some() {
+        if pick_sass(embedded::SASS, &bc3hash_stem(window), self.sm).is_some() {
             return None;
         }
         let (index, name) = (self.index, self.name());
@@ -604,9 +720,14 @@ mod tests {
 
     #[test]
     fn machine_code_is_the_cards_own_or_its_majors_earlier_minor() {
-        static HAVE: [(u32, u32, &[u8]); 5] =
-            [(16, 61, b"61"), (16, 75, b"75"), (16, 86, b"86"), (16, 89, b"89"), (16, 120, b"120")];
-        let pick = |sm| pick_sass(&HAVE, 16, sm).map(|(s, _)| s);
+        static HAVE: [(&str, u32, &[u8]); 5] = [
+            ("bc3hash_w16", 61, b"61"),
+            ("bc3hash_w16", 75, b"75"),
+            ("bc3hash_w16", 86, b"86"),
+            ("bc3hash_w16", 89, b"89"),
+            ("bc3hash_w16", 120, b"120"),
+        ];
+        let pick = |sm| pick_sass(&HAVE, "bc3hash_w16", sm).map(|(s, _)| s);
         assert_eq!(pick(86), Some(86));
         assert_eq!(pick(89), Some(89));
         assert_eq!(pick(87), Some(86), "Jetson Orin runs Ampere's code");
@@ -616,17 +737,38 @@ mod tests {
         assert_eq!(pick(90), None);
         assert_eq!(pick(70), None, "nor a V100 Turing's");
         assert_eq!(pick(60), None);
-        assert_eq!(pick_sass(&HAVE, 18, 86), None, "nor one window another's");
+        assert_eq!(pick_sass(&HAVE, "bc3hash_w18", 86), None, "nor one kernel another's");
     }
 
-    /// What build.rs embedded unpacks to cubins, for windows there is a PTX
+    /// What build.rs embedded unpacks to cubins, for kernels there is a PTX
     /// for. Empty in a build without tools/sass.sh's output.
     #[test]
     fn the_embedded_machine_code_unpacks_to_cubins() {
-        for (window, sm, packed) in embedded::SASS {
-            assert!(BC3HASH_PTX.iter().any(|(w, _)| w == window), "window {window}");
+        for (stem, sm, packed) in embedded::SASS {
+            let known = *stem == "bc3hash_build" || BC3HASH_PTX.iter().any(|(w, _)| bc3hash_stem(*w) == *stem);
+            assert!(known, "{stem}");
             let code = miniz_oxide::inflate::decompress_to_vec(packed).expect("inflate");
-            assert_eq!(&code[..4], b"\x7fELF", "window {window}, sm_{sm}");
+            assert_eq!(&code[..4], b"\x7fELF", "{stem}, sm_{sm}");
+        }
+    }
+
+    /// The tables a card builds itself are bit for bit the host's, the last
+    /// row of a window that does not divide 256 included (its zeros too),
+    /// on a window small enough to compare whole and on 16.
+    #[test]
+    #[ignore = "needs an NVIDIA GPU (run inside a --gpus all container)"]
+    fn cuda_tables_built_on_the_card_are_the_hosts() {
+        let mut backend = CudaBackend::new(0).expect("CUDA-backend");
+        for window in [5, 9, 16] {
+            let t0 = std::time::Instant::now();
+            let built = backend.build_tables(window).unwrap_or_else(|e| panic!("window {window}: {e}"));
+            let took = t0.elapsed();
+            let card = backend.stream.clone_dtoh(&built).expect("dtoh");
+            backend.stream.synchronize().expect("synchronize");
+            let host = bc3hash::gpu_tables(window).unwrap();
+            assert_eq!(card.len(), host.len(), "window {window}");
+            assert!(card == host, "window {window}: the card's tables differ from the host's");
+            println!("window {window}: {} MiB, built on the card in {:.3} s", (card.len() * 8) >> 20, took.as_secs_f64());
         }
     }
 
