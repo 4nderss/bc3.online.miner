@@ -58,7 +58,7 @@ the file to the commit and the workflow that built it, which is the part a
 checksum cannot establish:
 
 ```
-gh attestation verify bc3-miner-2.1.0-windows-x86_64.zip --repo 4nderss/bc3.online.miner
+gh attestation verify bc3-miner-2.1.1-windows-x86_64.zip --repo 4nderss/bc3.online.miner
 ```
 
 The Windows binaries need the Microsoft Visual C++ Redistributable (x64),
@@ -127,7 +127,7 @@ covers NVIDIA, AMD/Intel and CPU: the miner opens the GPU runtimes with dlopen
 rather than linking them, so it uses whatever the host exposes and falls back
 to CPU when there is nothing.
 
-Image tags follow the releases: `ghcr.io/4nderss/bc3-miner:2.1.0` (and
+Image tags follow the releases: `ghcr.io/4nderss/bc3-miner:2.1.1` (and
 `:2.1`) is this version, and `:latest` - what the command above and
 `docker-compose.yml` use - moves to a release when it is published. **The
 fork needs 2.0.0 or later.** A container keeps running the image it was
@@ -138,7 +138,7 @@ docker pull ghcr.io/4nderss/bc3-miner:latest
 docker rm -f bc3-miner        # then the docker run above again
 ```
 
-With compose: `docker compose pull && docker compose up -d`. Pin `:2.1.0`
+With compose: `docker compose pull && docker compose up -d`. Pin `:2.1.1`
 instead of `:latest` if you would rather choose when to move.
 
 An NVIDIA card spends its first minutes measuring which BC3Hash table window
@@ -194,6 +194,17 @@ Set `BC3_REQUIRE_GPU=1` there. Without it the miner falls back to CPU when no
 device reaches the container, and you go on paying GPU prices for CPU hashrate
 with nothing in the logs but a low number. With it the container exits and the
 host's restart policy or alerting has something to notice.
+
+The log is often all a rented host lets you see, so a minute in and then
+every ten minutes the miner logs each NVIDIA card's power against its limit,
+its clock and what holds the clock back:
+
+```
+[gpu] NVML 0 NVIDIA GeForce RTX 5090: 448 of 450 W (default 575, max 600), SM 2280 of 3090 MHz, PCIe gen 2 x8, held back by power limit
+```
+
+A card held back by a power limit below its default runs where the host set
+it, and hashes accordingly.
 
 `docker-compose.yml` in this repository has both patterns as a working example.
 
