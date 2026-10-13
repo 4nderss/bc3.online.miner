@@ -37,12 +37,17 @@ COPY --from=build /src/target/release/bc3-miner /usr/local/bin/bc3-miner
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# The one file the miner writes: each GPU's tuned BC3Hash table window
-# (src/tuning.rs), in $XDG_CACHE_HOME/bc3-miner. The container's own layer is
-# enough - it outlives a restart, and a new image is a new miner version,
-# which measures again anyway.
-RUN mkdir -p /var/cache/bc3-miner && chown 65534:65534 /var/cache/bc3-miner
-ENV XDG_CACHE_HOME=/var/cache
+# What the miner writes: each GPU's tuned BC3Hash table window (src/tuning.rs),
+# in $XDG_CACHE_HOME/bc3-miner, and the NVIDIA driver its compiled kernels.
+# The driver caches those in $HOME/.nv unless CUDA_CACHE_PATH says otherwise,
+# and nobody's home is /nonexistent: in 2.1.0 every load of the kernel was
+# compiled from scratch, ~15 s on a 64-core EPYC, at every start and at every
+# switch of the window tuning - three times 15 s of idle card per GPU. The
+# container's own layer is enough for both: it outlives a restart, and a new
+# image is a new miner version, which measures and compiles again anyway.
+RUN mkdir -p /var/cache/bc3-miner/cuda && chown -R 65534:65534 /var/cache/bc3-miner
+ENV XDG_CACHE_HOME=/var/cache \
+    CUDA_CACHE_PATH=/var/cache/bc3-miner/cuda
 
 # Mining needs no privileges. Run as nobody.
 USER 65534:65534

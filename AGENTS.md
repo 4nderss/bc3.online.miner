@@ -262,6 +262,13 @@ picks the same job up where the cursor stopped.
   directory (`BC3_TUNING_FILE` overrides it; the Docker image points
   `XDG_CACHE_HOME` at a directory its user may write). A new driver or
   miner version measures again.
+- **The switch is quick only with the driver's JIT cache.** The compile
+  ahead fills the cache, and the switch loads from it in about a second.
+  The cache lives in `$HOME/.nv` unless `CUDA_CACHE_PATH` says otherwise,
+  and the Docker image's user has no home: in 2.1.0 every load compiled the
+  kernel again, ~15 s on a 64-core EPYC, at every start and every switch.
+  The image sets `CUDA_CACHE_PATH`; anything else that runs the miner
+  without a writable home needs it too.
 - **OpenCL cards do not tune** (`MiningBackend::memory` is None there): a
   switch builds the program from source while the card waits, and OpenCL
   caps one buffer at `CL_DEVICE_MAX_MEM_ALLOC_SIZE`. Untried on AMD and
