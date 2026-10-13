@@ -37,7 +37,14 @@ COPY --from=build /src/target/release/bc3-miner /usr/local/bin/bc3-miner
 ENV NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# Mining needs no privileges and writes nothing. Run as nobody.
+# The one file the miner writes: each GPU's tuned BC3Hash table window
+# (src/tuning.rs), in $XDG_CACHE_HOME/bc3-miner. The container's own layer is
+# enough - it outlives a restart, and a new image is a new miner version,
+# which measures again anyway.
+RUN mkdir -p /var/cache/bc3-miner && chown 65534:65534 /var/cache/bc3-miner
+ENV XDG_CACHE_HOME=/var/cache
+
+# Mining needs no privileges. Run as nobody.
 USER 65534:65534
 
 # No shell in between: signals reach the miner directly, so `docker stop`
