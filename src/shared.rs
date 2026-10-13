@@ -1,10 +1,11 @@
 //! State shared between the stratum client and the worker threads.
 
-use crate::consensus::{PowAlgo, Target};
+use crate::consensus::{difficulty_of_bits, PowAlgo, Target};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 #[cfg(test)]
 use std::sync::Arc;
+use std::time::Instant;
 
 /// An active mining job from the pool (all the worker threads need).
 #[derive(Clone)]
@@ -88,9 +89,8 @@ pub struct Stats {
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
     pub blocks: AtomicU64,
-    /// Highest share difficulty reached (f64 via `to_bits`) - "best share".
-    pub best_share_bits: AtomicU64,
-    /// Latest network nBits (for the ETA calculation).
+    /// nBits of the latest job: the block the miner is working on, for its
+    /// difficulty and the ETA.
     pub network_bits: AtomicU32,
     /// Height of the block we are mining on right now (from the job's
     /// coinbase, BIP34). 0 = unknown (no job yet).
@@ -105,6 +105,29 @@ pub struct Stats {
     /// Latest round trip of a request to the pool, in microseconds. 0 until
     /// the pool has answered something - see `Shared::record_pool_rtt`.
     pub pool_rtt_us: AtomicU64,
+}
+
+/// The highest difficulty a share of the current PoW reached ("best share"),
+/// and what it would have needed to be a block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BestShare {
+    pub difficulty: f64,
+    /// The block difficulty of the job the share was found on, from that
+    /// job's nBits. Recorded with the share, not looked up when it is shown:
+    /// with ASERT (since the BC3Hash fork) the difficulty moves every block,
+    /// and the current block's is not what an hour-old share was up against.
+    pub network_difficulty: f64,
+    pub found: Instant,
+}
+
+/// The PoW of the latest job and the best share found with it, under one
+/// lock: a change of PoW starts the best share over, and a share of the old
+/// PoW still draining from a launch must not land between the check and the
+/// update.
+#[derive(Default)]
+struct PowState {
+    algo: Option<PowAlgo>,
+    best: Option<BestShare>,
 }
 
 /// Holds one live GPU worker in the count for as long as the worker can hash.
@@ -152,9 +175,9 @@ pub struct Shared {
     pub submit_tx: std::sync::mpsc::SyncSender<FoundShare>,
     /// Which devices were started for what; fixed before the workers start.
     pub plan: MiningPlan,
-    /// The PoW of the latest job, so a change of PoW is announced once - not
-    /// once per job.
-    last_algo: Mutex<Option<PowAlgo>>,
+    /// The PoW of the latest job - so a change of PoW is announced once, not
+    /// once per job - and the best share found with it.
+    pow: Mutex<PowState>,
     /// GPU workers able to mine each PoW (by `PowAlgo::index`): raised when a
     /// worker's backend has a kernel for it, lowered when that kernel fails
     /// its self-test or the worker stops. The stand-in CPU threads go by it.
@@ -358,7 +381,7 @@ impl Shared {
             stats: Stats::default(),
             submit_tx,
             plan,
-            last_algo: Mutex::new(None),
+            pow: Mutex::new(PowState::default()),
             gpu_capable: Default::default(),
             gpus_opened: AtomicU32::new(0),
             bc3_window: AtomicU32::new(DEFAULT_BC3_WINDOW),
@@ -448,36 +471,32 @@ impl Shared {
         self.job_cv.notify_all();
     }
 
-    /// Record a submitted share: updates the best share (and the block
-    /// counter when the share also met the block's target) - for a share of
-    /// the current PoW only. The difficulties of two PoWs do not compare: a
-    /// SHA3-256t best share kept past the fork read as hundreds of percent
-    /// of a BC3Hash block, and a launch still draining at the switch would
-    /// have put one back.
-    pub fn record_share(&self, algo: PowAlgo, difficulty: f64, is_block: bool) {
-        if self.current_algo().is_some_and(|current| current != algo) {
+    /// Record a submitted share, found on a job with nBits `bits`: updates
+    /// the best share (and the block counter when the share also met the
+    /// block's target) - for a share of the current PoW only. The
+    /// difficulties of two PoWs do not compare: a SHA3-256t best share kept
+    /// past the fork read as hundreds of percent of a BC3Hash block, and a
+    /// launch still draining at the switch would have put one back.
+    pub fn record_share(&self, algo: PowAlgo, difficulty: f64, bits: u32, is_block: bool) {
+        let mut pow = self.pow.lock().unwrap();
+        if pow.algo.is_some_and(|current| current != algo) {
             return;
         }
         if is_block {
             self.stats.blocks.fetch_add(1, Ordering::Relaxed);
         }
-        let bits = difficulty.to_bits();
-        let mut cur = self.stats.best_share_bits.load(Ordering::Relaxed);
-        while difficulty > f64::from_bits(cur) {
-            match self.stats.best_share_bits.compare_exchange_weak(
-                cur,
-                bits,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
+        if difficulty > pow.best.map_or(0.0, |b| b.difficulty) {
+            pow.best = Some(BestShare {
+                difficulty,
+                network_difficulty: difficulty_of_bits(bits),
+                found: Instant::now(),
+            });
         }
     }
 
-    pub fn best_share(&self) -> f64 {
-        f64::from_bits(self.stats.best_share_bits.load(Ordering::Relaxed))
+    /// None until a share of the current PoW has been found.
+    pub fn best_share(&self) -> Option<BestShare> {
+        self.pow.lock().unwrap().best
     }
 
     /// The pool answered a request `rtt` after it was sent. Only the latest
@@ -549,8 +568,17 @@ impl Shared {
             // jobs within the same block too (new transactions, new ntime).
             let prev = self.stats.job_height.swap(h, Ordering::Relaxed);
             if prev != h {
-                crate::ipc::emit(&crate::ipc::Event::NewBlockHeight { height: h });
-                crate::human!("[pool] now working on block #{h}");
+                // With its difficulty: since the BC3Hash fork (ASERT) a new
+                // figure every block.
+                let difficulty = difficulty_of_bits(job.bits);
+                crate::ipc::emit(&crate::ipc::Event::NewBlockHeight {
+                    height: h,
+                    network_difficulty: difficulty,
+                });
+                crate::human!(
+                    "[pool] now working on block #{h}, difficulty {}",
+                    crate::stats::format_difficulty(difficulty)
+                );
             }
         }
         self.note_pow(job.algo);
@@ -571,15 +599,15 @@ impl Shared {
     /// per change, not once per worker.
     fn note_pow(&self, algo: PowAlgo) {
         {
-            let mut last = self.last_algo.lock().unwrap();
-            if *last == Some(algo) {
+            let mut pow = self.pow.lock().unwrap();
+            if pow.algo == Some(algo) {
                 return;
             }
             // A new PoW starts the best share over - see `record_share`.
-            if last.is_some() {
-                self.stats.best_share_bits.store(0, Ordering::Relaxed);
+            if pow.algo.is_some() {
+                pow.best = None;
             }
-            *last = Some(algo);
+            pow.algo = Some(algo);
         }
         self.announce(algo);
     }
@@ -607,7 +635,7 @@ impl Shared {
 
     /// The PoW of the latest job; None before the first one.
     pub fn current_algo(&self) -> Option<PowAlgo> {
-        *self.last_algo.lock().unwrap()
+        self.pow.lock().unwrap().algo
     }
 
     /// Like `wait_for_job`, but only for a job published after generation
@@ -847,16 +875,16 @@ mod tests {
     #[test]
     fn publish_announces_each_change_of_pow_once() {
         let s = shared();
-        assert_eq!(*s.last_algo.lock().unwrap(), None);
+        assert_eq!(s.current_algo(), None);
         s.publish_job(a_job());
-        assert_eq!(*s.last_algo.lock().unwrap(), Some(PowAlgo::Sha3t));
+        assert_eq!(s.current_algo(), Some(PowAlgo::Sha3t));
         let mut fork = a_job();
         fork.algo = PowAlgo::Bc3Hash;
         s.publish_job(fork.clone());
         s.publish_job(fork);
-        assert_eq!(*s.last_algo.lock().unwrap(), Some(PowAlgo::Bc3Hash));
+        assert_eq!(s.current_algo(), Some(PowAlgo::Bc3Hash));
         s.publish_job(a_job());
-        assert_eq!(*s.last_algo.lock().unwrap(), Some(PowAlgo::Sha3t));
+        assert_eq!(s.current_algo(), Some(PowAlgo::Sha3t));
     }
 
     /// A worker that sat a job out wakes for the next job, not before.
@@ -890,39 +918,82 @@ mod tests {
         assert_eq!(s.intensity(), 100);
     }
 
+    /// nBits of difficulty 1 and of difficulty 16 (diff1 >> 4).
+    const DIFF_1: u32 = 0x1d00_ffff;
+    const DIFF_16: u32 = 0x1c0f_fff0;
+
+    fn best(s: &Shared) -> Option<f64> {
+        s.best_share().map(|b| b.difficulty)
+    }
+
     #[test]
     fn best_share_keeps_the_maximum_and_counts_blocks() {
         let s = shared();
-        assert_eq!(s.best_share(), 0.0);
-        s.record_share(PowAlgo::Sha3t, 12.5, false);
-        s.record_share(PowAlgo::Sha3t, 3.0, false); // lower - must not overwrite
-        assert_eq!(s.best_share(), 12.5);
-        s.record_share(PowAlgo::Sha3t, 900.0, true); // a block is a share as well
-        assert_eq!(s.best_share(), 900.0);
+        assert_eq!(best(&s), None);
+        s.record_share(PowAlgo::Sha3t, 12.5, DIFF_1, false);
+        s.record_share(PowAlgo::Sha3t, 3.0, DIFF_1, false); // lower - must not overwrite
+        assert_eq!(best(&s), Some(12.5));
+        s.record_share(PowAlgo::Sha3t, 900.0, DIFF_1, true); // a block is a share as well
+        assert_eq!(best(&s), Some(900.0));
         assert_eq!(s.stats.blocks.load(Ordering::Relaxed), 1);
     }
 
-    /// The best share is per PoW: the fork starts it over, and a SHA3-256t
-    /// share from a launch still draining after the switch does not put the
-    /// old figure back - nor count as a block.
+    /// With ASERT every block has a difficulty of its own. The best share
+    /// keeps the one of the job it was found on, and when it was found -
+    /// the latest job's would turn an old share's percentage into fiction.
+    #[test]
+    fn the_best_share_keeps_the_difficulty_of_its_own_block() {
+        let s = shared();
+        s.publish_job(a_job()); // difficulty 1
+        let before = Instant::now();
+        s.record_share(PowAlgo::Sha3t, 0.5, DIFF_1, false);
+        let first = s.best_share().expect("recorded");
+        assert_eq!((first.difficulty, first.network_difficulty), (0.5, 1.0));
+        assert!(first.found >= before && first.found <= Instant::now());
+
+        // The next block is harder. The block being mined moves on to its
+        // difficulty; a lower share found there changes nothing, the time
+        // included.
+        let mut next = a_job();
+        next.height = Some(59_343);
+        next.bits = DIFF_16;
+        s.publish_job(next);
+        assert_eq!(s.stats.network_bits.load(Ordering::Relaxed), DIFF_16);
+        s.record_share(PowAlgo::Sha3t, 0.25, DIFF_16, false);
+        assert_eq!(s.best_share(), Some(first), "a lower share replaced the best one");
+
+        // A higher one takes over, with its own block's difficulty.
+        s.record_share(PowAlgo::Sha3t, 3.0, DIFF_16, false);
+        let second = s.best_share().expect("recorded");
+        assert_eq!((second.difficulty, second.network_difficulty), (3.0, 16.0));
+        assert!(second.found >= first.found);
+    }
+
+    /// The best share is per PoW: the fork starts it over, with the
+    /// difficulty it needed and when it was found, and a SHA3-256t share
+    /// from a launch still draining after the switch does not put the old
+    /// figure back - nor count as a block.
     #[test]
     fn the_best_share_starts_over_with_a_new_pow() {
         let s = shared();
-        s.publish_job(a_job());
-        s.record_share(PowAlgo::Sha3t, 5_000.0, false);
-        assert_eq!(s.best_share(), 5_000.0);
+        let mut sha3t = a_job();
+        sha3t.bits = DIFF_16;
+        s.publish_job(sha3t);
+        s.record_share(PowAlgo::Sha3t, 5.0, DIFF_16, false);
+        assert_eq!(best(&s), Some(5.0));
         let mut fork = a_job();
         fork.algo = PowAlgo::Bc3Hash;
         s.publish_job(fork.clone());
-        assert_eq!(s.best_share(), 0.0, "the SHA3-256t best share outlived the fork");
-        s.record_share(PowAlgo::Sha3t, 9_000.0, true);
-        assert_eq!(s.best_share(), 0.0, "a late SHA3-256t share counted");
+        assert_eq!(s.best_share(), None, "the SHA3-256t best share outlived the fork");
+        s.record_share(PowAlgo::Sha3t, 9_000.0, DIFF_16, true);
+        assert_eq!(s.best_share(), None, "a late SHA3-256t share counted");
         assert_eq!(s.stats.blocks.load(Ordering::Relaxed), 0);
-        s.record_share(PowAlgo::Bc3Hash, 0.002, false);
-        assert_eq!(s.best_share(), 0.002);
+        s.record_share(PowAlgo::Bc3Hash, 0.002, DIFF_1, false);
+        let after = s.best_share().expect("recorded");
+        assert_eq!((after.difficulty, after.network_difficulty), (0.002, 1.0));
         // A new job of the same PoW keeps it.
         s.publish_job(fork);
-        assert_eq!(s.best_share(), 0.002);
+        assert_eq!(s.best_share(), Some(after));
     }
 
     #[test]

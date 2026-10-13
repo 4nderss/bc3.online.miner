@@ -73,6 +73,21 @@ function fmtDiff(d) {
   for (const [u, f] of units) if (d >= f) return num2.format(d / f) + u;
   return d >= 1 ? num2.format(d) : sig3.format(d);
 }
+// Two decimals, or two significant digits below 1 %, where a BC3Hash best
+// share sits for its first hours. Intl, not toPrecision: that one wrote
+// "0.47" with a point whatever the locale.
+const pct2 = new Intl.NumberFormat(undefined, { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const pctSig2 = new Intl.NumberFormat(undefined, { style: "percent", maximumSignificantDigits: 2 });
+function fmtPct(ratio) {
+  return ratio >= 0.01 ? pct2.format(ratio) : pctSig2.format(ratio);
+}
+// "12m ago", "2h 5m ago": fmtDuration's units, to the minute - a line that
+// ticked every second would pull the eye for nothing.
+function fmtAgo(s) {
+  if (!(s >= 60)) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return fmtDuration(s) + " ago";
+}
 function setStat(id, value) {
   const e = el(id);
   if (!e || e.textContent === value) return;
@@ -81,6 +96,58 @@ function setStat(id, value) {
   void e.offsetWidth;
   e.classList.add("bump");
 }
+// A sub line with the figure it is about picked out: "difficulty <b>11,28</b>".
+function setSub(id, before, figure = "", after = "") {
+  const e = el(id);
+  if (e.textContent === before + figure + after) return;
+  if (!figure) {
+    e.textContent = before + after;
+    return;
+  }
+  const b = document.createElement("b");
+  b.textContent = figure;
+  e.replaceChildren(before, b, after);
+}
+
+// ---------- Mining block ----------
+// The block the pool is working on - proof that we are in sync - and the
+// difficulty a hash has to reach to be it, from the job's own nBits: with
+// ASERT, since the BC3Hash fork, that is a new figure every block.
+function renderJob(height, difficulty) {
+  if (height > 0) setStat("job-height", "#" + numInt.format(height));
+  if (difficulty > 0) setSub("job-height-sub", "difficulty ", fmtDiff(difficulty));
+  else if (height > 0) setSub("job-height-sub", "in sync with the pool");
+  if (height > 0 || difficulty > 0) el("job-height-card").classList.add("live");
+}
+
+// ---------- Best share ----------
+// Against the difficulty of the block it was found on, which the miner
+// records with it: the difficulty moves every block, and the current one is
+// not what an hour-old share was up against. When the PoW changes the miner
+// starts the best share over, and the whole card goes back to the dash.
+let bestFoundAt = null; // performance.now() when it was found; null = none yet
+function renderBestShare(ev) {
+  const best = ev.best_share, need = ev.best_share_network_difficulty;
+  setStat("best-share", best > 0 ? fmtDiff(best) : "—");
+  if (best > 0 && need > 0) {
+    setSub("best-share-sub", "of ", fmtDiff(need), " needed · " + fmtPct(best / need));
+  } else {
+    setSub("best-share-sub", "highest difficulty hit");
+  }
+  bestFoundAt = best > 0 && ev.best_share_age_secs != null
+    ? performance.now() - ev.best_share_age_secs * 1000
+    : null;
+  renderBestAge();
+}
+// Between stats too, and after the miner stops: the share only gets older.
+function renderBestAge() {
+  const text = bestFoundAt === null
+    ? ""
+    : "found " + fmtAgo((performance.now() - bestFoundAt) / 1000);
+  const e = el("best-share-age");
+  if (e.textContent !== text) e.textContent = text;
+}
+setInterval(renderBestAge, 1000);
 
 // ---------- Log ----------
 function log(text, cls) {
@@ -380,25 +447,9 @@ listen("miner-event", ({ payload: ev }) => {
         ? `accepted / rejected · pool ${numInt.format(Math.round(ev.pool_rtt_ms))} ms`
         : "accepted / rejected");
       setStat("eta", ev.eta_secs ? fmtDuration(ev.eta_secs) : "—");
-      setStat("best-share", ev.best_share > 0 ? fmtDiff(ev.best_share) : "—");
+      renderBestShare(ev);
       setStat("blocks", numInt.format(ev.blocks || 0));
-      // How close to a block the best share was (network difficulty = 100%).
-      // The miner starts the best share over when the PoW changes; so does
-      // this line, or the last SHA3-256t figure stayed under the dash.
-      if (ev.best_share > 0 && ev.network_difficulty > 0) {
-        const pct = (ev.best_share / ev.network_difficulty) * 100;
-        el("best-share-sub").textContent =
-          (pct >= 1 ? num2.format(pct) : pct.toPrecision(2)) + "% of a block";
-      } else if (!(ev.best_share > 0)) {
-        el("best-share-sub").textContent = "highest difficulty hit";
-      }
-      el("netdiff").textContent = "network difficulty " + fmtDiff(ev.network_difficulty);
-      // The height the pool is working on - proof that we are in sync.
-      if (ev.job_height > 0) {
-        setStat("job-height", "#" + numInt.format(ev.job_height));
-        el("job-height-sub").textContent = "in sync with the pool";
-        el("job-height-card").classList.add("live");
-      }
+      renderJob(ev.job_height, ev.network_difficulty);
       renderTemps(ev);
       if (sparkSkip > 0) {
         sparkSkip--;
@@ -412,10 +463,9 @@ listen("miner-event", ({ payload: ev }) => {
       noteShare(ev.accepted);
       break;
     case "newblockheight": {
-      setStat("job-height", "#" + numInt.format(ev.height));
-      el("job-height-sub").textContent = "in sync with the pool";
-      el("job-height-card").classList.add("live");
-      log("pool started on block #" + numInt.format(ev.height), "l-accent");
+      renderJob(ev.height, ev.network_difficulty);
+      const diff = ev.network_difficulty > 0 ? ", difficulty " + fmtDiff(ev.network_difficulty) : "";
+      log("pool started on block #" + numInt.format(ev.height) + diff, "l-accent");
       break;
     }
     case "block":

@@ -46,13 +46,22 @@ pub enum Event {
         hashrate_cpu: f64,
         accepted: u64,
         rejected: u64,
-        /// Highest share difficulty reached during this run.
+        /// Highest share difficulty reached during this run, with the
+        /// current PoW. 0 before the first share.
         best_share: f64,
+        /// The block difficulty of the job the best share was found on: what
+        /// it would have needed to be a block. Not `network_difficulty` -
+        /// with ASERT that moves every block. 0 before the first share.
+        best_share_network_difficulty: f64,
+        /// Seconds since the best share was found; `null` before one.
+        best_share_age_secs: Option<f64>,
         /// Number of blocks found during this run.
         blocks: u64,
         /// Expected time to a block in seconds; `null` before there is a
         /// hashrate.
         eta_secs: Option<f64>,
+        /// Difficulty of the block being mined, from the latest job's nBits.
+        /// 0 before the first job.
         network_difficulty: f64,
         /// The block height the pool's latest job applies to - shows that the
         /// client is in sync with the pool and mining on the right block.
@@ -70,8 +79,10 @@ pub enum Event {
     Share { accepted: bool },
     /// We found a block (hash in display order).
     Block { hash: String },
-    /// The pool moved on to a new block (height from the job's coinbase).
-    NewBlockHeight { height: u32 },
+    /// The pool moved on to a new block (height from the job's coinbase), and
+    /// the difficulty that block needs (from the job's nBits) - so the two
+    /// never show as a mismatched pair until the next stats.
+    NewBlockHeight { height: u32, network_difficulty: f64 },
     /// Answer to `--probe`: available hardware (the GUI asks before start).
     Probe {
         gpus: Vec<String>,
@@ -131,10 +142,12 @@ mod tests {
             hashrate_cpu: 0.0,
             accepted: 3,
             rejected: 0,
-            best_share: 1234.5,
+            best_share: 1.46,
+            best_share_network_difficulty: 11.28,
+            best_share_age_secs: Some(720.0),
             blocks: 0,
             eta_secs: None,
-            network_difficulty: 42.0,
+            network_difficulty: 11.31,
             job_height: 59_342,
             pool_rtt_ms: Some(34.5),
             telemetry: crate::telemetry::Reading {
@@ -146,9 +159,23 @@ mod tests {
         assert!(s.starts_with(r#"{"type":"stats","hashrate":1.5"#));
         assert!(s.contains(r#""eta_secs":null"#));
         assert!(s.contains(r#""pool_rtt_ms":34.5"#));
+        assert!(s.contains(
+            r#""best_share":1.46,"best_share_network_difficulty":11.28,"best_share_age_secs":720.0"#
+        ));
+        assert!(s.contains(r#""network_difficulty":11.31"#));
         // The telemetry is flattened into the same object.
         assert!(s.contains(r#""gpu_temp_c":64"#));
         assert!(s.contains(r#""cpu_temp_c":null"#));
+    }
+
+    #[test]
+    fn a_new_block_comes_with_its_difficulty() {
+        let s = serde_json::to_string(&Event::NewBlockHeight {
+            height: 64_368,
+            network_difficulty: 11.28,
+        })
+        .unwrap();
+        assert_eq!(s, r#"{"type":"newblockheight","height":64368,"network_difficulty":11.28}"#);
     }
 
     #[test]
