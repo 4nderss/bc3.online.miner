@@ -40,6 +40,7 @@ let hw = "gpu";       // hardware: gpu | cpu | dual
 const spark = [];
 let sparkAlgo = null; // the PoW the sparkline's samples are of
 let sparkSkip = 0;    // samples to leave out after a change of PoW
+const rates = [];     // the last minute of samples, for the rate shown
 
 // ---------- Formatting ----------
 const num1 = new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
@@ -188,6 +189,29 @@ function flushShares() {
   shareFlush = a || r ? setTimeout(flushShares, 1000) : null;
   if (a) log(`${numInt.format(a)} more share${a === 1 ? "" : "s"} accepted`, "l-ok");
   if (r) log(`${numInt.format(r)} more share${r === 1 ? "" : "s"} rejected`, "l-bad");
+}
+
+// ---------- Hashrate ----------
+// The rate shown, and its GPU/CPU split, are the mean of the last minute of
+// samples; the sparkline keeps every sample. Hashes are counted as a kernel
+// launch completes, so a sample holds whole launches, and one more or less
+// moves a 3 s sample by 7 % with BC3Hash's 0.2 s launches on an RTX 4090,
+// by 10 % with the 0.3 s of smaller cards. 1.83 MH/s here against ~1.9 in
+// the CLI (5 s samples) read as a slower GUI, with both computing the rate
+// the same way. Over a minute, one launch is 0.5 % at most.
+const RATE_WINDOW_MS = 60_000;
+function meanRate(ev) {
+  const now = performance.now();
+  // Zeros before the first hash are the miner starting up, not a rate: the
+  // minute starts at the first hash.
+  if (rates.length || ev.hashrate > 0) {
+    rates.push({ t: now, total: ev.hashrate, gpu: ev.hashrate_gpu, cpu: ev.hashrate_cpu });
+  }
+  while (rates.length && now - rates[0].t >= RATE_WINDOW_MS) rates.shift();
+  if (!rates.length) return { total: ev.hashrate, gpu: ev.hashrate_gpu, cpu: ev.hashrate_cpu };
+  // The plain mean is the time-weighted one: the samples are evenly spaced.
+  const mean = (k) => rates.reduce((sum, r) => sum + r[k], 0) / rates.length;
+  return { total: mean("total"), gpu: mean("gpu"), cpu: mean("cpu") };
 }
 
 // ---------- Hashrate-sparkline ----------
@@ -371,6 +395,7 @@ async function toggle() {
   spark.length = 0;
   sparkAlgo = null;
   sparkSkip = 0;
+  rates.length = 0;
   drawSpark();
   try {
     await invoke("start_mining", {
@@ -418,6 +443,7 @@ listen("miner-event", ({ payload: ev }) => {
       // The first sample after the switch still counts hashes of both.
       if (sparkAlgo !== null && sparkAlgo !== ev.algo) {
         spark.length = 0;
+        rates.length = 0;
         sparkSkip = 1;
         drawSpark();
       }
@@ -430,14 +456,19 @@ listen("miner-event", ({ payload: ev }) => {
       else if (ev.state === "error") setStatus("error", "Error");
       log(ev.message, ev.state === "error" ? "l-bad" : null);
       break;
-    case "stats":
-      setStat("hashrate", fmtHashrate(ev.hashrate));
+    case "stats": {
+      // The first sample after a change of PoW still counts hashes of both:
+      // it goes into neither the sparkline nor the rate shown.
+      const mixed = sparkSkip > 0;
+      if (mixed) sparkSkip--;
+      const rate = mixed ? null : meanRate(ev);
+      setStat("hashrate", rate ? fmtHashrate(rate.total) : "—");
       // Show the split only when both backends actually contribute - and
       // clear it when they stop: in auto the CPU stands in for the GPU until
       // its kernel is ready, and a split left over from those first seconds
       // kept showing a CPU rate that no longer added up to the total.
-      el("hashrate-sub").textContent = ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0
-        ? `GPU ${fmtHashrate(ev.hashrate_gpu)} · CPU ${fmtHashrate(ev.hashrate_cpu)}`
+      el("hashrate-sub").textContent = rate && ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0
+        ? `GPU ${fmtHashrate(rate.gpu)} · CPU ${fmtHashrate(rate.cpu)}`
         : "";
       setStat("accepted", numInt.format(ev.accepted));
       setStat("rejected", numInt.format(ev.rejected));
@@ -446,19 +477,22 @@ listen("miner-event", ({ payload: ev }) => {
       setStat("shares-sub", ev.pool_rtt_ms != null
         ? `accepted / rejected · pool ${numInt.format(Math.round(ev.pool_rtt_ms))} ms`
         : "accepted / rejected");
-      setStat("eta", ev.eta_secs ? fmtDuration(ev.eta_secs) : "—");
+      // A block takes difficulty x 2^32 hashes on average - at the rate
+      // shown, not the last sample's, or the time to block jumped with it.
+      setStat("eta", rate && rate.total > 0 && ev.network_difficulty > 0
+        ? fmtDuration(ev.network_difficulty * 2 ** 32 / rate.total)
+        : "—");
       renderBestShare(ev);
       setStat("blocks", numInt.format(ev.blocks || 0));
       renderJob(ev.job_height, ev.network_difficulty);
       renderTemps(ev);
-      if (sparkSkip > 0) {
-        sparkSkip--;
-      } else {
+      if (!mixed) {
         spark.push(ev.hashrate);
         while (spark.length > 60) spark.shift();
         drawSpark();
       }
       break;
+    }
     case "share":
       noteShare(ev.accepted);
       break;
@@ -481,7 +515,9 @@ listen("miner-log", ({ payload }) => log(payload.text));
 listen("miner-stopped", ({ payload: code }) => {
   setRunning(false);
   setStatus(null, "Idle");
+  rates.length = 0;
   setStat("hashrate", "—");
+  el("hashrate-sub").textContent = "";
   setStat("job-height", "—");
   el("job-height-sub").textContent = "waiting for a job";
   el("job-height-card").classList.remove("live");
