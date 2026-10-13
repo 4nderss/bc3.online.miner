@@ -58,7 +58,7 @@ the file to the commit and the workflow that built it, which is the part a
 checksum cannot establish:
 
 ```
-gh attestation verify bc3-miner-2.1.1-windows-x86_64.zip --repo 4nderss/bc3.online.miner
+gh attestation verify bc3-miner-2.2.0-windows-x86_64.zip --repo 4nderss/bc3.online.miner
 ```
 
 The Windows binaries need the Microsoft Visual C++ Redistributable (x64),
@@ -127,8 +127,8 @@ covers NVIDIA, AMD/Intel and CPU: the miner opens the GPU runtimes with dlopen
 rather than linking them, so it uses whatever the host exposes and falls back
 to CPU when there is nothing.
 
-Image tags follow the releases: `ghcr.io/4nderss/bc3-miner:2.1.1` (and
-`:2.1`) is this version, and `:latest` - what the command above and
+Image tags follow the releases: `ghcr.io/4nderss/bc3-miner:2.2.0` (and
+`:2.2`) is this version, and `:latest` - what the command above and
 `docker-compose.yml` use - moves to a release when it is published. **The
 fork needs 2.0.0 or later.** A container keeps running the image it was
 created from, so pull the new one and recreate the container:
@@ -138,7 +138,7 @@ docker pull ghcr.io/4nderss/bc3-miner:latest
 docker rm -f bc3-miner        # then the docker run above again
 ```
 
-With compose: `docker compose pull && docker compose up -d`. Pin `:2.1.1`
+With compose: `docker compose pull && docker compose up -d`. Pin `:2.2.0`
 instead of `:latest` if you would rather choose when to move.
 
 An NVIDIA card spends its first minutes measuring which BC3Hash table window
