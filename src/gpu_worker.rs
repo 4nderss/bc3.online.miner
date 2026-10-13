@@ -25,6 +25,17 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The tables built ahead of a window switch (backend::bc3). A build without a
+/// GPU backend has no GPU to switch, and no tuning ever begins there.
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+use crate::backend::bc3::{prebuild as prebuild_tables, release as release_tables};
+#[cfg(not(any(feature = "cuda", feature = "opencl")))]
+fn prebuild_tables(_window: u32) -> Receiver<Result<(), String>> {
+    std::sync::mpsc::channel().1
+}
+#[cfg(not(any(feature = "cuda", feature = "opencl")))]
+fn release_tables(_window: u32) {}
+
 /// Autotune limits for the batch size (nonces per kernel launch) and the time
 /// a launch aims for. BC3Hash is about 110 kH/s on an RTX 3050 Ti. Launches
 /// start at the floor: 256 nonces are 2 ms there, and still far from the
@@ -159,7 +170,7 @@ impl Tune {
         self.tuner = Some(tuner);
         self.announce(recalled.is_none());
         if let Action::Build(w) = first {
-            self.built = Some(crate::backend::bc3::prebuild(w));
+            self.built = Some(prebuild_tables(w));
             self.held = Some(w);
             self.jit = backend.compile_bc3hash_ahead(w);
         }
@@ -257,7 +268,7 @@ impl Tune {
 
     fn release(&mut self) {
         if let Some(w) = self.held.take() {
-            crate::backend::bc3::release(w);
+            release_tables(w);
         }
         self.built = None;
         self.tables = None;
