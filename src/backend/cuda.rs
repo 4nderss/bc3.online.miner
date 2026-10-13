@@ -59,6 +59,11 @@ const BC3_BLOCK_DIM: u32 = 64;
 const BUILD_BLOCK_DIM: u32 = 64;
 const BUILD_BLOCKS_PER_SM: u32 = 8;
 
+/// Card memory a window's tables must leave free: the launch buffers, and
+/// the hash kernel's local memory before its first launch has taken it. The
+/// tuning keeps a GiB free (`tuning::largest_fitting`); this is the floor.
+const BUILD_SPARE: u64 = 256 << 20;
+
 /// The oldest driver that can load the kernel, as `cuDriverGetVersion` reports
 /// it (1000 x major + 10 x minor of the CUDA version it supports): the PTX
 /// declares ISA 8.0 (`MAX_PTX_ISA` in build.rs), which came with CUDA 12.0 -
@@ -375,6 +380,23 @@ impl CudaBackend {
         let power = bc3hash::gpu_power_tables()?;
         let curve_u64: usize = rows.iter().map(|r| r.places as usize * 8).sum();
         let total = power.len() + 4 * curve_u64;
+        // The card's own memory, not what the driver can lend: on Windows a
+        // CUDA allocation the card has no room for falls back to system memory
+        // (NVIDIA's "CUDA - Sysmem Fallback Policy", on by default since R536),
+        // and window 24's 28 GiB on an RTX 4090 (24 GB) did not fail - the
+        // card sat for minutes over tables half in host memory instead. The
+        // old tables went before this; the synchronize gives their memory back.
+        self.stream.synchronize().map_err(|e| format!("synchronize: {e}"))?;
+        let need = (total * 8) as u64;
+        if let Ok((free, _)) = self.ctx.mem_get_info() {
+            if need + BUILD_SPARE > free as u64 {
+                return Err(format!(
+                    "window {window} needs {} MiB of tables, and the card has {} MiB free",
+                    need >> 20,
+                    free as u64 >> 20
+                ));
+            }
+        }
         // Zeroed: the places past the last point of a uniform window's last
         // row hold zeros, as the host's tables have them.
         let mut tables = self
