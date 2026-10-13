@@ -19,6 +19,28 @@ pub struct Telemetry {
     nvml: Option<Nvml>,
 }
 
+/// One NVIDIA card's power and clocks, and what NVML says holds its clock
+/// back: on a rented rig the log is all the owner sees, and a card that hashes
+/// less than it should is either at a power limit the host set or not. Any
+/// field may be missing; NVML answers what the driver lets it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpuReport {
+    /// NVML's index, which is PCI bus order - not necessarily CUDA's.
+    pub index: u32,
+    pub name: String,
+    pub power_w: Option<f64>,
+    pub limit_w: Option<f64>,
+    pub default_limit_w: Option<f64>,
+    pub max_limit_w: Option<f64>,
+    pub sm_mhz: Option<u32>,
+    pub max_sm_mhz: Option<u32>,
+    /// PCIe generation and width of the link now.
+    pub pcie: Option<(u32, u32)>,
+    /// NVML's clock throttle reasons, in words; empty when nothing holds the
+    /// clock back.
+    pub held_back_by: Vec<&'static str>,
+}
+
 /// One reading; any field may be missing depending on platform/hardware.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct Reading {
@@ -65,6 +87,46 @@ impl Telemetry {
             return nvml.sys_driver_version().ok();
         }
         None
+    }
+
+    /// Every NVIDIA card NVML sees; empty without NVML.
+    pub fn gpu_reports(&self) -> Vec<GpuReport> {
+        #[cfg(feature = "cuda")]
+        if let Some(nvml) = &self.nvml {
+            use nvml_wrapper::bitmasks::device::ThrottleReasons as R;
+            use nvml_wrapper::enum_wrappers::device::Clock;
+            const REASONS: [(R, &str); 8] = [
+                (R::SW_POWER_CAP, "power limit"),
+                (R::HW_POWER_BRAKE_SLOWDOWN, "power brake"),
+                (R::SW_THERMAL_SLOWDOWN, "temperature"),
+                (R::HW_THERMAL_SLOWDOWN, "temperature (hardware)"),
+                (R::HW_SLOWDOWN, "hardware slowdown"),
+                (R::APPLICATIONS_CLOCKS_SETTING, "application clocks"),
+                (R::SYNC_BOOST, "sync boost"),
+                (R::GPU_IDLE, "idle"),
+            ];
+            let watts = |mw: u32| f64::from(mw) / 1000.0;
+            let count = nvml.device_count().unwrap_or(0);
+            return (0..count)
+                .filter_map(|index| {
+                    let d = nvml.device_by_index(index).ok()?;
+                    let reasons = d.current_throttle_reasons().unwrap_or(R::empty());
+                    Some(GpuReport {
+                        index,
+                        name: d.name().unwrap_or_default(),
+                        power_w: d.power_usage().ok().map(watts),
+                        limit_w: d.enforced_power_limit().ok().map(watts),
+                        default_limit_w: d.power_management_limit_default().ok().map(watts),
+                        max_limit_w: d.power_management_limit_constraints().ok().map(|c| watts(c.max_limit)),
+                        sm_mhz: d.clock_info(Clock::SM).ok(),
+                        max_sm_mhz: d.max_clock_info(Clock::SM).ok(),
+                        pcie: d.current_pcie_link_gen().ok().zip(d.current_pcie_link_width().ok()),
+                        held_back_by: REASONS.iter().filter(|(r, _)| reasons.contains(*r)).map(|(_, s)| *s).collect(),
+                    })
+                })
+                .collect();
+        }
+        Vec::new()
     }
 
     /// Read current values. Errors are swallowed - telemetry must never
@@ -252,6 +314,21 @@ mod tests {
         let r = t.read(0);
         // No requirements on the values - only that the call survives.
         let _ = (r.gpu_temp_c, r.cpu_temp_c, r.gpu_power_w, r.gpu_fan_pct);
+        // Nor the report, which is simply empty there.
+        let _ = t.gpu_reports();
+    }
+
+    /// What the log says about each card, from the real driver.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs an NVIDIA GPU (run inside a --gpus all container), with --nocapture"]
+    fn nvml_reports_every_card() {
+        let reports = Telemetry::open().gpu_reports();
+        assert!(!reports.is_empty(), "NVML found no card");
+        for r in &reports {
+            println!("[gpu] {}", crate::stats::format_gpu_report(r));
+            assert!(r.limit_w.is_some() && r.max_sm_mhz.is_some(), "{r:?}");
+        }
     }
 
     /// A machine that reports nothing must be probed exactly once.

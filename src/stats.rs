@@ -6,14 +6,28 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// When each NVIDIA card's power and clocks are logged (`format_gpu_report`):
+/// a minute in, when the cards mine and have warmed up, and then every ten
+/// minutes - often enough to see a host change its limits, rarely enough
+/// that six cards' lines do not bury the rest.
+const GPU_REPORT_FIRST: Duration = Duration::from_secs(60);
+const GPU_REPORT_EVERY: Duration = Duration::from_secs(600);
+
 pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
     let mut last_hashes = 0u64;
     let mut last_gpu = 0u64;
     let mut last_cpu = 0u64;
     let mut last_t = Instant::now();
     let telemetry = crate::telemetry::Telemetry::open();
+    let mut next_gpu_report = Instant::now() + GPU_REPORT_FIRST;
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs));
+        if Instant::now() >= next_gpu_report {
+            next_gpu_report += GPU_REPORT_EVERY;
+            for report in telemetry.gpu_reports() {
+                crate::human!("[gpu] {}", format_gpu_report(&report));
+            }
+        }
         let hashes = shared.stats.hashes.load(Ordering::Relaxed);
         let now = Instant::now();
         let dt = now.duration_since(last_t).as_secs_f64();
@@ -76,6 +90,42 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
             temp_text
         );
     }
+}
+
+/// "NVML 0 NVIDIA GeForce RTX 5090: 448 of 450 W (default 575, max 600), SM
+/// 2280 of 3090 MHz, PCIe gen 2 x8, held back by power limit": a card at its
+/// power limit hashes what that limit allows, and one held back by nothing
+/// is limited by the kernel. Fields NVML did not answer are left out.
+pub fn format_gpu_report(r: &crate::telemetry::GpuReport) -> String {
+    let mut parts = Vec::new();
+    match (r.power_w, r.limit_w) {
+        (Some(p), Some(l)) => parts.push(format!("{p:.0} of {l:.0} W")),
+        (Some(p), None) => parts.push(format!("{p:.0} W")),
+        (None, Some(l)) => parts.push(format!("limit {l:.0} W")),
+        (None, None) => {}
+    }
+    let range: Vec<String> = [("default", r.default_limit_w), ("max", r.max_limit_w)]
+        .iter()
+        .filter_map(|(what, w)| w.map(|w| format!("{what} {w:.0}")))
+        .collect();
+    if !range.is_empty() && r.limit_w.is_some() {
+        let last = parts.pop().unwrap_or_default();
+        parts.push(format!("{last} ({})", range.join(", ")));
+    }
+    match (r.sm_mhz, r.max_sm_mhz) {
+        (Some(c), Some(m)) => parts.push(format!("SM {c} of {m} MHz")),
+        (Some(c), None) => parts.push(format!("SM {c} MHz")),
+        _ => {}
+    }
+    if let Some((gen, width)) = r.pcie {
+        parts.push(format!("PCIe gen {gen} x{width}"));
+    }
+    parts.push(if r.held_back_by.is_empty() {
+        "clock held back by nothing".into()
+    } else {
+        format!("held back by {}", r.held_back_by.join(", "))
+    });
+    format!("NVML {} {}: {}", r.index, r.name, parts.join(", "))
 }
 
 /// "1.460 of 11.280 (12.94%)": the best share against the block difficulty
@@ -210,5 +260,29 @@ mod tests {
         assert_eq!(format_best_share(2.5e-6, 11.28), "2.50e-6 of 11.280 (2.2e-5%)");
         // No block difficulty to measure against: the share alone.
         assert_eq!(format_best_share(1.46, 0.0), "1.460");
+    }
+
+    #[test]
+    fn a_gpu_report_says_what_holds_the_card_back() {
+        let r = crate::telemetry::GpuReport {
+            index: 3,
+            name: "NVIDIA GeForce RTX 5090".into(),
+            power_w: Some(447.6),
+            limit_w: Some(450.0),
+            default_limit_w: Some(575.0),
+            max_limit_w: Some(600.0),
+            sm_mhz: Some(2280),
+            max_sm_mhz: Some(3090),
+            pcie: Some((2, 8)),
+            held_back_by: vec!["power limit"],
+        };
+        assert_eq!(
+            format_gpu_report(&r),
+            "NVML 3 NVIDIA GeForce RTX 5090: 448 of 450 W (default 575, max 600), \
+             SM 2280 of 3090 MHz, PCIe gen 2 x8, held back by power limit"
+        );
+        // What NVML did not answer is left out, and nothing in the way says so.
+        let bare = crate::telemetry::GpuReport { index: 0, name: "GPU".into(), ..Default::default() };
+        assert_eq!(format_gpu_report(&bare), "NVML 0 GPU: clock held back by nothing");
     }
 }
