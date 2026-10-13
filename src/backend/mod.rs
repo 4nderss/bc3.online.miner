@@ -492,6 +492,16 @@ impl GpuDevice {
             _ => unreachable!(),
         }
     }
+
+    /// An NVIDIA card through CUDA.
+    pub fn is_cuda(&self) -> bool {
+        match self {
+            #[cfg(feature = "cuda")]
+            GpuDevice::Cuda { .. } => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
 }
 
 /// Will a device have a kernel for `algo` once it is opened? The same answer

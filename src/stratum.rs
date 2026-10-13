@@ -73,6 +73,33 @@ fn next_line<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Opti
 pub struct StratumConfig {
     pub pool: String,
     pub user: String,
+    /// The share difficulty to ask the pool to start at, if any - see
+    /// `suggested_difficulty`.
+    pub suggest_difficulty: Option<f64>,
+}
+
+/// BC3Hash share difficulty to suggest per CUDA card. A pool that has no
+/// history of the rig starts it where a browser or a CPU belongs: bc3.online
+/// at 2e-6, which an RTX 4090 at 2.5 MH/s beats ~290 times a second. The pool
+/// takes 40 shares in 10 s and raises the difficulty x16 per 12 of them, so
+/// what the card had found at the old difficulty meanwhile, its queued
+/// launches included, came back "too many shares per second" - 155 rejects in
+/// the first ten seconds on an RTX 4090. At 1e-4 the RTX 4090 starts at ~6
+/// shares a second, and the pool has raised it after two seconds, long
+/// before its limit; a card of 20 kH/s, slower than any NVIDIA card the
+/// kernel is likely to meet, gets a share every ~20 s, near the pool's
+/// target of 15.
+const SUGGESTED_DIFFICULTY_PER_CARD: f64 = 1e-4;
+
+/// The share difficulty to suggest to the pool (`mining.suggest_difficulty`)
+/// for `cuda_cards` NVIDIA cards mining at `intensity` percent. None without
+/// a CUDA card: a CPU belongs where the pool starts anyway, and an OpenCL
+/// device may be an integrated GPU of a few kH/s, which a suggestion made
+/// for discrete cards would leave without a share for minutes.
+pub fn suggested_difficulty(cuda_cards: usize, intensity: u32) -> Option<f64> {
+    (cuda_cards > 0).then(|| {
+        SUGGESTED_DIFFICULTY_PER_CARD * cuda_cards as f64 * f64::from(intensity.clamp(1, 100)) / 100.0
+    })
 }
 
 /// Requests the pool has not answered yet, so that its answer can be timed.
@@ -121,12 +148,14 @@ const REJECT_SUMMARY_EVERY: Duration = Duration::from_secs(10);
 /// Says why shares are rejected once per reason, and then how many more
 /// every `REJECT_SUMMARY_EVERY` while it goes on - not a line per share.
 ///
-/// Right after the fork the pool starts every connection at a share
-/// difficulty an RTX 4090 beats ~145 times a second, and answers all but 4
-/// (then 40) per 10 s with "too many shares per second" until vardiff has
+/// Right after the fork the pool started every connection at a share
+/// difficulty an RTX 4090 beat ~145 times a second, and answered all but 4
+/// (then 40) per 10 s with "too many shares per second" until vardiff had
 /// caught up. A line each buried everything else said at the fork - and in
 /// the GUI, whose log keeps 300 lines, the kernel and PoW lines were gone
-/// within a second.
+/// within a second. The miner suggests a starting difficulty now
+/// (`suggested_difficulty`), but not every pool takes it, nor every device
+/// gets one.
 #[derive(Default)]
 struct RejectLog {
     /// Per reason: when its window started, and the rejects held back in it.
@@ -264,6 +293,14 @@ fn session(
     send(&mut writer, json!({"id": 1, "method": "mining.subscribe",
         "params": [format!("bc3-miner/{}", env!("CARGO_PKG_VERSION"))]}))?;
     outstanding.sent(1, Instant::now());
+    // Before authorize, so that the first job already carries it. The pool
+    // keeps what the rig's own recent shares say instead, where it has them;
+    // a pool that does not know the method answers with an error, which
+    // nothing here reads.
+    if let Some(d) = cfg.suggest_difficulty {
+        send(&mut writer, json!({"id": 3, "method": "mining.suggest_difficulty", "params": [d]}))?;
+        outstanding.sent(3, Instant::now());
+    }
     send(&mut writer, json!({"id": 2, "method": "mining.authorize",
         "params": [cfg.user, "x"]}))?;
     outstanding.sent(2, Instant::now());
@@ -801,6 +838,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_suggested_difficulty_scales_with_the_cuda_cards_and_intensity() {
+        assert_eq!(suggested_difficulty(0, 100), None);
+        assert_eq!(suggested_difficulty(1, 100), Some(1e-4));
+        let rig = suggested_difficulty(8, 50).unwrap();
+        assert!((rig - 4e-4).abs() < 1e-12, "{rig}");
+        // Intensity is 1-100; nothing outside it may zero or inflate it.
+        assert!(suggested_difficulty(1, 0).unwrap() > 0.0);
+        assert_eq!(suggested_difficulty(1, 500), Some(1e-4));
+    }
+
+    /// The suggestion goes between subscribe and authorize, so that the
+    /// pool's first job carries it - and a pool that does not know the
+    /// method costs nothing: its error is not a rejected share, and the
+    /// session goes on.
+    #[test]
+    fn the_difficulty_is_suggested_before_authorize() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = StratumConfig {
+            pool: listener.local_addr().unwrap().to_string(),
+            user: "bc1qtest.rig".into(),
+            suggest_difficulty: Some(2e-4),
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(crate::shared::SUBMIT_QUEUE);
+        let shared = Arc::new(Shared::new(tx, Default::default()));
+        let s = shared.clone();
+        let miner = std::thread::spawn(move || {
+            let mut authorized_at = None;
+            let result = session(&s, &rx, &cfg, &mut authorized_at);
+            (result, authorized_at)
+        });
+        let mut pool = FakePool::accept(&listener);
+        let mut asked = Vec::new();
+        while asked.len() < 3 {
+            if let Some(m) = pool.next() {
+                asked.push(m);
+            }
+        }
+        let methods: Vec<&str> = asked.iter().map(|m| m["method"].as_str().unwrap_or("")).collect();
+        assert_eq!(methods, ["mining.subscribe", "mining.suggest_difficulty", "mining.authorize"]);
+        assert_eq!(asked[1]["params"][0].as_f64(), Some(2e-4));
+        pool.send(json!({"id": 1, "error": null, "result": [
+            [["mining.set_difficulty", "0a0b0c0d"], ["mining.notify", "0a0b0c0d"]], "0a0b0c0d", 4]}));
+        pool.send(json!({"id": 3, "result": null, "error": [20, "unknown method", null]}));
+        pool.send(json!({"id": 2, "error": null, "result": true}));
+        // Answered and authorized: then the pool goes away.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.pool_rtt_ms().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        drop(pool);
+        let (result, authorized_at) = miner.join().unwrap();
+        assert!(result.is_err(), "the session ends when the pool goes away");
+        assert!(authorized_at.is_some(), "the error to the suggestion must not stop the session");
+        assert_eq!(shared.stats.rejected.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     /// The fork over a real connection, as the pool runs it: a SHA3-256t
     /// job, as from a pool that is not past the fork, which the miner must
     /// not mine at all - not a hash, not a share. Then at the fork height a
@@ -823,6 +918,7 @@ mod tests {
         let cfg = StratumConfig {
             pool: listener.local_addr().unwrap().to_string(),
             user: "bc1qtest.rig".into(),
+            suggest_difficulty: None,
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
         let plan = MiningPlan { cpu_threads: 1, ..Default::default() };

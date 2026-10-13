@@ -38,9 +38,13 @@ the GUI of 1.2.0 and later also shows a banner linking to the new release.
 Docker users pull the new image - see *Quick start — Docker* below.
 
 When the pool starts a connection at a very low share difficulty, a fast card
-gets "too many shares per second" answers until vardiff has raised it. That
-is expected. The miner prints the first such reject at once and then one line
-every 10 s counting the repeats.
+gets "too many shares per second" answers until vardiff has raised it. Since
+2.1.0 a miner with NVIDIA cards asks the pool for a starting difficulty that
+suits them (`mining.suggest_difficulty`): an RTX 4090 starts at a few
+shares a second rather than hundreds. A pool that knows the rig's recent
+shares starts it where they say instead. Where it still happens - another device, another
+pool - it is harmless, and the miner prints the first such reject at once and
+then one line every 10 s counting the repeats.
 
 ## Download
 

@@ -383,6 +383,9 @@ fn main() {
         .stats
         .gpu_workers_alive
         .store(gpus.len() as u32, std::sync::atomic::Ordering::Relaxed);
+    // Taken before the workers own the devices: see stratum::suggested_difficulty.
+    let suggest_difficulty =
+        stratum::suggested_difficulty(gpus.iter().filter(|g| g.is_cuda()).count(), args.intensity);
     for (g, gpu) in gpus.into_iter().enumerate() {
         let s = shared.clone();
         std::thread::Builder::new()
@@ -435,7 +438,7 @@ fn main() {
         std::process::exit(args.internal.run(shared, submit_rx, devices));
     }
 
-    stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user });
+    stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user, suggest_difficulty });
 }
 
 /// How many CPU threads to start, and what they mine.
