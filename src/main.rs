@@ -15,6 +15,9 @@ mod gpu_worker;
 mod internal;
 mod ipc;
 mod telemetry;
+#[cfg(feature = "bc3hash")]
+#[allow(dead_code)] // wired into the GPU worker with the window switching
+mod tuning;
 mod shared;
 #[cfg(feature = "internal-tools")]
 mod solve;

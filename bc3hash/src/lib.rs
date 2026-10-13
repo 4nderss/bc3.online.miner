@@ -25,6 +25,9 @@ extern "C" {
     fn bc3hash_table_bytes() -> usize;
     fn bc3hash_gpu_part_u64(window: u32, part: i32) -> usize;
     fn bc3hash_gpu_table_part(window: u32, part: i32, out: *mut u64, len: usize) -> i32;
+    fn bc3hash_gpu_rows(window: u32) -> u32;
+    fn bc3hash_gpu_row_u64(window: u32) -> usize;
+    fn bc3hash_gpu_curve_row(window: u32, curve: i32, row: u32, out: *mut u64, len: usize) -> i32;
 }
 
 /// The lookup tables the GPU kernel (src/kernels/bc3hash.cl in the miner)
@@ -34,42 +37,69 @@ extern "C" {
 /// node's own constants with the same secp256k1 calls as its CPU tables, and
 /// independent of `configure`.
 ///
-/// The four curves are built on four threads: window 16 (256 MiB) takes
-/// ~11 s on one thread, ~3 s this way; window 10 (6.8 MiB) a fraction of a
-/// second.
+/// Every row of every curve is built on its own (its base straight from the
+/// curve's point by one scalar multiplication), on as many threads as the
+/// machine has. On an i9-12900HK (20 threads): window 16 (256 MiB) in 1.3 s,
+/// ~3 s with a thread per curve before; 18 in 5.2 s, 19 in 9.6 s, 20 (3.3 GiB)
+/// in 18.7 s.
 pub fn gpu_tables(window: u32) -> Result<Vec<u64>, String> {
     if !(2..=20).contains(&window) {
         return Err(format!("no GPU tables for a window of {window} bits"));
     }
     // SAFETY: plain integer arguments, cannot throw.
+    let (pow_len, rows, row_len) =
+        unsafe { (bc3hash_gpu_part_u64(window, 0), bc3hash_gpu_rows(window) as usize, bc3hash_gpu_row_u64(window)) };
+    let mut out = vec![0u64; pow_len + 4 * rows * row_len];
+    // Work items: the power tables, then (curve, row) for each curve's rows,
+    // in the buffer's order - BC3_TABLE_* of the kernel.
+    let (pow, curves) = out.split_at_mut(pow_len);
+    let mut items: Vec<(usize, &mut [u64])> = vec![(0, pow)];
+    items.extend(curves.chunks_mut(row_len).enumerate().map(|(i, slice)| (i + 1, slice)));
+    items.reverse();
+    let queue = std::sync::Mutex::new(items);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 64);
+    let failed = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let Some((item, slice)) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else { break };
+                // SAFETY: each slice is exactly its item's length, and no
+                // other thread touches it.
+                let rc = unsafe {
+                    if item == 0 {
+                        bc3hash_gpu_table_part(window, 0, slice.as_mut_ptr(), slice.len())
+                    } else {
+                        let (curve, row) = ((item - 1) / rows, (item - 1) % rows);
+                        bc3hash_gpu_curve_row(window, curve as i32, row as u32, slice.as_mut_ptr(), slice.len())
+                    }
+                };
+                if rc != 0 {
+                    failed.store(true, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    if failed.load(Ordering::Relaxed) {
+        Err(format!("building the BC3Hash GPU tables (window {window}) failed"))
+    } else {
+        Ok(out)
+    }
+}
+
+/// The curve tables the way 2.0.0 built them - one curve after the other,
+/// each row's base from the row before - for the test that the row-parallel
+/// build gives the same table.
+#[cfg(test)]
+fn gpu_tables_by_curve(window: u32) -> Vec<u64> {
     let sizes: Vec<usize> = (0..5).map(|part| unsafe { bc3hash_gpu_part_u64(window, part) }).collect();
     let mut out = vec![0u64; sizes.iter().sum()];
-    let mut rest: &mut [u64] = &mut out;
-    let mut parts = Vec::with_capacity(5);
-    for &size in &sizes {
-        let (part, tail) = rest.split_at_mut(size);
-        parts.push(part);
-        rest = tail;
+    let mut at = 0;
+    for (part, &size) in sizes.iter().enumerate() {
+        let slice = &mut out[at..at + size];
+        assert_eq!(unsafe { bc3hash_gpu_table_part(window, part as i32, slice.as_mut_ptr(), size) }, 0);
+        at += size;
     }
-    let results: Vec<i32> = std::thread::scope(|s| {
-        let handles: Vec<_> = parts
-            .into_iter()
-            .enumerate()
-            .map(|(part, slice)| {
-                s.spawn(move || {
-                    // SAFETY: slice is exactly this part's length, and no
-                    // other thread touches it.
-                    unsafe { bc3hash_gpu_table_part(window, part as i32, slice.as_mut_ptr(), slice.len()) }
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap_or(-1)).collect()
-    });
-    if results.iter().all(|&rc| rc == 0) {
-        Ok(out)
-    } else {
-        Err(format!("building the BC3Hash GPU tables (window {window}) failed"))
-    }
+    out
 }
 
 /// The node's header vectors among the self-test vectors: 80-byte BC3Hash
@@ -336,12 +366,21 @@ mod tests {
         assert_eq!(header_vectors().len(), 2);
     }
 
+    /// The row-parallel build gives exactly the table the curve-by-curve one
+    /// did, every window the kernel is built for.
+    #[test]
+    fn gpu_tables_rows_match_the_curve_build() {
+        for window in [10u32, 12] {
+            assert!(gpu_tables(window).unwrap() == gpu_tables_by_curve(window), "window {window}");
+        }
+    }
+
     /// How long the GPU tables take to build per window, and how big they are:
     ///     cargo test --release -- --ignored gpu_table_build_times --nocapture
     #[test]
     #[ignore]
     fn gpu_table_build_times() {
-        for window in [10u32, 12, 14, 16] {
+        for window in [10u32, 12, 14, 16, 18, 19, 20] {
             let t0 = std::time::Instant::now();
             let t = gpu_tables(window).unwrap();
             println!(

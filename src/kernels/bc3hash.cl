@@ -62,8 +62,15 @@
 //   curves  4 x BC3_CURVE_POINTS x (x[4], y[4])   affine, b*2^(w*i)*P
 #define BC3_TABLE_POW64   0
 #define BC3_TABLE_POW128  (BC3_TABLE_POW64 + 8 * 256 * 1)
+// pow256 table rows of BC3_POW256_BITS bits (8: 32 rows, 256 KiB; 12: 22 rows,
+// 2.75 MiB; 16: 16 rows, 32 MiB). Wider rows: fewer products per power.
+#ifndef BC3_POW256_BITS
+  #define BC3_POW256_BITS 8
+#endif
+#define BC3_POW256_ROWS    ((256u + BC3_POW256_BITS - 1u) / BC3_POW256_BITS)
+#define BC3_POW256_ENTRIES (1u << BC3_POW256_BITS)
 #define BC3_TABLE_POW256  (BC3_TABLE_POW128 + 16 * 256 * 2)
-#define BC3_TABLE_CURVE   (BC3_TABLE_POW256 + 32 * 256 * 4)
+#define BC3_TABLE_CURVE   (BC3_TABLE_POW256 + BC3_POW256_ROWS * BC3_POW256_ENTRIES * 4)
 #define BC3_TABLE_U64     (BC3_TABLE_CURVE + 4 * BC3_CURVE_POINTS * 8)
 CONST_ARR i32 BC3_MODINV_SECP[9] = {-0x3D1, -4, 0, 0, 0, 0, 0, 0, 65536};
 #define BC3_MODINV_SECP_INV30 0x2ddacacfu
@@ -512,309 +519,241 @@ DEVICE_FN u256 join256(const u32* x) {
 #define BC3_RARE(k)
 #endif
 
-// t[0..16) = a * b: row i adds a[i] * b into t[i .. i+8], where t[i+8] is still
-// free; the low and the high words of the row's products go in by two carry
-// chains, and a row's sum never carries past t[i+8].
+// t[0..16) = a * b: even-column products into E, odd ones into O (one word
+// down), one carry chain per row and parity, then t = E + O.
 DEVICE_FN void mul8(const u32* a, const u32* b, u32* t) {
-  u32 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15;
   const u32 a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4], a5 = a[5], a6 = a[6], a7 = a[7];
   const u32 b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3], b4 = b[4], b5 = b[5], b6 = b[6], b7 = b[7];
+  u32 E0 = 0, E1 = 0, E2 = 0, E3 = 0, E4 = 0, E5 = 0, E6 = 0, E7 = 0, E8 = 0, E9 = 0, E10 = 0, E11 = 0, E12 = 0, E13 = 0, E14 = 0, E15 = 0;
+  u32 O0 = 0, O1 = 0, O2 = 0, O3 = 0, O4 = 0, O5 = 0, O6 = 0, O7 = 0, O8 = 0, O9 = 0, O10 = 0, O11 = 0, O12 = 0, O13 = 0, O14 = 0;
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "mov.u32 %0, l0;\n\t"
-      "add.cc.u32 %1, l1, h0;\n\t"
-      "addc.cc.u32 %2, l2, h1;\n\t"
-      "addc.cc.u32 %3, l3, h2;\n\t"
-      "addc.cc.u32 %4, l4, h3;\n\t"
-      "addc.cc.u32 %5, l5, h4;\n\t"
-      "addc.cc.u32 %6, l6, h5;\n\t"
-      "addc.cc.u32 %7, l7, h6;\n\t"
-      "addc.u32 %8, h7, 0;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4), "=r"(t5), "=r"(t6), "=r"(t7), "=r"(t8)
-      : "r"(a0), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(E0), "+r"(E1), "+r"(E2), "+r"(E3), "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7), "+r"(E8)
+      : "r"(a0), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.cc.u32 %4, %4, l4;\n\t"
-      "addc.cc.u32 %5, %5, l5;\n\t"
-      "addc.cc.u32 %6, %6, l6;\n\t"
-      "addc.cc.u32 %7, %7, l7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.cc.u32 %4, %4, h3;\n\t"
-      "addc.cc.u32 %5, %5, h4;\n\t"
-      "addc.cc.u32 %6, %6, h5;\n\t"
-      "addc.cc.u32 %7, %7, h6;\n\t"
-      "addc.u32 %8, %8, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "=r"(t9)
-      : "r"(a1), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(O0), "+r"(O1), "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8)
+      : "r"(a0), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.cc.u32 %4, %4, l4;\n\t"
-      "addc.cc.u32 %5, %5, l5;\n\t"
-      "addc.cc.u32 %6, %6, l6;\n\t"
-      "addc.cc.u32 %7, %7, l7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.cc.u32 %4, %4, h3;\n\t"
-      "addc.cc.u32 %5, %5, h4;\n\t"
-      "addc.cc.u32 %6, %6, h5;\n\t"
-      "addc.cc.u32 %7, %7, h6;\n\t"
-      "addc.u32 %8, %8, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "=r"(t10)
-      : "r"(a2), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(E2), "+r"(E3), "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10)
+      : "r"(a1), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.cc.u32 %4, %4, l4;\n\t"
-      "addc.cc.u32 %5, %5, l5;\n\t"
-      "addc.cc.u32 %6, %6, l6;\n\t"
-      "addc.cc.u32 %7, %7, l7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.cc.u32 %4, %4, h3;\n\t"
-      "addc.cc.u32 %5, %5, h4;\n\t"
-      "addc.cc.u32 %6, %6, h5;\n\t"
-      "addc.cc.u32 %7, %7, h6;\n\t"
-      "addc.u32 %8, %8, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "=r"(t11)
-      : "r"(a3), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(O0), "+r"(O1), "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8)
+      : "r"(a1), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.cc.u32 %4, %4, l4;\n\t"
-      "addc.cc.u32 %5, %5, l5;\n\t"
-      "addc.cc.u32 %6, %6, l6;\n\t"
-      "addc.cc.u32 %7, %7, l7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.cc.u32 %4, %4, h3;\n\t"
-      "addc.cc.u32 %5, %5, h4;\n\t"
-      "addc.cc.u32 %6, %6, h5;\n\t"
-      "addc.cc.u32 %7, %7, h6;\n\t"
-      "addc.u32 %8, %8, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "+r"(t11), "=r"(t12)
-      : "r"(a4), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(E2), "+r"(E3), "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10)
+      : "r"(a2), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.cc.u32 %4, %4, l4;\n\t"
-      "addc.cc.u32 %5, %5, l5;\n\t"
-      "addc.cc.u32 %6, %6, l6;\n\t"
-      "addc.cc.u32 %7, %7, l7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.cc.u32 %4, %4, h3;\n\t"
-      "addc.cc.u32 %5, %5, h4;\n\t"
-      "addc.cc.u32 %6, %6, h5;\n\t"
-      "addc.cc.u32 %7, %7, h6;\n\t"
-      "addc.u32 %8, %8, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "+r"(t11), "+r"(t12), "=r"(t13)
-      : "r"(a5), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10)
+      : "r"(a2), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.cc.u32 %4, %4, l4;\n\t"
-      "addc.cc.u32 %5, %5, l5;\n\t"
-      "addc.cc.u32 %6, %6, l6;\n\t"
-      "addc.cc.u32 %7, %7, l7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.cc.u32 %4, %4, h3;\n\t"
-      "addc.cc.u32 %5, %5, h4;\n\t"
-      "addc.cc.u32 %6, %6, h5;\n\t"
-      "addc.cc.u32 %7, %7, h6;\n\t"
-      "addc.u32 %8, %8, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "+r"(t11), "+r"(t12), "+r"(t13), "=r"(t14)
-      : "r"(a6), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10), "+r"(E11), "+r"(E12)
+      : "r"(a3), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p0, %9, %10;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %9, %11;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %9, %12;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %9, %13;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %9, %14;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %9, %15;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %9, %16;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %9, %17;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.cc.u32 %4, %4, l4;\n\t"
-      "addc.cc.u32 %5, %5, l5;\n\t"
-      "addc.cc.u32 %6, %6, l6;\n\t"
-      "addc.cc.u32 %7, %7, l7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.cc.u32 %4, %4, h3;\n\t"
-      "addc.cc.u32 %5, %5, h4;\n\t"
-      "addc.cc.u32 %6, %6, h5;\n\t"
-      "addc.cc.u32 %7, %7, h6;\n\t"
-      "addc.u32 %8, %8, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "+r"(t11), "+r"(t12), "+r"(t13), "+r"(t14), "=r"(t15)
-      : "r"(a7), "r"(b0), "r"(b1), "r"(b2), "r"(b3), "r"(b4), "r"(b5), "r"(b6), "r"(b7));
+      : "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10)
+      : "r"(a3), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
+      "}"
+      : "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10), "+r"(E11), "+r"(E12)
+      : "r"(a4), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
+      "}"
+      : "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10), "+r"(O11), "+r"(O12)
+      : "r"(a4), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
+      "}"
+      : "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10), "+r"(E11), "+r"(E12), "+r"(E13), "+r"(E14)
+      : "r"(a5), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
+      "}"
+      : "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10), "+r"(O11), "+r"(O12)
+      : "r"(a5), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
+      "}"
+      : "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10), "+r"(E11), "+r"(E12), "+r"(E13), "+r"(E14)
+      : "r"(a6), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
+      "}"
+      : "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10), "+r"(O11), "+r"(O12), "+r"(O13), "+r"(O14)
+      : "r"(a6), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %8, %9, %0;\n\t"
+      "madc.hi.cc.u32 %1, %8, %9, %1;\n\t"
+      "madc.lo.cc.u32 %2, %8, %10, %2;\n\t"
+      "madc.hi.cc.u32 %3, %8, %10, %3;\n\t"
+      "madc.lo.cc.u32 %4, %8, %11, %4;\n\t"
+      "madc.hi.cc.u32 %5, %8, %11, %5;\n\t"
+      "madc.lo.cc.u32 %6, %8, %12, %6;\n\t"
+      "madc.hi.u32 %7, %8, %12, %7;\n\t"
+      "}"
+      : "+r"(E8), "+r"(E9), "+r"(E10), "+r"(E11), "+r"(E12), "+r"(E13), "+r"(E14), "+r"(E15)
+      : "r"(a7), "r"(b1), "r"(b3), "r"(b5), "r"(b7));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
+      "}"
+      : "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10), "+r"(O11), "+r"(O12), "+r"(O13), "+r"(O14)
+      : "r"(a7), "r"(b0), "r"(b2), "r"(b4), "r"(b6));
+  u32 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15;
+  asm("{\n\t"
+      "mov.u32 %0, %16;\n\t"
+      "add.cc.u32 %1, %17, %32;\n\t"
+      "addc.cc.u32 %2, %18, %33;\n\t"
+      "addc.cc.u32 %3, %19, %34;\n\t"
+      "addc.cc.u32 %4, %20, %35;\n\t"
+      "addc.cc.u32 %5, %21, %36;\n\t"
+      "addc.cc.u32 %6, %22, %37;\n\t"
+      "addc.cc.u32 %7, %23, %38;\n\t"
+      "addc.cc.u32 %8, %24, %39;\n\t"
+      "addc.cc.u32 %9, %25, %40;\n\t"
+      "addc.cc.u32 %10, %26, %41;\n\t"
+      "addc.cc.u32 %11, %27, %42;\n\t"
+      "addc.cc.u32 %12, %28, %43;\n\t"
+      "addc.cc.u32 %13, %29, %44;\n\t"
+      "addc.cc.u32 %14, %30, %45;\n\t"
+      "addc.u32 %15, %31, %46;\n\t"
+      "}"
+      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4), "=r"(t5), "=r"(t6), "=r"(t7), "=r"(t8), "=r"(t9), "=r"(t10), "=r"(t11), "=r"(t12), "=r"(t13), "=r"(t14), "=r"(t15)
+      : "r"(E0), "r"(E1), "r"(E2), "r"(E3), "r"(E4), "r"(E5), "r"(E6), "r"(E7), "r"(E8), "r"(E9), "r"(E10), "r"(E11), "r"(E12), "r"(E13), "r"(E14), "r"(E15), "r"(O0), "r"(O1), "r"(O2), "r"(O3), "r"(O4), "r"(O5), "r"(O6), "r"(O7), "r"(O8), "r"(O9), "r"(O10), "r"(O11), "r"(O12), "r"(O13), "r"(O14));
   t[0] = t0;
   t[1] = t1;
   t[2] = t2;
@@ -833,209 +772,190 @@ DEVICE_FN void mul8(const u32* a, const u32* b, u32* t) {
   t[15] = t15;
 }
 
-// t[0..16) = a^2: the cross products row by row as in the product (row i
-// adds a[i] * a[i+1 ..] at t[2i+1 ..]), then t = 2t + the squares, by carry chains.
+// t[0..16) = a^2: cross products into E and O as in the product, s = E + O,
+// t = 2s, then the squares a_i^2 by one carry chain over the even pairs.
 DEVICE_FN void sqr8(const u32* a, u32* t) {
-  u32 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15;
   const u32 a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3], a4 = a[4], a5 = a[5], a6 = a[6], a7 = a[7];
+  u32 E0 = 0, E1 = 0, E2 = 0, E3 = 0, E4 = 0, E5 = 0, E6 = 0, E7 = 0, E8 = 0, E9 = 0, E10 = 0, E11 = 0, E12 = 0, E13 = 0, E14 = 0, E15 = 0;
+  u32 O0 = 0, O1 = 0, O2 = 0, O3 = 0, O4 = 0, O5 = 0, O6 = 0, O7 = 0, O8 = 0, O9 = 0, O10 = 0, O11 = 0, O12 = 0, O13 = 0, O14 = 0;
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p1, %8, %9;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %8, %10;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %8, %11;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %8, %12;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %8, %13;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %8, %14;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %8, %15;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "mov.u32 %0, l1;\n\t"
-      "add.cc.u32 %1, l2, h1;\n\t"
-      "addc.cc.u32 %2, l3, h2;\n\t"
-      "addc.cc.u32 %3, l4, h3;\n\t"
-      "addc.cc.u32 %4, l5, h4;\n\t"
-      "addc.cc.u32 %5, l6, h5;\n\t"
-      "addc.cc.u32 %6, l7, h6;\n\t"
-      "addc.u32 %7, h7, 0;\n\t"
+      "mad.lo.cc.u32 %0, %7, %8, %0;\n\t"
+      "madc.hi.cc.u32 %1, %7, %8, %1;\n\t"
+      "madc.lo.cc.u32 %2, %7, %9, %2;\n\t"
+      "madc.hi.cc.u32 %3, %7, %9, %3;\n\t"
+      "madc.lo.cc.u32 %4, %7, %10, %4;\n\t"
+      "madc.hi.cc.u32 %5, %7, %10, %5;\n\t"
+      "addc.u32 %6, %6, 0;\n\t"
       "}"
-      : "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4), "=r"(t5), "=r"(t6), "=r"(t7), "=r"(t8)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
+      : "+r"(E2), "+r"(E3), "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7), "+r"(E8)
+      : "r"(a0), "r"(a2), "r"(a4), "r"(a6));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p2, %8, %9;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %8, %10;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %8, %11;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %8, %12;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %8, %13;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %8, %14;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l2;\n\t"
-      "addc.cc.u32 %1, %1, l3;\n\t"
-      "addc.cc.u32 %2, %2, l4;\n\t"
-      "addc.cc.u32 %3, %3, l5;\n\t"
-      "addc.cc.u32 %4, %4, l6;\n\t"
-      "addc.cc.u32 %5, %5, l7;\n\t"
-      "addc.u32 %6, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h2;\n\t"
-      "addc.cc.u32 %2, %2, h3;\n\t"
-      "addc.cc.u32 %3, %3, h4;\n\t"
-      "addc.cc.u32 %4, %4, h5;\n\t"
-      "addc.cc.u32 %5, %5, h6;\n\t"
-      "addc.u32 %6, %6, h7;\n\t"
+      "mad.lo.cc.u32 %0, %9, %10, %0;\n\t"
+      "madc.hi.cc.u32 %1, %9, %10, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %11, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %11, %3;\n\t"
+      "madc.lo.cc.u32 %4, %9, %12, %4;\n\t"
+      "madc.hi.cc.u32 %5, %9, %12, %5;\n\t"
+      "madc.lo.cc.u32 %6, %9, %13, %6;\n\t"
+      "madc.hi.cc.u32 %7, %9, %13, %7;\n\t"
+      "addc.u32 %8, %8, 0;\n\t"
       "}"
-      : "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "=r"(t9)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
+      : "+r"(O0), "+r"(O1), "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8)
+      : "r"(a0), "r"(a1), "r"(a3), "r"(a5), "r"(a7));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p3, %8, %9;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mul.wide.u32 p4, %8, %10;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %8, %11;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %8, %12;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %8, %13;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l3;\n\t"
-      "addc.cc.u32 %1, %1, l4;\n\t"
-      "addc.cc.u32 %2, %2, l5;\n\t"
-      "addc.cc.u32 %3, %3, l6;\n\t"
-      "addc.cc.u32 %4, %4, l7;\n\t"
-      "addc.u32 %5, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h3;\n\t"
-      "addc.cc.u32 %2, %2, h4;\n\t"
-      "addc.cc.u32 %3, %3, h5;\n\t"
-      "addc.cc.u32 %4, %4, h6;\n\t"
-      "addc.u32 %5, %5, h7;\n\t"
+      "mad.lo.cc.u32 %0, %7, %8, %0;\n\t"
+      "madc.hi.cc.u32 %1, %7, %8, %1;\n\t"
+      "madc.lo.cc.u32 %2, %7, %9, %2;\n\t"
+      "madc.hi.cc.u32 %3, %7, %9, %3;\n\t"
+      "madc.lo.cc.u32 %4, %7, %10, %4;\n\t"
+      "madc.hi.cc.u32 %5, %7, %10, %5;\n\t"
+      "addc.u32 %6, %6, 0;\n\t"
       "}"
-      : "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "=r"(t10)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
+      : "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10)
+      : "r"(a1), "r"(a3), "r"(a5), "r"(a7));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p4, %8, %9;\n\t"
-      "mov.b64 {l4, h4}, p4;\n\t"
-      "mul.wide.u32 p5, %8, %10;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %8, %11;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %8, %12;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l4;\n\t"
-      "addc.cc.u32 %1, %1, l5;\n\t"
-      "addc.cc.u32 %2, %2, l6;\n\t"
-      "addc.cc.u32 %3, %3, l7;\n\t"
-      "addc.u32 %4, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h4;\n\t"
-      "addc.cc.u32 %2, %2, h5;\n\t"
-      "addc.cc.u32 %3, %3, h6;\n\t"
-      "addc.u32 %4, %4, h7;\n\t"
+      "mad.lo.cc.u32 %0, %7, %8, %0;\n\t"
+      "madc.hi.cc.u32 %1, %7, %8, %1;\n\t"
+      "madc.lo.cc.u32 %2, %7, %9, %2;\n\t"
+      "madc.hi.cc.u32 %3, %7, %9, %3;\n\t"
+      "madc.lo.cc.u32 %4, %7, %10, %4;\n\t"
+      "madc.hi.cc.u32 %5, %7, %10, %5;\n\t"
+      "addc.u32 %6, %6, 0;\n\t"
       "}"
-      : "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "=r"(t11)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
+      : "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8)
+      : "r"(a1), "r"(a2), "r"(a4), "r"(a6));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p5, %8, %9;\n\t"
-      "mov.b64 {l5, h5}, p5;\n\t"
-      "mul.wide.u32 p6, %8, %10;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %8, %11;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l5;\n\t"
-      "addc.cc.u32 %1, %1, l6;\n\t"
-      "addc.cc.u32 %2, %2, l7;\n\t"
-      "addc.u32 %3, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h5;\n\t"
-      "addc.cc.u32 %2, %2, h6;\n\t"
-      "addc.u32 %3, %3, h7;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "+r"(t9), "+r"(t10), "+r"(t11), "=r"(t12)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
+      : "+r"(E6), "+r"(E7), "+r"(E8), "+r"(E9), "+r"(E10)
+      : "r"(a2), "r"(a4), "r"(a6));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p6, %8, %9;\n\t"
-      "mov.b64 {l6, h6}, p6;\n\t"
-      "mul.wide.u32 p7, %8, %10;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l6;\n\t"
-      "addc.cc.u32 %1, %1, l7;\n\t"
-      "addc.u32 %2, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h6;\n\t"
-      "addc.u32 %2, %2, h7;\n\t"
+      "mad.lo.cc.u32 %0, %7, %8, %0;\n\t"
+      "madc.hi.cc.u32 %1, %7, %8, %1;\n\t"
+      "madc.lo.cc.u32 %2, %7, %9, %2;\n\t"
+      "madc.hi.cc.u32 %3, %7, %9, %3;\n\t"
+      "madc.lo.cc.u32 %4, %7, %10, %4;\n\t"
+      "madc.hi.cc.u32 %5, %7, %10, %5;\n\t"
+      "addc.u32 %6, %6, 0;\n\t"
       "}"
-      : "+r"(t11), "+r"(t12), "=r"(t13)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
+      : "+r"(O4), "+r"(O5), "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10)
+      : "r"(a2), "r"(a3), "r"(a5), "r"(a7));
   asm("{\n\t"
-      ".reg .u64 p<8>; .reg .u32 l<8>, h<8>;\n\t"
-      "mul.wide.u32 p7, %8, %9;\n\t"
-      "mov.b64 {l7, h7}, p7;\n\t"
-      "add.cc.u32 %0, %0, l7;\n\t"
-      "addc.u32 %1, 0, 0;\n\t"
-      "add.u32 %1, %1, h7;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "+r"(t13), "=r"(t14)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
+      : "+r"(E8), "+r"(E9), "+r"(E10), "+r"(E11), "+r"(E12)
+      : "r"(a3), "r"(a5), "r"(a7));
   asm("{\n\t"
-      ".reg .u64 q<8>; .reg .u32 s<8>, z<8>;\n\t"
-      "mul.wide.u32 q0, %16, %16;\n\t"
-      "mov.b64 {s0, z0}, q0;\n\t"
-      "mul.wide.u32 q1, %17, %17;\n\t"
-      "mov.b64 {s1, z1}, q1;\n\t"
-      "mul.wide.u32 q2, %18, %18;\n\t"
-      "mov.b64 {s2, z2}, q2;\n\t"
-      "mul.wide.u32 q3, %19, %19;\n\t"
-      "mov.b64 {s3, z3}, q3;\n\t"
-      "mul.wide.u32 q4, %20, %20;\n\t"
-      "mov.b64 {s4, z4}, q4;\n\t"
-      "mul.wide.u32 q5, %21, %21;\n\t"
-      "mov.b64 {s5, z5}, q5;\n\t"
-      "mul.wide.u32 q6, %22, %22;\n\t"
-      "mov.b64 {s6, z6}, q6;\n\t"
-      "mul.wide.u32 q7, %23, %23;\n\t"
-      "mov.b64 {s7, z7}, q7;\n\t"
-      "add.cc.u32 %1, %1, %1;\n\t"
-      "addc.cc.u32 %2, %2, %2;\n\t"
-      "addc.cc.u32 %3, %3, %3;\n\t"
-      "addc.cc.u32 %4, %4, %4;\n\t"
-      "addc.cc.u32 %5, %5, %5;\n\t"
-      "addc.cc.u32 %6, %6, %6;\n\t"
-      "addc.cc.u32 %7, %7, %7;\n\t"
-      "addc.cc.u32 %8, %8, %8;\n\t"
-      "addc.cc.u32 %9, %9, %9;\n\t"
-      "addc.cc.u32 %10, %10, %10;\n\t"
-      "addc.cc.u32 %11, %11, %11;\n\t"
-      "addc.cc.u32 %12, %12, %12;\n\t"
-      "addc.cc.u32 %13, %13, %13;\n\t"
-      "addc.cc.u32 %14, %14, %14;\n\t"
-      "addc.u32 %15, 0, 0;\n\t"
-      "mov.u32 %0, s0;\n\t"
-      "add.cc.u32 %1, %1, z0;\n\t"
-      "addc.cc.u32 %2, %2, s1;\n\t"
-      "addc.cc.u32 %3, %3, z1;\n\t"
-      "addc.cc.u32 %4, %4, s2;\n\t"
-      "addc.cc.u32 %5, %5, z2;\n\t"
-      "addc.cc.u32 %6, %6, s3;\n\t"
-      "addc.cc.u32 %7, %7, z3;\n\t"
-      "addc.cc.u32 %8, %8, s4;\n\t"
-      "addc.cc.u32 %9, %9, z4;\n\t"
-      "addc.cc.u32 %10, %10, s5;\n\t"
-      "addc.cc.u32 %11, %11, z5;\n\t"
-      "addc.cc.u32 %12, %12, s6;\n\t"
-      "addc.cc.u32 %13, %13, z6;\n\t"
-      "addc.cc.u32 %14, %14, s7;\n\t"
-      "addc.u32 %15, %15, z7;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "=r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "+r"(t11), "+r"(t12), "+r"(t13), "+r"(t14), "=r"(t15)
+      : "+r"(O6), "+r"(O7), "+r"(O8), "+r"(O9), "+r"(O10)
+      : "r"(a3), "r"(a4), "r"(a6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
+      "}"
+      : "+r"(E10), "+r"(E11), "+r"(E12)
+      : "r"(a4), "r"(a6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
+      "}"
+      : "+r"(O8), "+r"(O9), "+r"(O10), "+r"(O11), "+r"(O12)
+      : "r"(a4), "r"(a5), "r"(a7));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
+      "}"
+      : "+r"(E12), "+r"(E13), "+r"(E14)
+      : "r"(a5), "r"(a7));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
+      "}"
+      : "+r"(O10), "+r"(O11), "+r"(O12)
+      : "r"(a5), "r"(a6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
+      "}"
+      : "+r"(O12), "+r"(O13), "+r"(O14)
+      : "r"(a6), "r"(a7));
+  u32 t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15;
+  asm("{\n\t"
+      ".reg .u32 s<16>;\n\t"
+      "mov.u32 s0, 0;\n\t"
+      "add.cc.u32 s1, %17, %32;\n\t"
+      "addc.cc.u32 s2, %18, %33;\n\t"
+      "addc.cc.u32 s3, %19, %34;\n\t"
+      "addc.cc.u32 s4, %20, %35;\n\t"
+      "addc.cc.u32 s5, %21, %36;\n\t"
+      "addc.cc.u32 s6, %22, %37;\n\t"
+      "addc.cc.u32 s7, %23, %38;\n\t"
+      "addc.cc.u32 s8, %24, %39;\n\t"
+      "addc.cc.u32 s9, %25, %40;\n\t"
+      "addc.cc.u32 s10, %26, %41;\n\t"
+      "addc.cc.u32 s11, %27, %42;\n\t"
+      "addc.cc.u32 s12, %28, %43;\n\t"
+      "addc.cc.u32 s13, %29, %44;\n\t"
+      "addc.cc.u32 s14, %30, %45;\n\t"
+      "addc.u32 s15, %31, %46;\n\t"
+      "add.cc.u32 %1, s1, s1;\n\t"
+      "addc.cc.u32 %2, s2, s2;\n\t"
+      "addc.cc.u32 %3, s3, s3;\n\t"
+      "addc.cc.u32 %4, s4, s4;\n\t"
+      "addc.cc.u32 %5, s5, s5;\n\t"
+      "addc.cc.u32 %6, s6, s6;\n\t"
+      "addc.cc.u32 %7, s7, s7;\n\t"
+      "addc.cc.u32 %8, s8, s8;\n\t"
+      "addc.cc.u32 %9, s9, s9;\n\t"
+      "addc.cc.u32 %10, s10, s10;\n\t"
+      "addc.cc.u32 %11, s11, s11;\n\t"
+      "addc.cc.u32 %12, s12, s12;\n\t"
+      "addc.cc.u32 %13, s13, s13;\n\t"
+      "addc.cc.u32 %14, s14, s14;\n\t"
+      "addc.u32 %15, s15, s15;\n\t"
+      "mov.u32 %0, 0;\n\t"
+      "}"
+      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4), "=r"(t5), "=r"(t6), "=r"(t7), "=r"(t8), "=r"(t9), "=r"(t10), "=r"(t11), "=r"(t12), "=r"(t13), "=r"(t14), "=r"(t15)
+      : "r"(E0), "r"(E1), "r"(E2), "r"(E3), "r"(E4), "r"(E5), "r"(E6), "r"(E7), "r"(E8), "r"(E9), "r"(E10), "r"(E11), "r"(E12), "r"(E13), "r"(E14), "r"(E15), "r"(O0), "r"(O1), "r"(O2), "r"(O3), "r"(O4), "r"(O5), "r"(O6), "r"(O7), "r"(O8), "r"(O9), "r"(O10), "r"(O11), "r"(O12), "r"(O13), "r"(O14));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %16, %16, %0;\n\t"
+      "madc.hi.cc.u32 %1, %16, %16, %1;\n\t"
+      "madc.lo.cc.u32 %2, %17, %17, %2;\n\t"
+      "madc.hi.cc.u32 %3, %17, %17, %3;\n\t"
+      "madc.lo.cc.u32 %4, %18, %18, %4;\n\t"
+      "madc.hi.cc.u32 %5, %18, %18, %5;\n\t"
+      "madc.lo.cc.u32 %6, %19, %19, %6;\n\t"
+      "madc.hi.cc.u32 %7, %19, %19, %7;\n\t"
+      "madc.lo.cc.u32 %8, %20, %20, %8;\n\t"
+      "madc.hi.cc.u32 %9, %20, %20, %9;\n\t"
+      "madc.lo.cc.u32 %10, %21, %21, %10;\n\t"
+      "madc.hi.cc.u32 %11, %21, %21, %11;\n\t"
+      "madc.lo.cc.u32 %12, %22, %22, %12;\n\t"
+      "madc.hi.cc.u32 %13, %22, %22, %13;\n\t"
+      "madc.lo.cc.u32 %14, %23, %23, %14;\n\t"
+      "madc.hi.u32 %15, %23, %23, %15;\n\t"
+      "}"
+      : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7), "+r"(t8), "+r"(t9), "+r"(t10), "+r"(t11), "+r"(t12), "+r"(t13), "+r"(t14), "+r"(t15)
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7));
   t[0] = t0;
   t[1] = t1;
@@ -1136,97 +1056,97 @@ DEVICE_FN u256 fsub(u256 a, u256 b) {
                (u64)r6 | ((u64)r7 << 32));
 }
 
-// t[0..8) = a * b: row i adds a[i] * b into t[i .. i+4], where t[i+4] is still
-// free; the low and the high words of the row's products go in by two carry
-// chains, and a row's sum never carries past t[i+4].
+// t[0..8) = a * b: even-column products into E, odd ones into O (one word
+// down), one carry chain per row and parity, then t = E + O.
 DEVICE_FN void mul4(const u32* a, const u32* b, u32* t) {
-  u32 t0, t1, t2, t3, t4, t5, t6, t7;
   const u32 a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
   const u32 b0 = b[0], b1 = b[1], b2 = b[2], b3 = b[3];
+  u32 E0 = 0, E1 = 0, E2 = 0, E3 = 0, E4 = 0, E5 = 0, E6 = 0, E7 = 0;
+  u32 O0 = 0, O1 = 0, O2 = 0, O3 = 0, O4 = 0, O5 = 0, O6 = 0;
   asm("{\n\t"
-      ".reg .u64 p<4>; .reg .u32 l<4>, h<4>;\n\t"
-      "mul.wide.u32 p0, %5, %6;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %5, %7;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %5, %8;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %5, %9;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mov.u32 %0, l0;\n\t"
-      "add.cc.u32 %1, l1, h0;\n\t"
-      "addc.cc.u32 %2, l2, h1;\n\t"
-      "addc.cc.u32 %3, l3, h2;\n\t"
-      "addc.u32 %4, h3, 0;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4)
-      : "r"(a0), "r"(b0), "r"(b1), "r"(b2), "r"(b3));
+      : "+r"(E0), "+r"(E1), "+r"(E2), "+r"(E3), "+r"(E4)
+      : "r"(a0), "r"(b0), "r"(b2));
   asm("{\n\t"
-      ".reg .u64 p<4>; .reg .u32 l<4>, h<4>;\n\t"
-      "mul.wide.u32 p0, %5, %6;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %5, %7;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %5, %8;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %5, %9;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.u32 %4, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.u32 %4, %4, h3;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "=r"(t5)
-      : "r"(a1), "r"(b0), "r"(b1), "r"(b2), "r"(b3));
+      : "+r"(O0), "+r"(O1), "+r"(O2), "+r"(O3), "+r"(O4)
+      : "r"(a0), "r"(b1), "r"(b3));
   asm("{\n\t"
-      ".reg .u64 p<4>; .reg .u32 l<4>, h<4>;\n\t"
-      "mul.wide.u32 p0, %5, %6;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %5, %7;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %5, %8;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %5, %9;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.u32 %4, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.u32 %4, %4, h3;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "=r"(t6)
-      : "r"(a2), "r"(b0), "r"(b1), "r"(b2), "r"(b3));
+      : "+r"(E2), "+r"(E3), "+r"(E4), "+r"(E5), "+r"(E6)
+      : "r"(a1), "r"(b1), "r"(b3));
   asm("{\n\t"
-      ".reg .u64 p<4>; .reg .u32 l<4>, h<4>;\n\t"
-      "mul.wide.u32 p0, %5, %6;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %5, %7;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %5, %8;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %5, %9;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.cc.u32 %2, %2, l2;\n\t"
-      "addc.cc.u32 %3, %3, l3;\n\t"
-      "addc.u32 %4, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.cc.u32 %2, %2, h1;\n\t"
-      "addc.cc.u32 %3, %3, h2;\n\t"
-      "addc.u32 %4, %4, h3;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "=r"(t7)
-      : "r"(a3), "r"(b0), "r"(b1), "r"(b2), "r"(b3));
+      : "+r"(O0), "+r"(O1), "+r"(O2), "+r"(O3), "+r"(O4)
+      : "r"(a1), "r"(b0), "r"(b2));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
+      "}"
+      : "+r"(E2), "+r"(E3), "+r"(E4), "+r"(E5), "+r"(E6)
+      : "r"(a2), "r"(b0), "r"(b2));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
+      "}"
+      : "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6)
+      : "r"(a2), "r"(b1), "r"(b3));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %4, %5, %0;\n\t"
+      "madc.hi.cc.u32 %1, %4, %5, %1;\n\t"
+      "madc.lo.cc.u32 %2, %4, %6, %2;\n\t"
+      "madc.hi.u32 %3, %4, %6, %3;\n\t"
+      "}"
+      : "+r"(E4), "+r"(E5), "+r"(E6), "+r"(E7)
+      : "r"(a3), "r"(b1), "r"(b3));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
+      "}"
+      : "+r"(O2), "+r"(O3), "+r"(O4), "+r"(O5), "+r"(O6)
+      : "r"(a3), "r"(b0), "r"(b2));
+  u32 t0, t1, t2, t3, t4, t5, t6, t7;
+  asm("{\n\t"
+      "mov.u32 %0, %8;\n\t"
+      "add.cc.u32 %1, %9, %16;\n\t"
+      "addc.cc.u32 %2, %10, %17;\n\t"
+      "addc.cc.u32 %3, %11, %18;\n\t"
+      "addc.cc.u32 %4, %12, %19;\n\t"
+      "addc.cc.u32 %5, %13, %20;\n\t"
+      "addc.cc.u32 %6, %14, %21;\n\t"
+      "addc.u32 %7, %15, %22;\n\t"
+      "}"
+      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4), "=r"(t5), "=r"(t6), "=r"(t7)
+      : "r"(E0), "r"(E1), "r"(E2), "r"(E3), "r"(E4), "r"(E5), "r"(E6), "r"(E7), "r"(O0), "r"(O1), "r"(O2), "r"(O3), "r"(O4), "r"(O5), "r"(O6));
   t[0] = t0;
   t[1] = t1;
   t[2] = t2;
@@ -1237,77 +1157,82 @@ DEVICE_FN void mul4(const u32* a, const u32* b, u32* t) {
   t[7] = t7;
 }
 
-// t[0..8) = a^2: the cross products row by row as in the product (row i
-// adds a[i] * a[i+1 ..] at t[2i+1 ..]), then t = 2t + the squares, by carry chains.
+// t[0..8) = a^2: cross products into E and O as in the product, s = E + O,
+// t = 2s, then the squares a_i^2 by one carry chain over the even pairs.
 DEVICE_FN void sqr4(const u32* a, u32* t) {
-  u32 t0, t1, t2, t3, t4, t5, t6, t7;
   const u32 a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
+  u32 E0 = 0, E1 = 0, E2 = 0, E3 = 0, E4 = 0, E5 = 0, E6 = 0, E7 = 0;
+  u32 O0 = 0, O1 = 0, O2 = 0, O3 = 0, O4 = 0, O5 = 0, O6 = 0;
   asm("{\n\t"
-      ".reg .u64 p<4>; .reg .u32 l<4>, h<4>;\n\t"
-      "mul.wide.u32 p1, %4, %5;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mul.wide.u32 p2, %4, %6;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %4, %7;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "mov.u32 %0, l1;\n\t"
-      "add.cc.u32 %1, l2, h1;\n\t"
-      "addc.cc.u32 %2, l3, h2;\n\t"
-      "addc.u32 %3, h3, 0;\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
       "}"
-      : "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3));
+      : "+r"(E2), "+r"(E3), "+r"(E4)
+      : "r"(a0), "r"(a2));
   asm("{\n\t"
-      ".reg .u64 p<4>; .reg .u32 l<4>, h<4>;\n\t"
-      "mul.wide.u32 p2, %4, %5;\n\t"
-      "mov.b64 {l2, h2}, p2;\n\t"
-      "mul.wide.u32 p3, %4, %6;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "add.cc.u32 %0, %0, l2;\n\t"
-      "addc.cc.u32 %1, %1, l3;\n\t"
-      "addc.u32 %2, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h2;\n\t"
-      "addc.u32 %2, %2, h3;\n\t"
+      "mad.lo.cc.u32 %0, %5, %6, %0;\n\t"
+      "madc.hi.cc.u32 %1, %5, %6, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %7, %2;\n\t"
+      "madc.hi.cc.u32 %3, %5, %7, %3;\n\t"
+      "addc.u32 %4, %4, 0;\n\t"
       "}"
-      : "+r"(t3), "+r"(t4), "=r"(t5)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3));
+      : "+r"(O0), "+r"(O1), "+r"(O2), "+r"(O3), "+r"(O4)
+      : "r"(a0), "r"(a1), "r"(a3));
   asm("{\n\t"
-      ".reg .u64 p<4>; .reg .u32 l<4>, h<4>;\n\t"
-      "mul.wide.u32 p3, %4, %5;\n\t"
-      "mov.b64 {l3, h3}, p3;\n\t"
-      "add.cc.u32 %0, %0, l3;\n\t"
-      "addc.u32 %1, 0, 0;\n\t"
-      "add.u32 %1, %1, h3;\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
       "}"
-      : "+r"(t5), "=r"(t6)
-      : "r"(a0), "r"(a1), "r"(a2), "r"(a3));
+      : "+r"(E4), "+r"(E5), "+r"(E6)
+      : "r"(a1), "r"(a3));
   asm("{\n\t"
-      ".reg .u64 q<4>; .reg .u32 s<4>, z<4>;\n\t"
-      "mul.wide.u32 q0, %8, %8;\n\t"
-      "mov.b64 {s0, z0}, q0;\n\t"
-      "mul.wide.u32 q1, %9, %9;\n\t"
-      "mov.b64 {s1, z1}, q1;\n\t"
-      "mul.wide.u32 q2, %10, %10;\n\t"
-      "mov.b64 {s2, z2}, q2;\n\t"
-      "mul.wide.u32 q3, %11, %11;\n\t"
-      "mov.b64 {s3, z3}, q3;\n\t"
-      "add.cc.u32 %1, %1, %1;\n\t"
-      "addc.cc.u32 %2, %2, %2;\n\t"
-      "addc.cc.u32 %3, %3, %3;\n\t"
-      "addc.cc.u32 %4, %4, %4;\n\t"
-      "addc.cc.u32 %5, %5, %5;\n\t"
-      "addc.cc.u32 %6, %6, %6;\n\t"
-      "addc.u32 %7, 0, 0;\n\t"
-      "mov.u32 %0, s0;\n\t"
-      "add.cc.u32 %1, %1, z0;\n\t"
-      "addc.cc.u32 %2, %2, s1;\n\t"
-      "addc.cc.u32 %3, %3, z1;\n\t"
-      "addc.cc.u32 %4, %4, s2;\n\t"
-      "addc.cc.u32 %5, %5, z2;\n\t"
-      "addc.cc.u32 %6, %6, s3;\n\t"
-      "addc.u32 %7, %7, z3;\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
       "}"
-      : "=r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "=r"(t7)
+      : "+r"(O2), "+r"(O3), "+r"(O4)
+      : "r"(a1), "r"(a2));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
+      "}"
+      : "+r"(O4), "+r"(O5), "+r"(O6)
+      : "r"(a2), "r"(a3));
+  u32 t0, t1, t2, t3, t4, t5, t6, t7;
+  asm("{\n\t"
+      ".reg .u32 s<8>;\n\t"
+      "mov.u32 s0, 0;\n\t"
+      "add.cc.u32 s1, %9, %16;\n\t"
+      "addc.cc.u32 s2, %10, %17;\n\t"
+      "addc.cc.u32 s3, %11, %18;\n\t"
+      "addc.cc.u32 s4, %12, %19;\n\t"
+      "addc.cc.u32 s5, %13, %20;\n\t"
+      "addc.cc.u32 s6, %14, %21;\n\t"
+      "addc.u32 s7, %15, %22;\n\t"
+      "add.cc.u32 %1, s1, s1;\n\t"
+      "addc.cc.u32 %2, s2, s2;\n\t"
+      "addc.cc.u32 %3, s3, s3;\n\t"
+      "addc.cc.u32 %4, s4, s4;\n\t"
+      "addc.cc.u32 %5, s5, s5;\n\t"
+      "addc.cc.u32 %6, s6, s6;\n\t"
+      "addc.u32 %7, s7, s7;\n\t"
+      "mov.u32 %0, 0;\n\t"
+      "}"
+      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3), "=r"(t4), "=r"(t5), "=r"(t6), "=r"(t7)
+      : "r"(E0), "r"(E1), "r"(E2), "r"(E3), "r"(E4), "r"(E5), "r"(E6), "r"(E7), "r"(O0), "r"(O1), "r"(O2), "r"(O3), "r"(O4), "r"(O5), "r"(O6));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %8, %8, %0;\n\t"
+      "madc.hi.cc.u32 %1, %8, %8, %1;\n\t"
+      "madc.lo.cc.u32 %2, %9, %9, %2;\n\t"
+      "madc.hi.cc.u32 %3, %9, %9, %3;\n\t"
+      "madc.lo.cc.u32 %4, %10, %10, %4;\n\t"
+      "madc.hi.cc.u32 %5, %10, %10, %5;\n\t"
+      "madc.lo.cc.u32 %6, %11, %11, %6;\n\t"
+      "madc.hi.u32 %7, %11, %11, %7;\n\t"
+      "}"
+      : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3), "+r"(t4), "+r"(t5), "+r"(t6), "+r"(t7)
       : "r"(a0), "r"(a1), "r"(a2), "r"(a3));
   t[0] = t0;
   t[1] = t1;
@@ -1463,74 +1388,89 @@ DEVICE_FN void reduce4_small_w(const u32* t, u32 C, u32* r) {
   r[3] = r3;
 }
 
-// t[0..4) = a * b: row i adds a[i] * b into t[i .. i+2], where t[i+2] is still
-// free; the low and the high words of the row's products go in by two carry
-// chains, and a row's sum never carries past t[i+2].
+// t[0..4) = a * b: even-column products into E, odd ones into O (one word
+// down), one carry chain per row and parity, then t = E + O.
 DEVICE_FN void mul2(const u32* a, const u32* b, u32* t) {
-  u32 t0, t1, t2, t3;
   const u32 a0 = a[0], a1 = a[1];
   const u32 b0 = b[0], b1 = b[1];
+  u32 E0 = 0, E1 = 0, E2 = 0, E3 = 0;
+  u32 O0 = 0, O1 = 0, O2 = 0;
   asm("{\n\t"
-      ".reg .u64 p<2>; .reg .u32 l<2>, h<2>;\n\t"
-      "mul.wide.u32 p0, %3, %4;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %3, %5;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mov.u32 %0, l0;\n\t"
-      "add.cc.u32 %1, l1, h0;\n\t"
-      "addc.u32 %2, h1, 0;\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
       "}"
-      : "=r"(t0), "=r"(t1), "=r"(t2)
-      : "r"(a0), "r"(b0), "r"(b1));
+      : "+r"(E0), "+r"(E1), "+r"(E2)
+      : "r"(a0), "r"(b0));
   asm("{\n\t"
-      ".reg .u64 p<2>; .reg .u32 l<2>, h<2>;\n\t"
-      "mul.wide.u32 p0, %3, %4;\n\t"
-      "mov.b64 {l0, h0}, p0;\n\t"
-      "mul.wide.u32 p1, %3, %5;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "add.cc.u32 %0, %0, l0;\n\t"
-      "addc.cc.u32 %1, %1, l1;\n\t"
-      "addc.u32 %2, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, h0;\n\t"
-      "addc.u32 %2, %2, h1;\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
       "}"
-      : "+r"(t1), "+r"(t2), "=r"(t3)
-      : "r"(a1), "r"(b0), "r"(b1));
+      : "+r"(O0), "+r"(O1), "+r"(O2)
+      : "r"(a0), "r"(b1));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %2, %3, %0;\n\t"
+      "madc.hi.u32 %1, %2, %3, %1;\n\t"
+      "}"
+      : "+r"(E2), "+r"(E3)
+      : "r"(a1), "r"(b1));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
+      "}"
+      : "+r"(O0), "+r"(O1), "+r"(O2)
+      : "r"(a1), "r"(b0));
+  u32 t0, t1, t2, t3;
+  asm("{\n\t"
+      "mov.u32 %0, %4;\n\t"
+      "add.cc.u32 %1, %5, %8;\n\t"
+      "addc.cc.u32 %2, %6, %9;\n\t"
+      "addc.u32 %3, %7, %10;\n\t"
+      "}"
+      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3)
+      : "r"(E0), "r"(E1), "r"(E2), "r"(E3), "r"(O0), "r"(O1), "r"(O2));
   t[0] = t0;
   t[1] = t1;
   t[2] = t2;
   t[3] = t3;
 }
 
-// t[0..4) = a^2: the cross products row by row as in the product (row i
-// adds a[i] * a[i+1 ..] at t[2i+1 ..]), then t = 2t + the squares, by carry chains.
+// t[0..4) = a^2: cross products into E and O as in the product, s = E + O,
+// t = 2s, then the squares a_i^2 by one carry chain over the even pairs.
 DEVICE_FN void sqr2(const u32* a, u32* t) {
-  u32 t0, t1, t2, t3;
   const u32 a0 = a[0], a1 = a[1];
+  u32 E0 = 0, E1 = 0, E2 = 0, E3 = 0;
+  u32 O0 = 0, O1 = 0, O2 = 0;
   asm("{\n\t"
-      ".reg .u64 p<2>; .reg .u32 l<2>, h<2>;\n\t"
-      "mul.wide.u32 p1, %2, %3;\n\t"
-      "mov.b64 {l1, h1}, p1;\n\t"
-      "mov.u32 %0, l1;\n\t"
-      "mov.u32 %1, h1;\n\t"
+      "mad.lo.cc.u32 %0, %3, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %3, %4, %1;\n\t"
+      "addc.u32 %2, %2, 0;\n\t"
       "}"
-      : "=r"(t1), "=r"(t2)
+      : "+r"(O0), "+r"(O1), "+r"(O2)
       : "r"(a0), "r"(a1));
+  u32 t0, t1, t2, t3;
   asm("{\n\t"
-      ".reg .u64 q<2>; .reg .u32 s<2>, z<2>;\n\t"
-      "mul.wide.u32 q0, %4, %4;\n\t"
-      "mov.b64 {s0, z0}, q0;\n\t"
-      "mul.wide.u32 q1, %5, %5;\n\t"
-      "mov.b64 {s1, z1}, q1;\n\t"
-      "add.cc.u32 %1, %1, %1;\n\t"
-      "addc.cc.u32 %2, %2, %2;\n\t"
-      "addc.u32 %3, 0, 0;\n\t"
-      "mov.u32 %0, s0;\n\t"
-      "add.cc.u32 %1, %1, z0;\n\t"
-      "addc.cc.u32 %2, %2, s1;\n\t"
-      "addc.u32 %3, %3, z1;\n\t"
+      ".reg .u32 s<4>;\n\t"
+      "mov.u32 s0, 0;\n\t"
+      "add.cc.u32 s1, %5, %8;\n\t"
+      "addc.cc.u32 s2, %6, %9;\n\t"
+      "addc.u32 s3, %7, %10;\n\t"
+      "add.cc.u32 %1, s1, s1;\n\t"
+      "addc.cc.u32 %2, s2, s2;\n\t"
+      "addc.u32 %3, s3, s3;\n\t"
+      "mov.u32 %0, 0;\n\t"
       "}"
-      : "=r"(t0), "+r"(t1), "+r"(t2), "=r"(t3)
+      : "=r"(t0), "=r"(t1), "=r"(t2), "=r"(t3)
+      : "r"(E0), "r"(E1), "r"(E2), "r"(E3), "r"(O0), "r"(O1), "r"(O2));
+  asm("{\n\t"
+      "mad.lo.cc.u32 %0, %4, %4, %0;\n\t"
+      "madc.hi.cc.u32 %1, %4, %4, %1;\n\t"
+      "madc.lo.cc.u32 %2, %5, %5, %2;\n\t"
+      "madc.hi.u32 %3, %5, %5, %3;\n\t"
+      "}"
+      : "+r"(t0), "+r"(t1), "+r"(t2), "+r"(t3)
       : "r"(a0), "r"(a1));
   t[0] = t0;
   t[1] = t1;
@@ -1586,57 +1526,44 @@ DEVICE_FN void reduce2_small_w(const u32* t, u32 C, u32* r) {
   r[1] = r1;
 }
 
-// t mod p for secp256k1's p = 2^256 - (2^32 + 977), canonical. First fold:
-// t[8..16) * 977 and t[8..16) one word up, into t[0..8), by carry chains;
-// the top word c (34 bits: c + 2^32 c2) folds once more into r0..r2. A carry
-// past r2, a third fold, and r >= p are rare (2^-32 and below): branches.
+// t mod p for secp256k1's p = 2^256 - (2^32 + 977), canonical: t_lo plus the even
+// products t[8+2m]*977 by one carry chain over the pairs of t_lo; the odd ones
+// t[9+2m]*977 plus the pair {t[9+2m], t[8+2m]} (t_hi one word up) by another;
+// r = E + O; the top (c + 2^32 c2) folds once more into r0..r2. A carry past r2,
+// a third fold, and r >= p are rare (2^-32 and below): branches.
 DEVICE_FN u256 reduce8_secp(const u32* t) {
   u32 r0, r1, r2, r3, r4, r5, r6, r7, s;
   const u32 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3], t4 = t[4], t5 = t[5], t6 = t[6], t7 = t[7], t8 = t[8], t9 = t[9], t10 = t[10], t11 = t[11], t12 = t[12], t13 = t[13], t14 = t[14], t15 = t[15];
   asm("{\n\t"
-      ".reg .u64 q<8>, x; .reg .u32 ql<8>, qh<8>, xl, xh, c, c2;\n\t"
-      "mul.wide.u32 q0, %17, 977;\n\t"
-      "mov.b64 {ql0, qh0}, q0;\n\t"
-      "mul.wide.u32 q1, %18, 977;\n\t"
-      "mov.b64 {ql1, qh1}, q1;\n\t"
-      "mul.wide.u32 q2, %19, 977;\n\t"
-      "mov.b64 {ql2, qh2}, q2;\n\t"
-      "mul.wide.u32 q3, %20, 977;\n\t"
-      "mov.b64 {ql3, qh3}, q3;\n\t"
-      "mul.wide.u32 q4, %21, 977;\n\t"
-      "mov.b64 {ql4, qh4}, q4;\n\t"
-      "mul.wide.u32 q5, %22, 977;\n\t"
-      "mov.b64 {ql5, qh5}, q5;\n\t"
-      "mul.wide.u32 q6, %23, 977;\n\t"
-      "mov.b64 {ql6, qh6}, q6;\n\t"
-      "mul.wide.u32 q7, %24, 977;\n\t"
-      "mov.b64 {ql7, qh7}, q7;\n\t"
-      "add.cc.u32 %0, %9, ql0;\n\t"
-      "addc.cc.u32 %1, %10, ql1;\n\t"
-      "addc.cc.u32 %2, %11, ql2;\n\t"
-      "addc.cc.u32 %3, %12, ql3;\n\t"
-      "addc.cc.u32 %4, %13, ql4;\n\t"
-      "addc.cc.u32 %5, %14, ql5;\n\t"
-      "addc.cc.u32 %6, %15, ql6;\n\t"
-      "addc.cc.u32 %7, %16, ql7;\n\t"
-      "addc.u32 c, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, qh0;\n\t"
-      "addc.cc.u32 %2, %2, qh1;\n\t"
-      "addc.cc.u32 %3, %3, qh2;\n\t"
-      "addc.cc.u32 %4, %4, qh3;\n\t"
-      "addc.cc.u32 %5, %5, qh4;\n\t"
-      "addc.cc.u32 %6, %6, qh5;\n\t"
-      "addc.cc.u32 %7, %7, qh6;\n\t"
-      "addc.u32 c, c, qh7;\n\t"
-      "add.cc.u32 %1, %1, %17;\n\t"
-      "addc.cc.u32 %2, %2, %18;\n\t"
-      "addc.cc.u32 %3, %3, %19;\n\t"
-      "addc.cc.u32 %4, %4, %20;\n\t"
-      "addc.cc.u32 %5, %5, %21;\n\t"
-      "addc.cc.u32 %6, %6, %22;\n\t"
-      "addc.cc.u32 %7, %7, %23;\n\t"
-      "addc.cc.u32 c, c, %24;\n\t"
-      "addc.u32 c2, 0, 0;\n\t"
+      ".reg .u64 x; .reg .u32 o<10>, e8, xl, xh, c, c2, k;\n\t"
+      "mov.u32 k, 977;\n\t"
+      "mad.lo.cc.u32 %0, %17, k, %9;\n\t"
+      "madc.hi.cc.u32 %1, %17, k, %10;\n\t"
+      "madc.lo.cc.u32 %2, %19, k, %11;\n\t"
+      "madc.hi.cc.u32 %3, %19, k, %12;\n\t"
+      "madc.lo.cc.u32 %4, %21, k, %13;\n\t"
+      "madc.hi.cc.u32 %5, %21, k, %14;\n\t"
+      "madc.lo.cc.u32 %6, %23, k, %15;\n\t"
+      "madc.hi.cc.u32 %7, %23, k, %16;\n\t"
+      "addc.u32 e8, 0, 0;\n\t"
+      "mad.lo.cc.u32 o1, %18, k, %17;\n\t"
+      "madc.hi.cc.u32 o2, %18, k, %18;\n\t"
+      "madc.lo.cc.u32 o3, %20, k, %19;\n\t"
+      "madc.hi.cc.u32 o4, %20, k, %20;\n\t"
+      "madc.lo.cc.u32 o5, %22, k, %21;\n\t"
+      "madc.hi.cc.u32 o6, %22, k, %22;\n\t"
+      "madc.lo.cc.u32 o7, %24, k, %23;\n\t"
+      "madc.hi.cc.u32 o8, %24, k, %24;\n\t"
+      "addc.u32 o9, 0, 0;\n\t"
+      "add.cc.u32 %1, %1, o1;\n\t"
+      "addc.cc.u32 %2, %2, o2;\n\t"
+      "addc.cc.u32 %3, %3, o3;\n\t"
+      "addc.cc.u32 %4, %4, o4;\n\t"
+      "addc.cc.u32 %5, %5, o5;\n\t"
+      "addc.cc.u32 %6, %6, o6;\n\t"
+      "addc.cc.u32 %7, %7, o7;\n\t"
+      "addc.cc.u32 c, e8, o8;\n\t"
+      "addc.u32 c2, o9, 0;\n\t"
       "mul.wide.u32 x, c, 977;\n\t"
       "mov.b64 {xl, xh}, x;\n\t"
       "mad.lo.u32 xh, c2, 977, xh;\n\t"
@@ -1677,48 +1604,39 @@ DEVICE_FN u256 reduce8_secp(const u32* t) {
                (u64)r6 | ((u64)r7 << 32));
 }
 
-// t folded to 8 words modulo 2^256 - C for C < 2^16, not canonical: the first
-// fold as in the reductions above, the second into r0 and r1; returns the
-// carry out of r1 (probability C^2/2^64 or less), for fold_fix.
+// t folded to 8 words modulo 2^256 - C for C < 2^16, not canonical; returns
+// the carry out of r1 (probability C^2/2^64 or less), for fold_fix.
 DEVICE_FN u32 fold8_small(const u32* t, u32 C, u32* r) {
   u32 r0, r1, r2, r3, r4, r5, r6, r7, c;
   const u32 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3], t4 = t[4], t5 = t[5], t6 = t[6], t7 = t[7], t8 = t[8], t9 = t[9], t10 = t[10], t11 = t[11], t12 = t[12], t13 = t[13], t14 = t[14], t15 = t[15];
   asm("{\n\t"
-      ".reg .u64 q<8>; .reg .u32 ql<8>, qh<8>, x;\n\t"
-      "mul.wide.u32 q0, %17, %25;\n\t"
+      ".reg .u64 q<4>; .reg .u32 ql<4>, qh<4>, x, top;\n\t"
+      "mad.lo.cc.u32 %0, %17, %25, %9;\n\t"
+      "madc.hi.cc.u32 %1, %17, %25, %10;\n\t"
+      "madc.lo.cc.u32 %2, %19, %25, %11;\n\t"
+      "madc.hi.cc.u32 %3, %19, %25, %12;\n\t"
+      "madc.lo.cc.u32 %4, %21, %25, %13;\n\t"
+      "madc.hi.cc.u32 %5, %21, %25, %14;\n\t"
+      "madc.lo.cc.u32 %6, %23, %25, %15;\n\t"
+      "madc.hi.cc.u32 %7, %23, %25, %16;\n\t"
+      "addc.u32 top, 0, 0;\n\t"
+      "mul.wide.u32 q0, %18, %25;\n\t"
       "mov.b64 {ql0, qh0}, q0;\n\t"
-      "mul.wide.u32 q1, %18, %25;\n\t"
+      "mul.wide.u32 q1, %20, %25;\n\t"
       "mov.b64 {ql1, qh1}, q1;\n\t"
-      "mul.wide.u32 q2, %19, %25;\n\t"
+      "mul.wide.u32 q2, %22, %25;\n\t"
       "mov.b64 {ql2, qh2}, q2;\n\t"
-      "mul.wide.u32 q3, %20, %25;\n\t"
+      "mul.wide.u32 q3, %24, %25;\n\t"
       "mov.b64 {ql3, qh3}, q3;\n\t"
-      "mul.wide.u32 q4, %21, %25;\n\t"
-      "mov.b64 {ql4, qh4}, q4;\n\t"
-      "mul.wide.u32 q5, %22, %25;\n\t"
-      "mov.b64 {ql5, qh5}, q5;\n\t"
-      "mul.wide.u32 q6, %23, %25;\n\t"
-      "mov.b64 {ql6, qh6}, q6;\n\t"
-      "mul.wide.u32 q7, %24, %25;\n\t"
-      "mov.b64 {ql7, qh7}, q7;\n\t"
-      "add.cc.u32 %0, %9, ql0;\n\t"
-      "addc.cc.u32 %1, %10, ql1;\n\t"
-      "addc.cc.u32 %2, %11, ql2;\n\t"
-      "addc.cc.u32 %3, %12, ql3;\n\t"
-      "addc.cc.u32 %4, %13, ql4;\n\t"
-      "addc.cc.u32 %5, %14, ql5;\n\t"
-      "addc.cc.u32 %6, %15, ql6;\n\t"
-      "addc.cc.u32 %7, %16, ql7;\n\t"
-      "addc.u32 %8, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, qh0;\n\t"
-      "addc.cc.u32 %2, %2, qh1;\n\t"
-      "addc.cc.u32 %3, %3, qh2;\n\t"
-      "addc.cc.u32 %4, %4, qh3;\n\t"
-      "addc.cc.u32 %5, %5, qh4;\n\t"
-      "addc.cc.u32 %6, %6, qh5;\n\t"
-      "addc.cc.u32 %7, %7, qh6;\n\t"
-      "addc.u32 %8, %8, qh7;\n\t"
-      "mul.lo.u32 x, %8, %25;\n\t"
+      "add.cc.u32 %1, %1, ql0;\n\t"
+      "addc.cc.u32 %2, %2, qh0;\n\t"
+      "addc.cc.u32 %3, %3, ql1;\n\t"
+      "addc.cc.u32 %4, %4, qh1;\n\t"
+      "addc.cc.u32 %5, %5, ql2;\n\t"
+      "addc.cc.u32 %6, %6, qh2;\n\t"
+      "addc.cc.u32 %7, %7, ql3;\n\t"
+      "addc.u32 top, top, qh3;\n\t"
+      "mul.lo.u32 x, top, %25;\n\t"
       "add.cc.u32 %0, %0, x;\n\t"
       "addc.cc.u32 %1, %1, 0;\n\t"
       "addc.u32 %8, 0, 0;\n\t"
@@ -1736,32 +1654,27 @@ DEVICE_FN u32 fold8_small(const u32* t, u32 C, u32* r) {
   return c;
 }
 
-// t folded to 4 words modulo 2^128 - C for C < 2^16, not canonical: the first
-// fold as in the reductions above, the second into r0 and r1; returns the
-// carry out of r1 (probability C^2/2^64 or less), for fold_fix.
+// t folded to 4 words modulo 2^128 - C for C < 2^16, not canonical; returns
+// the carry out of r1 (probability C^2/2^64 or less), for fold_fix.
 DEVICE_FN u32 fold4_small(const u32* t, u32 C, u32* r) {
   u32 r0, r1, r2, r3, c;
   const u32 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3], t4 = t[4], t5 = t[5], t6 = t[6], t7 = t[7];
   asm("{\n\t"
-      ".reg .u64 q<4>; .reg .u32 ql<4>, qh<4>, x;\n\t"
-      "mul.wide.u32 q0, %9, %13;\n\t"
+      ".reg .u64 q<2>; .reg .u32 ql<2>, qh<2>, x, top;\n\t"
+      "mad.lo.cc.u32 %0, %9, %13, %5;\n\t"
+      "madc.hi.cc.u32 %1, %9, %13, %6;\n\t"
+      "madc.lo.cc.u32 %2, %11, %13, %7;\n\t"
+      "madc.hi.cc.u32 %3, %11, %13, %8;\n\t"
+      "addc.u32 top, 0, 0;\n\t"
+      "mul.wide.u32 q0, %10, %13;\n\t"
       "mov.b64 {ql0, qh0}, q0;\n\t"
-      "mul.wide.u32 q1, %10, %13;\n\t"
+      "mul.wide.u32 q1, %12, %13;\n\t"
       "mov.b64 {ql1, qh1}, q1;\n\t"
-      "mul.wide.u32 q2, %11, %13;\n\t"
-      "mov.b64 {ql2, qh2}, q2;\n\t"
-      "mul.wide.u32 q3, %12, %13;\n\t"
-      "mov.b64 {ql3, qh3}, q3;\n\t"
-      "add.cc.u32 %0, %5, ql0;\n\t"
-      "addc.cc.u32 %1, %6, ql1;\n\t"
-      "addc.cc.u32 %2, %7, ql2;\n\t"
-      "addc.cc.u32 %3, %8, ql3;\n\t"
-      "addc.u32 %4, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, qh0;\n\t"
-      "addc.cc.u32 %2, %2, qh1;\n\t"
-      "addc.cc.u32 %3, %3, qh2;\n\t"
-      "addc.u32 %4, %4, qh3;\n\t"
-      "mul.lo.u32 x, %4, %13;\n\t"
+      "add.cc.u32 %1, %1, ql0;\n\t"
+      "addc.cc.u32 %2, %2, qh0;\n\t"
+      "addc.cc.u32 %3, %3, ql1;\n\t"
+      "addc.u32 top, top, qh1;\n\t"
+      "mul.lo.u32 x, top, %13;\n\t"
       "add.cc.u32 %0, %0, x;\n\t"
       "addc.cc.u32 %1, %1, 0;\n\t"
       "addc.u32 %4, 0, 0;\n\t"
@@ -1775,24 +1688,21 @@ DEVICE_FN u32 fold4_small(const u32* t, u32 C, u32* r) {
   return c;
 }
 
-// t folded to 2 words modulo 2^64 - C for C < 2^16, not canonical: the first
-// fold as in the reductions above, the second into r0 and r1; returns the
-// carry out of r1 (probability C^2/2^64 or less), for fold_fix.
+// t folded to 2 words modulo 2^64 - C for C < 2^16, not canonical; returns
+// the carry out of r1 (probability C^2/2^64 or less), for fold_fix.
 DEVICE_FN u32 fold2_small(const u32* t, u32 C, u32* r) {
   u32 r0, r1, c;
   const u32 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3];
   asm("{\n\t"
-      ".reg .u64 q<2>; .reg .u32 ql<2>, qh<2>, x;\n\t"
-      "mul.wide.u32 q0, %5, %7;\n\t"
+      ".reg .u64 q<1>; .reg .u32 ql<1>, qh<1>, x, top;\n\t"
+      "mad.lo.cc.u32 %0, %5, %7, %3;\n\t"
+      "madc.hi.cc.u32 %1, %5, %7, %4;\n\t"
+      "addc.u32 top, 0, 0;\n\t"
+      "mul.wide.u32 q0, %6, %7;\n\t"
       "mov.b64 {ql0, qh0}, q0;\n\t"
-      "mul.wide.u32 q1, %6, %7;\n\t"
-      "mov.b64 {ql1, qh1}, q1;\n\t"
-      "add.cc.u32 %0, %3, ql0;\n\t"
-      "addc.cc.u32 %1, %4, ql1;\n\t"
-      "addc.u32 %2, 0, 0;\n\t"
-      "add.cc.u32 %1, %1, qh0;\n\t"
-      "addc.u32 %2, %2, qh1;\n\t"
-      "mul.lo.u32 x, %2, %7;\n\t"
+      "add.cc.u32 %1, %1, ql0;\n\t"
+      "addc.u32 top, top, qh0;\n\t"
+      "mul.lo.u32 x, top, %7;\n\t"
       "add.cc.u32 %0, %0, x;\n\t"
       "addc.cc.u32 %1, %1, 0;\n\t"
       "addc.u32 %2, 0, 0;\n\t"
@@ -2029,7 +1939,9 @@ DEVICE_FN void fold_fix(u32* r, int n, u32 c, u32 C) {
 // of code) cost the whole kernel 7.5 % - while the powers alone ran 2 %
 // faster that way: the instruction cache. C99's _Pragma, so that OpenCL C 1.2
 // compilers take it too (opencl_unroll_hint is 2.0).
+#ifndef BC3_UNROLL1
 #define BC3_UNROLL1 _Pragma("unroll 1")
+#endif
 
 // ---- Two independent chains at once ----
 //
@@ -2255,15 +2167,29 @@ DEVICE_FN u128 powtab128(GLOBAL const u64* tab, u128 e) {
   }
   return r;
 }
+// Rows of BC3_POW256_BITS bits: row i holds g^(d * 2^(BITS*i)) for every
+// digit d (8 bits: FixedPower's own table; wider: fewer products, bigger
+// table - see kernel_head.cl).
 DEVICE_FN u256 tab256(GLOBAL const u64* tab, u32 row, u32 b) {
-  u32 k = (row * 256u + b) * 4u;
+  u32 k = (row * BC3_POW256_ENTRIES + b) * 4u;
   return mk256(tab[k], tab[k + 1], tab[k + 2], tab[k + 3]);
 }
+#if BC3_POW256_BITS == 8
+// By pointer: e indexed at run time lives in local memory, and a copy per
+// call stored it again for every product (8 stores a product).
+DEVICE_FN u32 pow_digit(const u256* e, u32 i) { return (u32)((e->v[i >> 3] >> (8u * (i & 7u))) & 255u); }
+#else
+DEVICE_FN u32 pow_digit(const u256* e, u32 i) {
+  const u32 pos = i * BC3_POW256_BITS, limb = pos >> 6, sh = pos & 63u;
+  u64 v = e->v[limb] >> sh;
+  if (sh + BC3_POW256_BITS > 64u && limb + 1u < 4u) v |= e->v[limb + 1u] << (64u - sh);
+  return (u32)v & (BC3_POW256_ENTRIES - 1u);
+}
+#endif
 // One product at a time; the mix uses powtab256x2 below, the lab tests both.
 DEVICE_BIG u256 powtab256(GLOBAL const u64* tab, u256 e) {
-  u256 r = tab256(tab, 0, (u32)(e.v[0] & 255u));
-  for (u32 i = 1; i < 32; i++)
-    r = mulmod256(r, tab256(tab, i, (u32)((e.v[i >> 3] >> (8 * (i & 7))) & 255u)), C_F256);
+  u256 r = tab256(tab, 0, pow_digit(&e, 0));
+  for (u32 i = 1; i < BC3_POW256_ROWS; i++) r = mulmod256(r, tab256(tab, i, pow_digit(&e, i)), C_F256);
   return r;
 }
 
@@ -2272,15 +2198,15 @@ DEVICE_BIG u256 powtab256(GLOBAL const u64* tab, u256 e) {
 // again, is not used).
 DEVICE_BIG void powtab256x2(GLOBAL const u64* tab, u256 e, u256 f, u256* re, u256* rf) {
   u32 r[8], s[8], x[8], y[8];
-  split256(tab256(tab, 0, (u32)(e.v[0] & 255u)), r);
-  split256(tab256(tab, 0, (u32)(f.v[0] & 255u)), s);
-  u256 ne = tab256(tab, 1, (u32)((e.v[0] >> 8) & 255u)), nf = tab256(tab, 1, (u32)((f.v[0] >> 8) & 255u));
-  for (u32 i = 1; i < 32; i++) {
+  split256(tab256(tab, 0, pow_digit(&e, 0)), r);
+  split256(tab256(tab, 0, pow_digit(&f, 0)), s);
+  u256 ne = tab256(tab, 1, pow_digit(&e, 1)), nf = tab256(tab, 1, pow_digit(&f, 1));
+  for (u32 i = 1; i < BC3_POW256_ROWS; i++) {
     split256(ne, x);
     split256(nf, y);
-    const u32 j = (i + 1u) & 31u, sh = 8u * (j & 7u);
-    ne = tab256(tab, j, (u32)((e.v[j >> 3] >> sh) & 255u));
-    nf = tab256(tab, j, (u32)((f.v[j >> 3] >> sh) & 255u));
+    const u32 j = (i + 1u) % BC3_POW256_ROWS;
+    ne = tab256(tab, j, pow_digit(&e, j));
+    nf = tab256(tab, j, pow_digit(&f, j));
     mul8x2(r, x, s, y, (u32)C_F256);
   }
   *re = norm256(join256(r), C_F256);
@@ -2438,6 +2364,7 @@ DEVICE_FN u256 from_s30(s30 a) {
 // 30 divsteps on the bottom limbs; the transition matrix [u v; q r] scaled by 2^30.
 DEVICE_FN i32 divsteps_30(i32 zeta, u32 f0, u32 g0, i32* tu, i32* tv, i32* tq, i32* tr) {
   u32 u = 1, v = 0, q = 0, r = 1, f = f0, g = g0;
+#ifdef BC3_DIVSTEPS_MASKS
   for (int i = 0; i < 30; i++) {
     u32 mask1 = (u32)(zeta >> 31);
     u32 mask2 = 0u - (g & 1u);
@@ -2456,6 +2383,29 @@ DEVICE_FN i32 divsteps_30(i32 zeta, u32 f0, u32 g0, i32* tu, i32* tv, i32* tq, i
     u <<= 1;
     v <<= 1;
   }
+#else
+  // libsecp256k1's masks, as multipliers: (x ^ c) - c and then & mask2 and
+  // an add is four instructions a variable; m in {-1, 0, 1} makes the same
+  // conditional (negated) addition one multiply-add, and the swap's 0/1
+  // another.
+  for (int i = 0; i < 30; i++) {
+    const u32 c1 = (u32)(zeta >> 31);   // -1: zeta < 0
+    const u32 c2 = 0u - (g & 1u);       // -1: g odd
+    const u32 m = c2 & (c1 | 1u);       // g odd: -1 if zeta < 0 else 1; g even: 0
+    g += f * m;
+    q += u * m;
+    r += v * m;
+    const u32 s = c1 & c2;              // -1: swap
+    zeta = (i32)(((u32)zeta ^ s) - 1u);
+    const u32 sw = s & 1u;
+    f += g * sw;
+    u += q * sw;
+    v += r * sw;
+    g >>= 1;
+    u <<= 1;
+    v <<= 1;
+  }
+#endif
   *tu = (i32)u;
   *tv = (i32)v;
   *tq = (i32)q;
@@ -2463,8 +2413,15 @@ DEVICE_FN i32 divsteps_30(i32 zeta, u32 f0, u32 g0, i32* tu, i32* tv, i32* tq, i
   return zeta;
 }
 
+// The two moduli in libsecp256k1's signed30 form (consts.h) share one shape:
+// M0 + M1 * 2^30 + 65536 * 2^240, limbs 2..7 zero. Passed as constants into
+// inlined code, the products with the zero limbs drop out - read from
+// constant memory they were 7 of 9 (F256) and 6 of 9 (secp256k1) wasted
+// multiplications per variable per batch.
+DEVICE_FN i32 mlimb(int i, i32 M0, i32 M1) { return i == 0 ? M0 : i == 1 ? M1 : i == 8 ? 65536 : 0; }
+
 // (t / 2^30) * [d, e] mod the modulus; d, e stay in (-2*modulus, modulus).
-DEVICE_FN void update_de_30(s30* d, s30* e, i32 u, i32 v, i32 q, i32 r, CONST_PTR const i32* M, u32 inv30) {
+DEVICE_FN void update_de_30(s30* d, s30* e, i32 u, i32 v, i32 q, i32 r, const i32 M0, const i32 M1, const u32 inv30) {
   i32 sd = d->v[8] >> 31, se = e->v[8] >> 31;
   i32 md = (u & sd) + (v & se);
   i32 me = (q & sd) + (r & se);
@@ -2473,17 +2430,21 @@ DEVICE_FN void update_de_30(s30* d, s30* e, i32 u, i32 v, i32 q, i32 r, CONST_PT
   i64 ce = (i64)q * di + (i64)r * ei;
   md = (i32)((u32)md - ((inv30 * (u32)cd + (u32)md) & (u32)M30));
   me = (i32)((u32)me - ((inv30 * (u32)ce + (u32)me) & (u32)M30));
-  cd += (i64)M[0] * md;
-  ce += (i64)M[0] * me;
+  cd += (i64)M0 * md;
+  ce += (i64)M0 * me;
   cd >>= 30;
   ce >>= 30;
+#pragma unroll
   for (int i = 1; i < 9; i++) {
     di = d->v[i];
     ei = e->v[i];
     cd += (i64)u * di + (i64)v * ei;
     ce += (i64)q * di + (i64)r * ei;
-    cd += (i64)M[i] * md;
-    ce += (i64)M[i] * me;
+    const i32 mi = mlimb(i, M0, M1);
+    if (mi != 0) {
+      cd += (i64)mi * md;
+      ce += (i64)mi * me;
+    }
     d->v[i - 1] = (i32)cd & M30;
     cd >>= 30;
     e->v[i - 1] = (i32)ce & M30;
@@ -2515,14 +2476,16 @@ DEVICE_FN void update_fg_30(s30* f, s30* g, i32 u, i32 v, i32 q, i32 r) {
 }
 
 // r from (-2*modulus, modulus), negated if sign < 0, to [0, modulus).
-DEVICE_FN void normalize_30(s30* r, i32 sign, CONST_PTR const i32* M) {
+DEVICE_FN void normalize_30(s30* r, i32 sign, const i32 M0, const i32 M1) {
   i32 cond_add = r->v[8] >> 31;
-  for (int i = 0; i < 9; i++) r->v[i] += M[i] & cond_add;
+#pragma unroll
+  for (int i = 0; i < 9; i++) r->v[i] += mlimb(i, M0, M1) & cond_add;
   i32 cond_negate = sign >> 31;
   for (int i = 0; i < 9; i++) r->v[i] = (r->v[i] ^ cond_negate) - cond_negate;
   for (int i = 0; i < 8; i++) { r->v[i + 1] += r->v[i] >> 30; r->v[i] &= M30; }
   cond_add = r->v[8] >> 31;
-  for (int i = 0; i < 9; i++) r->v[i] += M[i] & cond_add;
+#pragma unroll
+  for (int i = 0; i < 9; i++) r->v[i] += mlimb(i, M0, M1) & cond_add;
   for (int i = 0; i < 8; i++) { r->v[i + 1] += r->v[i] >> 30; r->v[i] &= M30; }
 }
 
@@ -2533,16 +2496,16 @@ DEVICE_FN void normalize_30(s30* r, i32 sign, CONST_PTR const i32* M) {
 // then on a batch leaves f alone and only moves d by a multiple of the
 // modulus - normalize_30 maps every such d to the same residue. So from the
 // 17th batch on the loop ends as soon as g is 0: 18 batches for a warp.
-DEVICE_BIG u256 modinv256(u256 x, CONST_PTR const i32* M, u32 inv30) {
+DEVICE_FN u256 modinv256(u256 x, const i32 M0, const i32 M1, const u32 inv30) {
   s30 d, e, f, g;
-  for (int i = 0; i < 9; i++) { d.v[i] = 0; e.v[i] = 0; f.v[i] = M[i]; }
+  for (int i = 0; i < 9; i++) { d.v[i] = 0; e.v[i] = 0; f.v[i] = mlimb(i, M0, M1); }
   e.v[0] = 1;
   g = to_s30(x);
   i32 zeta = -1;
   for (int i = 0; i < 20; i++) {
     i32 tu, tv, tq, tr;
     zeta = divsteps_30(zeta, (u32)f.v[0], (u32)g.v[0], &tu, &tv, &tq, &tr);
-    update_de_30(&d, &e, tu, tv, tq, tr, M, inv30);
+    update_de_30(&d, &e, tu, tv, tq, tr, M0, M1, inv30);
     update_fg_30(&f, &g, tu, tv, tq, tr);
     if (i >= 16) {
       i32 any = 0;
@@ -2550,7 +2513,7 @@ DEVICE_BIG u256 modinv256(u256 x, CONST_PTR const i32* M, u32 inv30) {
       if (any == 0) break;
     }
   }
-  normalize_30(&d, f.v[8], M);
+  normalize_30(&d, f.v[8], M0, M1);
   return from_s30(d);
 }
 
@@ -2601,8 +2564,9 @@ DEVICE_BIG u256 inv_f256_fermat(u256 a) {
 
 // The inversions used by BC3Mix: safegcd. The Fermat chains above stay as
 // the slower reference they were measured against.
-DEVICE_FN u256 inv_secp(u256 a) { return modinv256(a, BC3_MODINV_SECP, BC3_MODINV_SECP_INV30); }
-DEVICE_FN u256 inv_f256(u256 a) { return modinv256(norm256(a, C_F256), BC3_MODINV_F256, BC3_MODINV_F256_INV30); }
+// The signed30 limbs M0, M1 of each modulus as in consts.h (BC3_MODINV_*).
+DEVICE_BIG u256 inv_secp(u256 a) { return modinv256(a, -0x3D1, -4, BC3_MODINV_SECP_INV30); }
+DEVICE_BIG u256 inv_f256(u256 a) { return modinv256(norm256(a, C_F256), -36113, 0, BC3_MODINV_F256_INV30); }
 
 // Phase profile hooks (prof.cu defines them; nothing anywhere else).
 #ifndef BC3_PROF_BEGIN
@@ -2689,10 +2653,10 @@ DEVICE_FN u64 load_be64(const u8* p) {
   return v;
 }
 
-DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
+// Expansion and stages 1-3: the h1, h2 that stage 4 starts from.
+DEVICE_BIG void bc3mix_s123(GLOBAL const u64* tables, const u8* in, u256* oh1, u256* oh2) {
   GLOBAL const u64* T64 = tables + BC3_TABLE_POW64;
   GLOBAL const u64* T128 = tables + BC3_TABLE_POW128;
-  GLOBAL const u64* T256 = tables + BC3_TABLE_POW256;
   GLOBAL const u64* TC = tables + BC3_TABLE_CURVE;
 
   BC3_PROF_BEGIN();
@@ -2799,27 +2763,50 @@ DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
     BC3_PROF_MARK(9);
   }
 
-  // ---- stage 4: table powers and inversions mod 2^256 - 36113 ----
-  u256 u1 = h1, u2 = h2;
-  for (int i = 0; i < 64; i++) {
-    u256 fc = c256(BC3_FINAL + 4 * i);
-    u256 g1, g2;
-    powtab256x2(T256, u1, u2, &g1, &g2);
-    u256 k1 = add256(g1, beta256(u2));
-    u256 k2 = add256(add256(g2, gamma256(u1, u2)), ch256(k1, u2, u1));
-    BC3_PROF_MARK(10);
-    u256 k3 = add256(add256(inv_f256(k2), beta256(u1)), beta256(xor256(xor256(u2, k1), fc)));
-    BC3_PROF_MARK(11);
-    u256 nu2 = add256(add256(xor256(k1, u1), maj256(k1, k2, u2)), beta256(k3));
-    u256 nu1 = add256(beta256(k1), k2);
-    u2 = nu2;
-    u1 = nu1;
-    BC3_PROF_MARK(12);
-  }
+  *oh1 = h1;
+  *oh2 = h2;
+}
+
+// ---- stage 4: table powers and inversions mod 2^256 - 36113 ----
+// A round is k1, k2 from the two table powers, then the inversion of k2, then
+// the new u1, u2; split around the inversion so two hashes can share one.
+DEVICE_FN void s4_pre(GLOBAL const u64* T256, u256 u1, u256 u2, u256* k1, u256* k2) {
+  u256 g1, g2;
+  powtab256x2(T256, u1, u2, &g1, &g2);
+  *k1 = add256(g1, beta256(u2));
+  *k2 = add256(add256(g2, gamma256(u1, u2)), ch256(*k1, u2, u1));
+}
+DEVICE_FN void s4_post(u256* u1, u256* u2, u256 k1, u256 k2, u256 ik2, int i) {
+  u256 fc = c256(BC3_FINAL + 4 * i);
+  u256 k3 = add256(add256(ik2, beta256(*u1)), beta256(xor256(xor256(*u2, k1), fc)));
+  u256 nu2 = add256(add256(xor256(k1, *u1), maj256(k1, k2, *u2)), beta256(k3));
+  u256 nu1 = add256(beta256(k1), k2);
+  *u2 = nu2;
+  *u1 = nu1;
+}
+DEVICE_FN void mix_out(u256 u1, u256 u2, u8* out) {
   u256 res = add256(u1, beta256(u2));
   for (int i = 0; i < 4; i++)
     for (int j = 0; j < 8; j++) out[i * 8 + j] = (u8)(res.v[3 - i] >> (56 - 8 * j));
 }
+
+DEVICE_BIG void bc3mix512(GLOBAL const u64* tables, const u8* in, u8* out) {
+  GLOBAL const u64* T256 = tables + BC3_TABLE_POW256;
+  u256 u1, u2;
+  bc3mix_s123(tables, in, &u1, &u2);
+  BC3_PROF_BEGIN();
+  for (int i = 0; i < 64; i++) {
+    u256 k1, k2;
+    s4_pre(T256, u1, u2, &k1, &k2);
+    BC3_PROF_MARK(10);
+    u256 ik2 = inv_f256(k2);
+    BC3_PROF_MARK(11);
+    s4_post(&u1, &u2, k1, k2, ik2, i);
+    BC3_PROF_MARK(12);
+  }
+  mix_out(u1, u2, out);
+}
+
 
 // =========================================================================
 // Standard hashes (standard_hashes.cpp), one-shot over private buffers.
@@ -3117,43 +3104,55 @@ DEVICE_FN u32 bc3_tag(u8* buf, int k) {
   return 47u + n;
 }
 
-DEVICE_BIG void bc3hash80(GLOBAL const u64* tables, const u8* header, u8* out) {
+// The six tagged standard hashes of the header (preimage = SHA3-512, the
+// input of BC3Mix) and the final SHA3-256 over them and the mix.
+struct bc3_parts { u8 preimage[64], s384[48], s512[64], r160[20], bs[32], bb[64]; };
+DEVICE_BIG void bc3hash_pre(const u8* header, struct bc3_parts* p) {
   u8 msg[58 + 80];
-  u8 preimage[64], mix[32], s384[48], s512[64], r160[20], bs[32], bb[64];
   u32 n;
-  BC3_PROF_BEGIN();
   n = bc3_tag(msg, 0);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
-  sha3(msg, n + 80u, 64u, preimage);
+  sha3(msg, n + 80u, 64u, p->preimage);
   n = bc3_tag(msg, 1);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
-  sha3(msg, n + 80u, 48u, s384);
+  sha3(msg, n + 80u, 48u, p->s384);
   n = bc3_tag(msg, 2);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
-  sha512(msg, n + 80u, s512);
+  sha512(msg, n + 80u, p->s512);
   n = bc3_tag(msg, 3);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
-  ripemd160(msg, n + 80u, r160);
+  ripemd160(msg, n + 80u, p->r160);
   n = bc3_tag(msg, 4);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
-  blake2s(BC3_PERSON_S, msg, n + 80u, bs);
+  blake2s(BC3_PERSON_S, msg, n + 80u, p->bs);
   n = bc3_tag(msg, 5);
   for (int i = 0; i < 80; i++) msg[n + i] = header[i];
-  blake2b(BC3_PERSON_B, msg, n + 80u, bb);
-  BC3_PROF_MARK(16);
-  bc3mix512(tables, preimage, mix);
-  BC3_PROF_MARK(17);
+  blake2b(BC3_PERSON_B, msg, n + 80u, p->bb);
+}
+DEVICE_BIG void bc3hash_fin(const struct bc3_parts* p, const u8* mix, u8* out) {
   u8 fin[56 + 48 + 32 + 64 + 20 + 32 + 64];
-  n = bc3_tag(fin, 6);
-  for (int i = 0; i < 48; i++) fin[n++] = s384[i];
+  u32 n = bc3_tag(fin, 6);
+  for (int i = 0; i < 48; i++) fin[n++] = p->s384[i];
   for (int i = 0; i < 32; i++) fin[n++] = mix[i];
-  for (int i = 0; i < 64; i++) fin[n++] = s512[i];
-  for (int i = 0; i < 20; i++) fin[n++] = r160[i];
-  for (int i = 0; i < 32; i++) fin[n++] = bs[i];
-  for (int i = 0; i < 64; i++) fin[n++] = bb[i];
+  for (int i = 0; i < 64; i++) fin[n++] = p->s512[i];
+  for (int i = 0; i < 20; i++) fin[n++] = p->r160[i];
+  for (int i = 0; i < 32; i++) fin[n++] = p->bs[i];
+  for (int i = 0; i < 64; i++) fin[n++] = p->bb[i];
   sha3(fin, n, 32u, out);
+}
+
+DEVICE_BIG void bc3hash80(GLOBAL const u64* tables, const u8* header, u8* out) {
+  struct bc3_parts p;
+  u8 mix[32];
+  BC3_PROF_BEGIN();
+  bc3hash_pre(header, &p);
+  BC3_PROF_MARK(16);
+  bc3mix512(tables, p.preimage, mix);
+  BC3_PROF_MARK(17);
+  bc3hash_fin(&p, mix, out);
   BC3_PROF_MARK(18);
 }
+
 
 // =========================================================================
 // Kernels.
