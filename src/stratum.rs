@@ -802,21 +802,21 @@ mod tests {
     }
 
     /// The fork over a real connection, as the pool runs it: a SHA3-256t
-    /// job, then at the fork height a job with bit 11 alone and the BC3Hash
-    /// start difficulty - `set_difficulty` before `notify`, which is what
-    /// binds the difficulty to the job. A CPU worker mines throughout; every
-    /// share is checked like the pool checks it. The miner must switch PoW
-    /// at once, never submit a share that fails its job, and take the
-    /// pool's answers at the fork - "stale: the proof of work has changed"
-    /// for SHA3-256t still in flight, "too many shares per second" while
-    /// vardiff catches up - as rejects to count, not as a reason to drop the
-    /// connection or stop. Then a retarget, and the pool going away.
+    /// job, as from a pool that is not past the fork, which the miner must
+    /// not mine at all - not a hash, not a share. Then at the fork height a
+    /// job with bit 11 alone and the BC3Hash start difficulty -
+    /// `set_difficulty` before `notify`, which is what binds the difficulty
+    /// to the job. A CPU worker mines throughout; every share is checked like
+    /// the pool checks it. The miner must start on BC3Hash at once, never
+    /// submit a share that fails its job, and take "too many shares per
+    /// second" while vardiff catches up as rejects to count, not as a reason
+    /// to drop the connection or stop. Then a retarget, and the pool going
+    /// away.
     #[cfg(feature = "bc3hash")]
     #[test]
     fn the_fork_over_a_pool_connection() {
         use crate::shared::{MiningPlan, SUBMIT_QUEUE};
         use std::sync::atomic::Ordering;
-        const STALE: &str = "stale: the proof of work has changed";
         const RATE_LIMITED: &str = "too many shares per second - difficulty will be raised";
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -871,25 +871,31 @@ mod tests {
 
         #[derive(Default, Debug)]
         struct Tally {
-            sha3_ok: u32,
-            stale: u32,
             bc3_ok: u32,
             limited: u32,
             retarget_ok: u32,
             bad: Vec<String>,
         }
         let mut t = Tally::default();
-        let mut forked: Option<Instant> = None;
         let mut first_bc3: Option<Duration> = None;
         let mut retargeted = false;
+
+        // Not past the fork: nothing to mine, and nothing is.
         sha3.announce(&mut pool, true);
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let quiet = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < quiet {
+            if let Some(m) = pool.next() {
+                panic!("the miner sent something for a SHA3-256t job: {m}");
+            }
+        }
+        assert_eq!(shared.current_algo(), Some(PowAlgo::Sha3t));
+        assert_eq!(shared.stats.hashes.load(Ordering::Relaxed), 0, "a SHA3-256t job was hashed");
+
+        fork.announce(&mut pool, true);
+        let forked = Instant::now();
+        let deadline = forked + Duration::from_secs(120);
         while t.retarget_ok < 2 {
             assert!(Instant::now() < deadline, "the fork never got going: {t:?}");
-            if forked.is_none() && t.sha3_ok >= 1 {
-                fork.announce(&mut pool, true);
-                forked = Some(Instant::now());
-            }
             if !retargeted && t.bc3_ok >= 3 && t.limited >= 3 {
                 retarget.announce(&mut pool, false);
                 retargeted = true;
@@ -903,25 +909,19 @@ mod tests {
             let ntime = u32::from_str_radix(p[3].as_str().unwrap(), 16).unwrap();
             let nonce = u32::from_str_radix(p[4].as_str().unwrap(), 16).unwrap();
             let job = match p[1].as_str().unwrap() {
-                "s1" => &sha3,
                 "b1" => &fork,
                 "b2" => &retarget,
+                "s1" => panic!("a share for the SHA3-256t job: {m}"),
                 other => panic!("a share for a job never sent: {other}"),
             };
             if !job.check(&en2, ntime, nonce) {
                 t.bad.push(format!("{m}"));
             }
-            let answer = if job.id == "s1" && forked.is_some() {
-                t.stale += 1;
-                Err((21, STALE))
-            } else if job.id == "s1" {
-                t.sha3_ok += 1;
-                Ok(())
-            } else if job.id == "b2" {
+            let answer = if job.id == "b2" {
                 t.retarget_ok += 1;
                 Ok(())
             } else if t.bc3_ok < 3 {
-                first_bc3.get_or_insert(forked.unwrap().elapsed());
+                first_bc3.get_or_insert(forked.elapsed());
                 t.bc3_ok += 1;
                 Ok(())
             } else {
@@ -939,7 +939,7 @@ mod tests {
         println!("fork: first BC3Hash share {first_bc3:?} after the switch; {t:?}");
 
         // Every answer was counted, and the connection was not given up.
-        let answered = t.sha3_ok + t.stale + t.bc3_ok + t.limited + t.retarget_ok;
+        let answered = t.bc3_ok + t.limited + t.retarget_ok;
         let until = Instant::now() + Duration::from_secs(10);
         while shared.stats.accepted.load(Ordering::Relaxed) + shared.stats.rejected.load(Ordering::Relaxed)
             < u64::from(answered)
@@ -949,9 +949,9 @@ mod tests {
         }
         assert_eq!(
             shared.stats.accepted.load(Ordering::Relaxed),
-            u64::from(t.sha3_ok + t.bc3_ok + t.retarget_ok)
+            u64::from(t.bc3_ok + t.retarget_ok)
         );
-        assert_eq!(shared.stats.rejected.load(Ordering::Relaxed), u64::from(t.stale + t.limited));
+        assert_eq!(shared.stats.rejected.load(Ordering::Relaxed), u64::from(t.limited));
         assert!(!miner.is_finished(), "the miner dropped the connection over rejects");
         assert_eq!(shared.current_algo(), Some(PowAlgo::Bc3Hash));
 

@@ -342,12 +342,12 @@ listen("miner-event", ({ payload: ev }) => {
       log(`miner ${ev.version} started — ${ev.gpus.length ? ev.gpus.join(", ") : "CPU only"}`);
       break;
     case "pow": {
-      // Where the current PoW is hashed. Since BC3Hash (no GPU kernel) a GPU
-      // rig mines on its CPU, and the card has to say so.
+      // Where the current PoW is hashed: a GPU rig mines on its CPU when a
+      // card's kernel fails, and nothing mines a job without BC3Hash's bit.
       const where = { gpu: "GPU", cpu: "CPU", "gpu+cpu": "GPU + CPU", none: "—" }[ev.devices];
       el("backend").textContent = `${where || ev.devices} · ${ev.algo}`;
-      // A new PoW is a new scale: next to SHA3-256t's GH/s, BC3Hash's MH/s
-      // drew a flat line at zero for the three minutes the sparkline keeps.
+      // A new PoW is a new scale: an old one's samples would squash the new
+      // one's line for the three minutes the sparkline keeps.
       // The first sample after the switch still counts hashes of both.
       if (sparkAlgo !== null && sparkAlgo !== ev.algo) {
         spark.length = 0;

@@ -30,12 +30,16 @@ update the numbers if you invalidate them.
 ```
 src/                 mining core (the bc3-miner CLI)
   backend/           CUDA, OpenCL and the dynamic loaders for both
-  kernels/sha3t.cl   GPU kernel - shared source for CUDA and OpenCL
-  kernels/sha3t.ptx  GENERATED from sha3t.cl - never hand-edit
-  consensus.rs       CPU reference implementation; the correctness oracle
+  kernels/bc3hash.cl GPU kernel - one source for CUDA and OpenCL; from the
+                     kernel lab, never edited here
+  kernels/bc3hash_w*.ptx
+                     GENERATED from bc3hash.cl, one per table window -
+                     never hand-edit
+  consensus.rs       the choice of PoW, headers, targets; the correctness
+                     oracle, with bc3hash/
   internal.rs        --benchmark (bench.rs) and --solve (solve.rs): only
                      with the internal-tools feature, never in a release
-bc3hash/             BC3Hash, the PoW of the second fork: the node's own C++
+bc3hash/             BC3Hash, the PoW since the second fork: the node's own C++
   vendor/            src/crypto/bc3 + src/secp256k1 of the node - never edit
   vectors/           the node's test vectors (doc/bc3/vectors)
 wasm/                browser miner used on bc3.online
@@ -53,21 +57,30 @@ CUDA and OpenCL are both in the default build. Neither is linked - both are
 resolved at run time - so **no GPU SDK is needed to build**, and one binary
 runs with CUDA on NVIDIA, OpenCL on AMD/Intel, or CPU alone.
 
-`build.rs` compiles `sha3t.cl` to PTX when `nvcc` is on PATH, and otherwise
-falls back to the checked-in `sha3t.ptx`. That fallback is the normal path:
-NVRTC ships with the CUDA *Toolkit*, not the graphics driver, so the kernel must
-be compiled ahead of time and embedded.
+`build.rs` compiles `bc3hash.cl` to PTX, once per table window, when `nvcc` is
+on PATH, and otherwise falls back to the checked-in `bc3hash_w*.ptx`. That
+fallback is the normal path: NVRTC ships with the CUDA *Toolkit*, not the
+graphics driver, so the kernel must be compiled ahead of time and embedded.
+The `cuda` and `opencl` features bring `bc3hash` with them - BC3Hash is the
+only kernel either backend has.
 
 ### BC3Hash and its C++
 
 The version bits pick the PoW per job, exactly as the node's `GetHash` does:
 bit 11 (`0x800`) is BC3Hash and wins over bit 12 (`0x1000`, SHA3-256t);
-neither is SHA256d. BC3Hash is not ported - `bc3hash/` compiles the node's
-reference code from `bc3hash/vendor/` (commit in `vendor/SOURCE_COMMIT`)
-behind a small C shim of ours, `bc3hash/src/shim.cpp`. A port could differ
-from the node in one bit and no test of ours would notice; the node's own code
-plus the node's vectors cannot. To move to a newer node, copy the two
-directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
+neither is SHA256d. Only BC3Hash is mined: the other two have no hash
+function (`PowAlgo::hash_fn` is None), so every worker sits such a job out
+(`shared::AlgoGate`) and the status says "NOT mining" and why - never hashed
+with the wrong function into shares the pool rejects. The SHA3-256t kernel
+and CPU path were removed once the chain was past the fork; `PowAlgo` keeps
+all three so a job is still classified as the node classifies it.
+
+BC3Hash is not ported - `bc3hash/` compiles the node's reference code from
+`bc3hash/vendor/` (commit in `vendor/SOURCE_COMMIT`) behind a small C shim of
+ours, `bc3hash/src/shim.cpp`. A port could differ from the node in one bit and
+no test of ours would notice; the node's own code plus the node's vectors
+cannot. To move to a newer node, copy the two directories again, update
+`SOURCE_COMMIT` and the vectors, and run the tests.
 
 - **A compiler can build it wrong and nothing fails.** GCC 13 (Ubuntu 24.04)
   at -O3 turns mix.cpp into code that runs and gets every hash wrong. The
@@ -77,7 +90,8 @@ directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
   spelling (cost: under 2 %), and `bc3hash::initialize` hashes four of the
   node's vectors before anything is mined. A build that fails them never
   mines BC3Hash; it says "this build computes BC3Hash incorrectly - report
-  it" on stderr and as a GUI status, and SHA3-256t carries on.
+  it" on stderr and as a GUI status, and mines nothing - a GPU needs the same
+  reference for its self-test and for every hit.
 - **Run the vector tests with every compiler that builds a release** -
   `cargo test` in `bc3hash/` and in the root, which needs `bc3hash/vectors/`.
   For the Windows build, cross-build the test binaries with cargo-xwin and run
@@ -90,13 +104,14 @@ directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
 - Native builds prefer `clang`/`clang++` when the environment names no
   compiler: ~10 % more hashrate than GCC 14, measured. The build warns when
   it has to fall back. -O3 stays: -O2 measured 20-25 % slower with either.
-- Where a card has no BC3Hash kernel, or its kernel failed the self-test, the
+- Where a card's BC3Hash kernel failed to load or failed the self-test, the
   CPU threads stand in for it in `--backend auto`
   (`worker::CpuRole::GpuFallback`). See "The BC3Hash GPU kernel" below.
-- The browser build (`wasm/`) shares `consensus.rs` and has the `bc3hash`
-  feature too: the same C++, compiled for wasm32 by clang against WASI's
-  libc/libc++ headers (`wasm/build.sh` installs them; `bc3hash/build.rs`
-  has the wasm32 flags). The module imports nothing: `bc3hash/src/wasm_rt.cpp`
+- The browser build (`wasm/`) shares `consensus.rs` - so it refuses a job
+  without bit 11 the same way - and has the `bc3hash` feature too: the same
+  C++, compiled for wasm32 by clang against WASI's libc/libc++ headers
+  (`wasm/build.sh` installs them; `bc3hash/build.rs` has the wasm32 flags).
+  The module imports nothing: `bc3hash/src/wasm_rt.cpp`
   and `wasm_malloc.rs` stand in for the C runtime, every error path traps,
   and libc++ without threads gets a no-op `std::mutex`
   (`bc3hash/wasm/include/mutex` - one thread per wasm instance). secp256k1
@@ -124,10 +139,11 @@ directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
 ## The BC3Hash GPU kernel
 
 `src/kernels/bc3hash.cl` is generated outside this repository (the kernel lab,
-from the node's constants) - copy it in whole, never edit it here. It is the
-same CUDA/OpenCL macro scheme as `sha3t.cl`. Its secp256k1 tables come in four
-window sizes, chosen at run time - releases mine with 16, an internal-tools
-build takes `--bc3-window` (see "Internal tools") - so it is built four times:
+from the node's constants) - copy it in whole, never edit it here. One source
+serves both backends, with what differs between them in macros at the top of
+the file. Its secp256k1 tables come in four window sizes, chosen at run time -
+releases mine with 16, an internal-tools build takes `--bc3-window` (see
+"Internal tools") - so it is built four times:
 
 ```
 for w in 10 12 14 16; do
@@ -136,7 +152,8 @@ for w in 10 12 14 16; do
 done
 ```
 
-with the CUDA 12.0 toolkit, as for `sha3t.ptx`. OpenCL builds the same source
+with the CUDA 12.0 toolkit (see "Changing the GPU kernel" for why).
+OpenCL builds the same source
 at run time with `-DBC3_WINDOW=N` (`cargo test --release opencl -- --ignored`
 under pocl runs it, see the README). The two builds do not share all of their
 arithmetic: under CUDA the multi-word products, squarings, reductions and the
@@ -146,7 +163,7 @@ RTX 3050 Ti), while OpenCL compiles the C versions next to them in the file
 (`-DBC3_C_ARITH` selects those under CUDA too). The lab checks the two against
 each other on inputs that reach every rare carry before it publishes a kernel.
 
-Unlike `sha3t.cl`, this kernel is **latency-bound**: each step is a chain of
+The kernel is **latency-bound**: each step is a chain of
 dependent carries, and at 255 registers a thread a scheduler had only two
 warps to switch between. Two changes fixed most of that: the independent
 powers of a round run as pairs in one basic block (`expfix*x2`,
@@ -179,55 +196,51 @@ Every GPU keeps two launches queued (`backend::QUEUE_DEPTH`), each with its
 own buffers: the next one waits on the device while the host collects the
 last and re-checks its hits - about a millisecond a BC3Hash hit. The hidden
 `--gpu-queue 1` of an internal-tools build brings back the one-at-a-time
-loop, to compare the two with `--benchmark`. BC3Hash launches stay long (~400 ms, 8 waves): the first waves
-of every launch run in lockstep and are slower, 8.4 us a hash at one or two
-waves a launch against 7.9 at eight on an RTX 3050 Ti
+loop, to compare the two with `--benchmark`. Launches stay long (~400 ms, 8
+waves): the first waves of every launch run in lockstep and are slower, 8.4 us
+a hash at one or two waves a launch against 7.9 at eight on an RTX 3050 Ti
 (`cuda_bc3hash_launch_sizes`). A stream per launch did not change that.
 
 ## Changing the GPU kernel
 
-`sha3t.cl` is shared by both backends and compiled two different ways, so a
-change there is a consensus change. The workflow that catches mistakes:
+`bc3hash.cl` is shared by both backends and compiled two different ways - to
+PTX by nvcc when the miner is built, by the OpenCL runtime on the user's
+machine - so a change there is a consensus change. It comes from the kernel
+lab (see "The BC3Hash GPU kernel"); the workflow that catches mistakes here:
 
-1. Edit `sha3t.cl`. Backend-specific differences belong in the macro block at
-   the top of the file, not scattered through the round function. The lanes
-   are bit-interleaved (see the note at the top of the kernel); the host side
-   of that contract is `kernel_lanes` and `kernel_target` in
-   `src/backend/mod.rs`, and the Rust mirror of the kernel in the tests there
-   (`il_round` and friends) must follow every change to the kernel's math.
-2. Regenerate the PTX with `nvcc --ptx -arch compute_52 -O3 -x cu`, **using the
-   CUDA 12.0 toolkit**. The toolkit version decides the PTX ISA version, and a
-   driver can only JIT the versions it knows: ISA 8.0 needs driver R525, ISA
-   8.8 (CUDA 12.9) needs R575. Build it too new and the card is detected but
-   the kernel never loads. `build.rs` fails the build above ISA 8.0 for exactly
-   that reason. Commit the regenerated `sha3t.ptx` - the build embeds it.
+1. Copy the lab's `bc3hash.cl` in whole. The host side of its contract is
+   `src/backend/bc3.rs` - the target limbs, the self-test - the tables from
+   `bc3hash::gpu_tables`, and the argument order of `bc3hash_scan` and
+   `bc3hash_batch` in `cuda.rs` and `opencl.rs`; they change with it.
+2. Regenerate the four PTX files, **using the CUDA 12.0 toolkit**. The toolkit
+   version decides the PTX ISA version, and a driver can only JIT the versions
+   it knows: ISA 8.0 needs driver R525, ISA 8.8 (CUDA 12.9) needs R575. Build
+   it too new and the card is detected but the kernel never loads. `build.rs`
+   fails the build above ISA 8.0 for exactly that reason, and the CUDA backend
+   refuses a driver older than R525 when it opens a card (`check_driver`), so
+   that card goes to OpenCL. Commit the regenerated PTX - the build embeds it.
+   Build it in `/work`: nvcc derives the names of internal functions from the
+   source's absolute path, and the committed PTX was built there (CI's
+   comparison ignores those names, see `build.yml`).
 
    ```
    docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.0.1-devel-ubuntu22.04 \
-     /usr/local/cuda/bin/nvcc --ptx -arch compute_52 -O3 -x cu \
-     src/kernels/sha3t.cl -o src/kernels/sha3t.ptx
+     sh -c 'for w in 10 12 14 16; do /usr/local/cuda/bin/nvcc --ptx -arch compute_52 \
+       -O3 -DBC3_WINDOW=$w -x cu src/kernels/bc3hash.cl -o src/kernels/bc3hash_w$w.ptx; done'
    ```
 3. **Verify bit-exactness against an independent reference**, not against the
-   previous kernel. `cargo test` compares the GPU hit set to `consensus.rs` on
-   random headers; `sha3_256` from any standard library works as a second
-   opinion and does not share our assumptions.
-4. Check the OpenCL branch still compiles. It is a different compiler with
-   different rules, and it will not be exercised by a CUDA-only test.
-5. Measure. `ptxas -arch=sm_89 -O3 -v` reports registers and spills;
-   `nvdisasm -c` gives the SASS so you can count instructions per round.
-
-The kernel is **ALU-bound and at the instruction-issue ceiling**. Occupancy,
-batch size and memory access are not the lever - instruction count is. One
-keccak round is ~168 SASS instructions on sm_86 (117 `LOP3`, 50 `SHF`), and
-every one is accounted for in the README, which also lists what has been
-measured NOT to help - the multiplier pipe, two nonces per thread, launch
-bounds, block sizes, hand-pruning the last round. Before optimising, count;
-do not guess. And measure with the kernels alternated in one process: on a
-laptop the clock drifts more with heat than most changes are worth.
-
-Register spills are catastrophic here, not merely slow: dynamic indexing of the
-state array pushes it to local memory and costs roughly 100x. If `ptxas -v`
-reports any spill, stop and fix that first.
+   previous kernel: the node's own C++, which `bc3hash/` builds. Every card's
+   self-test does that before it mines (the node's header vectors, random
+   headers, a scan through the launch queue against the CPU's hit set), and
+   `cargo test --release -- --ignored` on a GPU runs it at windows 10 and 16,
+   and `cuda_bc3hash_queued_launches_match_the_cpu` on top.
+4. Check the OpenCL build too - under pocl it runs without a GPU (README). It
+   is a different compiler with different rules, and it does not even share
+   all of its arithmetic with the CUDA build (the C versions instead of inline
+   PTX), so a CUDA-only test says nothing about it.
+5. Measure, with the kernels alternated in one process: on a laptop the clock
+   drifts more with heat than most changes are worth. `ptxas -arch=sm_89 -O3
+   -v` reports registers and spills; the lab's `prof.cu` profiles the phases.
 
 ## Internal tools
 
@@ -256,7 +269,6 @@ default build has no dead code. `build.yml` runs `cargo test --release
 | `--solve job.json` | | Mine one fixed block template offline, see below |
 | `--bc3-window 10\|12\|14\|16` | `BC3_BC3HASH_WINDOW` | Table window of the GPU's BC3Hash kernel: 7, 22, 76 or 256 MiB of GPU memory. Default 16 |
 | `--bc3hash-mode fast\|compact` | `BC3_BC3HASH_MODE` | The CPU's BC3Hash tables: `fast` (~256 MiB of RAM, about 10 s to build) or `compact` (~7 MiB, 10-20 % slower); both find the same shares. Default `compact` when a GPU mines BC3Hash and the CPU only re-checks its hits, `fast` otherwise |
-| `--algo bc3hash\|sha3t` | | The PoW the benchmark measures (default `bc3hash`) |
 | `--seconds N` | | Benchmark: seconds a run (default 20 comparing windows, else 60) |
 | `--difficulty D` | | Benchmark and solve: a fixed share difficulty instead of one from the measured rate |
 | `--gpu-queue 1\|2` (hidden) | | Kernel launches each GPU keeps queued; 1 is the old one-at-a-time loop |
@@ -264,16 +276,15 @@ default build has no dead code. `build.yml` runs `cargo test --release
 ```
 bc3-miner --benchmark                    # BC3Hash: every GPU, all four table windows
 bc3-miner --benchmark --bc3-window 16    # BC3Hash at one window, 60 s
-bc3-miner --benchmark --algo sha3t       # SHA3-256t
 bc3-miner --solve job.json
 ```
 
 `--benchmark` mines without a pool, a network or an address. An in-process
-job source hands random jobs with the right version bits to the normal
-workers - the same dispatch, kernels and launch queue as real mining, every
-GPU hit re-checked on the CPU - and every share is checked once more against
-the CPU reference, the way the pool checks it. For BC3Hash on GPUs with the
-kernel, and without `--bc3-window`, it compares the four table windows. Each
+job source hands random BC3Hash jobs to the normal workers - the same
+dispatch, kernels and launch queue as real mining, every GPU hit re-checked
+on the CPU - and every share is checked once more against the CPU reference,
+the way the pool checks it. On GPUs with the kernel, and without
+`--bc3-window`, it compares the four table windows. Each
 window runs twice, once on the way up and once on the way back down, and the
 two runs are averaged: a GPU's clock drifts as it warms up - on a laptop by
 more than the windows differ - and a steady drift cancels out that way.
@@ -312,13 +323,13 @@ ready for `submitblock` on a node that has the block before it.
 ## Testing
 
 ```
-cargo test                              # CPU: consensus vectors, kernel mirror
+cargo test                              # CPU: consensus and node vectors, workers
 cargo test --features internal-tools    # the same, plus the internal tools
 cargo test --release -- --ignored       # GPU tests; need an actual GPU
 ```
 
-The OpenCL test needs an OpenCL runtime but not a GPU - pocl provides a CPU one,
-so it runs in plain Docker. Both Docker recipes are in the README.
+The OpenCL tests need an OpenCL runtime but not a GPU - pocl provides a CPU
+one, so they run in plain Docker. Both Docker recipes are in the README.
 
 ## Releasing
 
@@ -351,7 +362,8 @@ anything at run time.
   submission. A kernel bug must never be able to submit an invalid share.
 - **Secrets never enter the repository.** Credentials live outside the working
   tree; scrub tokens from any command output you paste or log.
-- **Never hand-edit `sha3t.ptx`.** Regenerate it from the source.
+- **Never hand-edit the PTX (`bc3hash_w*.ptx`).** Regenerate it from the
+  source, and never edit `bc3hash.cl` here either - it comes from the lab.
 
 ## Commit messages
 

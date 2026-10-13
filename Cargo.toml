@@ -17,14 +17,18 @@ path = "src/main.rs"
 # dynamically at runtime, so ONE binary runs CUDA on NVIDIA, OpenCL on
 # AMD/Intel and CPU if there is nothing.
 default = ["cuda", "opencl", "bc3hash"]
-cuda = ["dep:cudarc", "dep:nvml-wrapper"]
+# Both GPU backends bring bc3hash with them: BC3Hash is the only kernel either
+# has, and its GPU tables and the CPU re-check of every hit come from it.
+cuda = ["dep:cudarc", "dep:nvml-wrapper", "bc3hash"]
 # OpenCL is loaded dynamically via src/backend/cl_sys.rs - NOT linked against
 # OpenCL.lib/libOpenCL.so. Static linking would have made the binary refuse
 # to start on machines without an OpenCL runtime.
-opencl = ["dep:libloading"]
-# BC3Hash, the PoW of the second fork: the node's own C++ (bc3hash/), mined on
-# the CPU. Needs a C++20 compiler with unsigned __int128 - GCC or Clang, and
-# clang-cl rather than cl.exe on Windows (bc3hash/build.rs picks it).
+opencl = ["dep:libloading", "bc3hash"]
+# BC3Hash, the PoW since the second fork: the node's own C++ (bc3hash/), mined
+# on the CPU and the reference every GPU hit is checked against. Without it
+# the miner mines nothing. Needs a C++20 compiler with unsigned __int128 - GCC
+# or Clang, and clang-cl rather than cl.exe on Windows (bc3hash/build.rs
+# picks it).
 bc3hash = ["dep:bc3hash"]
 # Development tools, never in a release: --benchmark, --solve and the knobs
 # only they need (--bc3-window, --bc3hash-mode, --gpu-queue, ...). Without the
@@ -32,7 +36,6 @@ bc3hash = ["dep:bc3hash"]
 internal-tools = []
 
 [dependencies]
-sha3 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }

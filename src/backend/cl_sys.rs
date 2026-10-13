@@ -27,7 +27,6 @@ pub type cl_bool = cl_uint;
 pub type cl_handle = *mut c_void;
 
 pub const CL_SUCCESS: cl_int = 0;
-#[cfg_attr(not(feature = "bc3hash"), allow(dead_code))]
 pub const CL_TRUE: cl_bool = 1;
 pub const CL_FALSE: cl_bool = 0;
 pub const CL_DEVICE_TYPE_GPU: cl_bitfield = 1 << 2;
@@ -40,7 +39,7 @@ pub const CL_MEM_READ_ONLY: cl_bitfield = 1 << 2;
 pub const CL_PROGRAM_BUILD_LOG: cl_uint = 0x1183;
 /// Largest work-group size this device can run THIS kernel with. It is a
 /// per-kernel limit, not a device one: register pressure decides it, and
-/// keccak is register-heavy.
+/// BC3Hash is register-heavy.
 pub const CL_KERNEL_WORK_GROUP_SIZE: cl_uint = 0x11B0;
 /// Command-queue property list key, and the bit that turns on event timing.
 pub const CL_QUEUE_PROPERTIES: cl_bitfield = 0x1093;

@@ -10,7 +10,7 @@
 //! how busy each GPU was: the device time of its launches (CUDA events,
 //! OpenCL profiling) over the wall time between them.
 //!
-//! For BC3Hash on a CUDA card it compares the GPU table windows (10, 12, 14
+//! On GPUs with a BC3Hash kernel it compares the table windows (10, 12, 14
 //! and 16 bits) unless `--bc3-window` names one: which is fastest depends on
 //! the card's L2.
 
@@ -24,8 +24,14 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The PoW the benchmark measures - the one the miner mines.
+const ALGO: PowAlgo = PowAlgo::Bc3Hash;
+
+/// The version getblocktemplate hands out from the fork height on: bit 11,
+/// BC3Hash, and bit 12, which stays set.
+const VERSION: u32 = 0x2000_1800;
+
 pub struct Config {
-    pub algo: PowAlgo,
     /// Seconds to measure, per window.
     pub seconds: u64,
     /// Fixed share difficulty; None sets it from the measured rate.
@@ -50,7 +56,7 @@ const SETTLE: Duration = Duration::from_secs(3);
 /// first-time JIT of a 2.8 MB PTX, self-test.
 const READY_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Random jobs with the right version bits, as a pool would hand them out.
+/// Random jobs with BC3Hash's version bits, as a pool would hand them out.
 struct JobSource {
     rng: u64,
     count: u64,
@@ -82,13 +88,7 @@ impl JobSource {
     }
 
     /// A new block: fresh previous hash, coinbase and branches.
-    fn new_block(&mut self, algo: PowAlgo, difficulty: f64) -> MinerJob {
-        let version = match algo {
-            PowAlgo::Sha256d => 0x2000_0000,
-            PowAlgo::Sha3t => 0x2000_1000,
-            // What getblocktemplate hands out from the fork height on.
-            PowAlgo::Bc3Hash => 0x2000_1800,
-        };
+    fn new_block(&mut self, difficulty: f64) -> MinerJob {
         let mut coinb1 = vec![2, 0, 0, 0, 1];
         coinb1.extend_from_slice(&[0u8; 32]);
         coinb1.extend_from_slice(&[0xff; 4]);
@@ -106,14 +106,14 @@ impl JobSource {
             coinb1,
             coinb2,
             merkle_steps,
-            version,
+            version: VERSION,
             prev_hash: prev,
             // A hard network target: no share is a block candidate.
             bits: 0x1a00_ffff,
             ntime: 1_790_000_000 + (self.count as u32) * 30,
             share_target: [0; 32],
             height: None,
-            algo,
+            algo: ALGO,
         };
         self.template = Some(template);
         self.retarget(difficulty)
@@ -167,15 +167,11 @@ fn difficulty_for(rate: f64) -> f64 {
 }
 
 /// A first guess at the rate, before anything is measured.
-fn guess_rate(algo: PowAlgo, gpus: usize, cpu_threads: usize) -> f64 {
-    let (gpu, cpu) = match algo {
-        PowAlgo::Bc3Hash => (100e3, 1e3),
-        PowAlgo::Sha256d | PowAlgo::Sha3t => (150e6, 1e6),
-    };
+fn guess_rate(gpus: usize, cpu_threads: usize) -> f64 {
     if gpus > 0 {
-        gpus as f64 * gpu
+        gpus as f64 * 100e3
     } else {
-        cpu_threads.max(1) as f64 * cpu
+        cpu_threads.max(1) as f64 * 1e3
     }
 }
 
@@ -209,7 +205,7 @@ impl Run<'_> {
     }
 
     fn new_block(&mut self) {
-        let job = self.source.new_block(self.cfg.algo, self.difficulty);
+        let job = self.source.new_block(self.difficulty);
         self.block_started = Instant::now();
         self.publish(job);
     }
@@ -470,7 +466,7 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
     println!(
         "[bench] bc3-miner {} benchmark - {}, {} s per run{}",
         env!("CARGO_PKG_VERSION"),
-        cfg.algo.name(),
+        ALGO.name(),
         cfg.seconds,
         match &cfg.difficulty {
             Some(d) => format!(", share difficulty {d}"),
@@ -489,7 +485,7 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
     if cfg.cpu_threads > 0 {
         println!("[bench] CPU: {} thread(s)", cfg.cpu_threads);
     }
-    let gpu_bc3 = cfg.algo == PowAlgo::Bc3Hash && cfg.gpu_bc3.iter().any(|&b| b);
+    let gpu_bc3 = cfg.gpu_bc3.iter().any(|&b| b);
     let windows = if gpu_bc3 { cfg.windows.clone() } else { vec![0] };
     // Comparing windows: up and back down again, and the two runs of each
     // window averaged. A GPU's clock drifts as it warms up - on a laptop by
@@ -519,22 +515,20 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
         shares: Shares::default(),
         difficulty: cfg
             .difficulty
-            .unwrap_or_else(|| difficulty_for(guess_rate(cfg.algo, cfg.gpu_names.len(), cfg.cpu_threads))),
+            .unwrap_or_else(|| difficulty_for(guess_rate(cfg.gpu_names.len(), cfg.cpu_threads))),
         block_started: Instant::now(),
     };
 
     // BC3Hash on the CPU, and the check of every share, need the CPU tables:
     // the fast ones take ~11 s to build, which is not hashing and must not be
     // measured as if it were.
-    if cfg.algo == PowAlgo::Bc3Hash {
-        let t0 = Instant::now();
-        match crate::worker::cpu_unavailable(PowAlgo::Bc3Hash, true) {
-            None => println!(
-                "[bench] CPU reference ready and self-tested ({:.1} s)",
-                t0.elapsed().as_secs_f64()
-            ),
-            Some(why) => println!("[bench] no CPU reference: {why}"),
-        }
+    let t0 = Instant::now();
+    match crate::worker::cpu_unavailable(ALGO, true) {
+        None => println!(
+            "[bench] CPU reference ready and self-tested ({:.1} s)",
+            t0.elapsed().as_secs_f64()
+        ),
+        Some(why) => println!("[bench] no CPU reference: {why}"),
     }
 
     let mut phases = Vec::new();
@@ -560,7 +554,7 @@ pub fn run(shared: Arc<Shared>, rx: Receiver<FoundShare>, cfg: Config) -> i32 {
 
     // The summary: one line per window, its runs averaged.
     println!();
-    println!("==== bc3-miner benchmark: {} ====", cfg.algo.name());
+    println!("==== bc3-miner benchmark: {} ====", ALGO.name());
     for (i, name) in cfg.gpu_names.iter().enumerate() {
         println!("GPU{i}  {name}");
     }
@@ -700,30 +694,30 @@ mod tests {
         assert_eq!(difficulty_for(0.0), 1.0 / (1u64 << 31) as f64);
     }
 
-    /// The job source's jobs: the PoW's version bits, a target for the
+    /// The job source's jobs: BC3Hash's version bits, a target for the
     /// difficulty, and a retarget that keeps the header space.
     #[test]
     fn jobs_carry_the_pow_and_keep_their_space_on_retarget() {
         let mut s = JobSource::new();
-        let a = s.new_block(PowAlgo::Bc3Hash, 1e-5);
+        let a = s.new_block(1e-5);
         assert_eq!(PowAlgo::for_version(a.version), PowAlgo::Bc3Hash);
         assert_eq!(a.algo, PowAlgo::Bc3Hash);
         assert_eq!(a.share_target, target_for_difficulty(1e-5));
         let b = s.retarget(1e-4);
         assert!(a.same_search_space(&b));
         assert_ne!(a.job_id, b.job_id);
-        let c = s.new_block(PowAlgo::Sha3t, 1.0);
-        assert_eq!(PowAlgo::for_version(c.version), PowAlgo::Sha3t);
+        let c = s.new_block(1e-4);
         assert!(!b.same_search_space(&c));
     }
 
     /// The check a share gets is the pool's: right header, right PoW, under
     /// the target - and a share for another nonce does not pass.
+    #[cfg(feature = "bc3hash")]
     #[test]
     fn shares_are_checked_like_a_pool_does() {
         let mut s = JobSource::new();
-        // Easy enough that a few nonces find one.
-        let job = s.new_block(PowAlgo::Sha3t, 1.0 / (1u64 << 31) as f64);
+        // Easy enough that a few nonces find one: about every other hash.
+        let job = s.new_block(1.0 / (1u64 << 31) as f64);
         let mut share = FoundShare {
             job_id: job.job_id.clone(),
             extranonce2: vec![0, 0, 0, 7],

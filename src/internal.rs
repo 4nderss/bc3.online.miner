@@ -50,17 +50,13 @@ pub struct Tools {
     #[arg(long, value_name = "JOB.json", conflicts_with = "benchmark")]
     solve: Option<std::path::PathBuf>,
 
-    /// Benchmark: the PoW to measure.
-    #[arg(long, value_enum, default_value_t = BenchAlgo::Bc3hash)]
-    algo: BenchAlgo,
-
     /// Benchmark: seconds to measure. Comparing the BC3Hash windows, each
     /// window runs twice for this long (default 20); otherwise 60.
     #[arg(long)]
     seconds: Option<u64>,
 
-    /// Benchmark: share difficulty. By default it is set from the measured
-    /// hashrate so that a share comes every few seconds.
+    /// Benchmark and --solve: share difficulty. By default it is set from the
+    /// measured hashrate so that a share comes every few seconds.
     #[arg(long)]
     difficulty: Option<f64>,
 
@@ -70,22 +66,6 @@ pub struct Tools {
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=2),
           hide = true)]
     gpu_queue: u32,
-}
-
-/// The PoW `--benchmark` measures.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
-enum BenchAlgo {
-    Bc3hash,
-    Sha3t,
-}
-
-impl From<BenchAlgo> for consensus::PowAlgo {
-    fn from(a: BenchAlgo) -> Self {
-        match a {
-            BenchAlgo::Bc3hash => consensus::PowAlgo::Bc3Hash,
-            BenchAlgo::Sha3t => consensus::PowAlgo::Sha3t,
-        }
-    }
 }
 
 #[cfg(feature = "bc3hash")]
@@ -142,8 +122,7 @@ impl Devices {
 
 impl Tools {
     /// A run that mines for no pool - the benchmark or `--solve`: it needs no
-    /// address, reports no pool statistics, and loads the BC3Hash kernel when
-    /// it needs it rather than ahead of time.
+    /// address and reports no pool statistics.
     pub fn offline(&self) -> bool {
         self.benchmark || self.solve.is_some()
     }
@@ -181,9 +160,7 @@ impl Tools {
         #[cfg(feature = "bc3hash")]
         let windows = match self.bc3_window {
             Some(w) => vec![w],
-            None if self.algo == BenchAlgo::Bc3hash && devices.bc3.contains(&true) => {
-                BC3_WINDOWS.to_vec()
-            }
+            None if devices.bc3.contains(&true) => BC3_WINDOWS.to_vec(),
             None => vec![shared.bc3_window()],
         };
         #[cfg(not(feature = "bc3hash"))]
@@ -193,7 +170,6 @@ impl Tools {
             shared,
             rx,
             bench::Config {
-                algo: self.algo.into(),
                 seconds: self.seconds.unwrap_or(if compare { 20 } else { 60 }),
                 difficulty: self.difficulty,
                 windows,

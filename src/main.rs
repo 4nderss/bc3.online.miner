@@ -64,8 +64,8 @@ struct Args {
     gpu_id: Option<usize>,
 
     /// Number of CPU threads (0 = all cores), mining every job. Without the
-    /// flag a GPU in --backend auto leaves the CPU idle until a job comes that
-    /// the GPU has no kernel for, and then mines it on all cores; with
+    /// flag a GPU in --backend auto leaves the CPU idle unless the GPU cannot
+    /// mine (its BC3Hash kernel failed), and then mines on all cores; with
     /// --backend cuda or opencl the CPU does not mine at all.
     #[arg(long, env = "BC3_THREADS")]
     threads: Option<usize>,
@@ -269,7 +269,6 @@ fn main() {
         cpu_fallback_threads: if role == CpuRole::GpuFallback { threads } else { 0 },
         gpu_kernel: consensus::PowAlgo::ALL
             .map(|a| gpus.iter().any(|g| backend::device_has_kernel(g, a))),
-        compile_ahead: !offline,
     };
     let gpu_bc3 = plan.gpu_kernel[consensus::PowAlgo::Bc3Hash.index()];
     #[cfg(not(feature = "bc3hash"))]
@@ -289,7 +288,7 @@ fn main() {
     }
     if plan.cpu_fallback_threads > 0 {
         human!(
-            "[cpu] {} thread(s) standing by for jobs the GPU has no kernel for (BC3Hash)",
+            "[cpu] {} thread(s) standing by, to mine BC3Hash should a GPU's kernel fail",
             plan.cpu_fallback_threads
         );
     }
@@ -320,10 +319,12 @@ fn main() {
                 .name("bc3hash-init".into())
                 .spawn(move || {
                     let t0 = std::time::Instant::now();
-                    // No exit: SHA3-256t, on the GPU above all, mines on
-                    // regardless. The CPU threads see the same result through
-                    // worker::cpu_supports and leave BC3Hash alone - shares
-                    // from a wrong build would only ever be rejected.
+                    // No exit: the error stays on screen, in the log and in
+                    // the GUI, while nothing is mined. The CPU threads see the
+                    // same result through worker::cpu_supports and leave
+                    // BC3Hash alone, and so do the GPUs, which need this
+                    // reference for their self-test and for every hit -
+                    // shares from a wrong build would only ever be rejected.
                     if let Err(e) = bc3hash::initialize() {
                         use bc3hash::InitError::{Tables, WrongResult};
                         let hint = match e {
@@ -443,8 +444,8 @@ fn main() {
 /// starve and the GPU hashrate drops more than the CPU adds. So `--threads 0`
 /// reserves one core per GPU plus one more.
 ///
-/// The stand-ins are different. They only run when the GPU has nothing to do,
-/// on BC3Hash, which has no kernel; then its feeder needs no core, and they
+/// The stand-ins are different. They only run when the GPU has nothing to do -
+/// its BC3Hash kernel failed - and then its feeder needs no core, and they
 /// get all of them.
 fn plan_cpu(
     backend: BackendKind,
@@ -459,7 +460,7 @@ fn plan_cpu(
         // Pure CPU mining, as before.
         (None, 0) => (all_cores, CpuRole::All),
         // A GPU in auto: no CPU mining next to it, but every core stands by
-        // for what it cannot do. Since the fork that is everything.
+        // for what it cannot do - BC3Hash, should its kernel fail.
         (None, _) if backend == BackendKind::Auto => (all_cores, CpuRole::GpuFallback),
         // A GPU backend the user chose by name: the CPU stays out of it.
         (None, _) => (0, CpuRole::All),
@@ -471,7 +472,7 @@ mod tests {
     use super::*;
 
     /// The fallback decision for every way the miner can be started. The case
-    /// the fork hinges on: auto with a GPU and no --threads stands every core
+    /// that matters most: auto with a GPU and no --threads stands every core
     /// by for BC3Hash, while a GPU backend chosen by name leaves the CPU alone.
     #[test]
     fn cpu_threads_and_their_role() {

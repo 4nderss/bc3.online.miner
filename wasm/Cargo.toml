@@ -3,7 +3,7 @@ name = "bc3-miner-wasm"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Search kernels (SHA3-256t, BC3Hash) for the bc3.online web miner (WebAssembly)"
+description = "Search kernel (BC3Hash) for the bc3.online web miner (WebAssembly)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -11,7 +11,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The same hash implementation the CLI miner uses. The kernel must be
 # bit-exactly equal - a share the web miner finds must be accepted by the pool.
-sha3 = { version = "0.10", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
@@ -19,7 +18,7 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 # compiled to wasm32 by clang against WASI's libc/libc++ headers - see
 # build.sh for the toolchain and BC3HASH_VENDOR for the sources. src/consensus.rs
 # (shared with the CLI) turns it on under the same feature name as the CLI.
-# Without it this crate builds as before: SHA3-256t and SHA256d only.
+# Without it the module hashes no PoW at all: it refuses every job.
 bc3hash = { path = "../bc3hash", optional = true }
 
 [dev-dependencies]
