@@ -54,12 +54,12 @@ the file to the commit and the workflow that built it, which is the part a
 checksum cannot establish:
 
 ```
-gh attestation verify bc3-miner-2.0.0-windows-x86_64.zip --repo 4nderss/bc3.online.miner
+gh attestation verify bc3-miner-2.1.0-windows-x86_64.zip --repo 4nderss/bc3.online.miner
 ```
 
 The Windows binaries need the Microsoft Visual C++ Redistributable (x64),
-which most machines already have. 2.0.0 uses its `MSVCP140.dll` as well as
-the `VCRUNTIME140.dll` earlier versions needed; if Windows says either is
+which most machines already have. Since 2.0.0 the miner uses its
+`MSVCP140.dll` as well as the `VCRUNTIME140.dll` 1.x needed; if Windows says either is
 missing, install the redistributable from Microsoft. On NVIDIA cards the GPU
 kernel needs driver R525 or newer; with an older one the miner falls back to
 the card's OpenCL runtime.
@@ -123,8 +123,8 @@ covers NVIDIA, AMD/Intel and CPU: the miner opens the GPU runtimes with dlopen
 rather than linking them, so it uses whatever the host exposes and falls back
 to CPU when there is nothing.
 
-Image tags follow the releases: `ghcr.io/4nderss/bc3-miner:2.0.0` (and
-`:2.0`) is this version, and `:latest` - what the command above and
+Image tags follow the releases: `ghcr.io/4nderss/bc3-miner:2.1.0` (and
+`:2.1`) is this version, and `:latest` - what the command above and
 `docker-compose.yml` use - moves to a release when it is published. **The
 fork needs 2.0.0 or later.** A container keeps running the image it was
 created from, so pull the new one and recreate the container:
@@ -134,8 +134,13 @@ docker pull ghcr.io/4nderss/bc3-miner:latest
 docker rm -f bc3-miner        # then the docker run above again
 ```
 
-With compose: `docker compose pull && docker compose up -d`. Pin `:2.0.0`
+With compose: `docker compose pull && docker compose up -d`. Pin `:2.1.0`
 instead of `:latest` if you would rather choose when to move.
+
+An NVIDIA card spends its first minutes measuring which BC3Hash table window
+suits it (see *The BC3Hash GPU kernel*), mining all along. The container
+keeps the answer, so a restart goes straight to it; a new container - an
+upgrade, say - measures again.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -194,8 +199,10 @@ Replace the binaries, or pull the new image: 1.x cannot mine since block
 64,360. The address, rig name, pool ports and every 1.x flag work as before,
 and the GUI keeps its settings. What is new:
 
-- BC3Hash needs memory for its tables: 256 MiB of GPU memory per card, and
-  RAM for the CPU's - about 7 MiB when a GPU mines BC3Hash and the CPU only
+- BC3Hash needs memory for its tables: 256 MiB of GPU memory per card to
+  start with - up to 3.3 GiB on an NVIDIA card that has the room and hashes
+  faster with a bigger table window (see *The BC3Hash GPU kernel*) - and RAM
+  for the CPU's: about 7 MiB when a GPU mines BC3Hash and the CPU only
   re-checks its hits, about 256 MiB when the CPU mines it.
 - At startup the miner checks its BC3Hash build against the node's test
   vectors, and every GPU checks its kernel against the CPU before it mines.
@@ -259,24 +266,23 @@ numbering is the one `--gpu-id` means.
 - **32-bit limbs, one instruction a product.** Products, squarings and reductions work on 32-bit limbs, which is what a GPU multiplies. Under CUDA each 32x32 product, together with the 64-bit addition into its accumulator and both carries, is a single `IMAD.WIDE.U32.X`: inline PTX `madc` chains, arranged by column parity so that ptxas can fuse them. That made the whole hash 23 % faster than 2.0.0's arithmetic on an RTX 3050 Ti; OpenCL compiles the C versions in the same file.
 - **Inversions by safegcd** (Bernstein-Yang divsteps), ported from libsecp256k1's `modinv32`: about a quarter of the instructions of Fermat's 255 squarings. Scalar multiplications run four at a time and share one field inversion (Montgomery's trick).
 - **Latency, not throughput, is the limit**: every step is a chain of dependent carries. The independent powers of a round run in pairs, so two chains interleave, and `__launch_bounds__` holds the kernel to 168 registers - three warps per scheduler instead of two. On an RTX 3050 Ti that was 30 % more hashes per clock.
-- **Four table windows.** The curve tables live in GPU memory, in windows of 10, 12, 14 or 16 bits: 7, 22, 76 or 256 MiB. A bigger window means fewer point additions but more memory traffic, so the best one depends on the card's L2 cache. Releases mine with 16, the fastest on every card measured so far; the other three are there for the benchmark to compare (see *Internal tools*). The PTX is built once per window, and the host builds the matching tables at startup (about 3 s for window 16).
-- **Checked bit-exact against the node.** In development: the node's reference vectors and 20,000 random BC3Mix/BC3Hash inputs at each of the four windows, and the PTX arithmetic against the C on inputs that reach every rare carry. On your machine, every card self-tests every window before it mines with it - the node's header vectors, random headers against the CPU reference, and a scan through the launch queue against the CPU's own hit set. A card that fails mines no BC3Hash, and under `--backend auto` the CPU takes over. Every GPU hit is re-checked on the CPU before it is submitted.
+- **Each card measures its own table window.** The curve tables live in GPU memory, in windows of 16, 18, 19 or 20 bits: 256 MiB, 0.9, 1.8 or 3.3 GiB. A bigger window means fewer point additions - 13 a scalar multiplication at 20 bits instead of 16 - but more memory traffic, so whether it pays depends on the card: on an RTX 4090 window 20 hashes 5.6 % faster than 16. Nobody can try every card, so every NVIDIA card starts at 16 and mines from the first second, builds the tables of the largest window it has the memory for meanwhile (and keeps a GiB free), and then measures: 16, the bigger window and 16 again, a minute each. It keeps the bigger window only if that hashes faster than the two measurements of 16 on average. The answer is remembered per card, driver and miner version - in `%LOCALAPPDATA%\bc3-miner\tuning.json` on Windows, `~/.cache/bc3-miner/tuning.json` on Linux - so the next start goes straight there; a new driver or version measures again, and so does deleting the file. When the two measurements of 16 disagree, something else moved the rate - in a laptop, the CPU taking the shared power budget - and the answer holds for that run only. The GUI shows the tables in use on the *Backend* card, and "tuning…" while it measures. OpenCL cards stay at 16: a switch there compiles the kernel while the card waits, and the tuning has not been tried on an AMD or Intel card yet.
+- **Checked bit-exact against the node.** In development: the node's reference vectors and 20,000 random BC3Mix/BC3Hash inputs at window 16, and the PTX arithmetic against the C on inputs that reach every rare carry. On your machine, every card self-tests every window before it mines with it - the node's header vectors, random headers against the CPU reference, and a scan through the launch queue against the CPU's own hit set. A card that fails mines no BC3Hash, and under `--backend auto` the CPU takes over; a bigger window that fails leaves the card at 16. Every GPU hit is re-checked on the CPU before it is submitted.
 
 ## Performance
 
 | Device | Backend | Hashrate | How measured |
 |--------|---------|----------|--------------|
-| NVIDIA RTX 4090 | CUDA | ~1.98 MH/s | bc3-miner 2.0.0 solving a real block template offline, on the operator's card |
+| NVIDIA RTX 4090 | CUDA, window 20 | ~2.66 MH/s (2.52 at window 16) | bc3-miner 2.1.0's benchmark (*Internal tools*), 60 s runs, on the operator's card at its 450 W limit; 2.0.0 did 1.82 |
 | NVIDIA RTX 4050 Laptop GPU | CUDA | ~180 kH/s | reported by BC3's developer, with an earlier version of the kernel |
-| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, window 16 | ~165 kH/s | bc3-miner 2.0.0's benchmark (*Internal tools*); the card is power-capped at ~40 W |
+| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, window 16 | ~215 kH/s | 2.1.0's benchmark; the card is power-capped at ~40 W; 2.0.0 did ~165 |
 | Intel Core i9-12900HK | CPU, 20 threads, fast tables | ~8 kH/s (~1.1 kH/s on one thread) | through the miner's worker loop, Linux, Clang build |
 
-A laptop GPU's BC3Hash rate is set by its power limit as much as by the
-kernel: the 3050 Ti above runs at its cap, where the 2.0.0 kernel - 30 %
-more hashes per clock - runs at lower clocks than the one before it. A card
-with power headroom gains more. On the laptop CPU the rate per thread falls
-as threads are added: 1.1 kH/s on one thread, 3.9 on four, 6.3 on eight,
-8.2 on all twenty.
+Both cards above run at their power limit, so their rate follows the energy
+a hash takes. 2.1.0's kernel does the same work in fewer instructions - a
+quarter less energy a hash - and gains 30 % on the laptop and 38 % on the
+RTX 4090 at the same window. On the laptop CPU the rate per thread falls as threads are
+added: 1.1 kH/s on one thread, 3.9 on four, 6.3 on eight, 8.2 on all twenty.
 
 ## Building
 

@@ -37,6 +37,8 @@ src/                 mining core (the bc3-miner CLI)
                      never hand-edit
   consensus.rs       the choice of PoW, headers, targets; the correctness
                      oracle, with bc3hash/
+  tuning.rs          each GPU's BC3Hash table window, measured while it
+                     mines (see "Window tuning")
   internal.rs        --benchmark (bench.rs) and --solve (solve.rs): only
                      with the internal-tools feature, never in a release
 bc3hash/             BC3Hash, the PoW since the second fork: the node's own C++
@@ -141,12 +143,12 @@ cannot. To move to a newer node, copy the two directories again, update
 `src/kernels/bc3hash.cl` is generated outside this repository (the kernel lab,
 from the node's constants) - copy it in whole, never edit it here. One source
 serves both backends, with what differs between them in macros at the top of
-the file. Its secp256k1 tables come in four window sizes, chosen at run time -
-releases mine with 16, an internal-tools build takes `--bc3-window` (see
-"Internal tools") - so it is built four times:
+the file. Its secp256k1 tables come in four window sizes - 16, 18, 19 and 20
+bits - chosen at run time, per card, by the tuning (see "Window tuning"), so
+it is built four times:
 
 ```
-for w in 10 12 14 16; do
+for w in 16 18 19 20; do
   nvcc --ptx -arch compute_52 -O3 -DBC3_WINDOW=$w -x cu \
     src/kernels/bc3hash.cl -o src/kernels/bc3hash_w$w.ptx
 done
@@ -229,6 +231,44 @@ waves): the first waves of every launch run in lockstep and are slower, 8.4 us
 a hash at one or two waves a launch against 7.9 at eight on an RTX 3050 Ti
 (`cuda_bc3hash_launch_sizes`). A stream per launch did not change that.
 
+### Window tuning
+
+`src/tuning.rs` decides, `gpu_worker::Tune` drives it. Every CUDA card
+starts at window 16 and mines from its first launch. Then it picks the
+largest window whose tables fit beside 1 GiB of free GPU memory and, while
+they are built, 2 GiB of free host memory, builds them in the background
+(`bc3::prebuild`: one build for every card that wants the same window, held
+until the last lets go) and has the driver compile that window's kernel
+ahead on a non-primary context of the card (`compile_bc3hash_ahead`), so the
+switch later is a load from the driver's cache. Then it measures, in GPU
+time from the launches' own events: 90 s of warm-up after the build, 16 for
+a minute, the bigger window for a minute after 30 s of settling, 16 again.
+The bigger window stays if it beat the mean of the two 16s by 0.5 %. A
+switch ends the launch run as a new job would: what is in flight is
+collected, the main loop switches (`switch_bc3`, self-test included) and
+picks the same job up where the cursor stopped.
+
+- **In a laptop, CPU and GPU share one power budget, and the GPU gets its
+  share back slowly.** The table build, on every core, took an RTX 3050 Ti
+  from 40 to 27 W, and it was back at 40 W only 90 s after the build; 16
+  measured right after the build came out 20 % low, and window 19 looked
+  11.5 % faster where it is 2-5 %. Hence the warm-up after the build, and
+  hence 16 is measured twice: the mean cancels a steady drift, and two 16s
+  more than 5 % apart (`MAX_DRIFT`) mean something else moved the rate - the
+  choice holds for the run, and the next start measures again.
+- **What is remembered**: a steady measurement, win or loss, and a bigger
+  window that failed its switch - per card name, memory size, driver and
+  miner version (`tuning::key`), in `tuning.json` in the user's cache
+  directory (`BC3_TUNING_FILE` overrides it; the Docker image points
+  `XDG_CACHE_HOME` at a directory its user may write). A new driver or
+  miner version measures again.
+- **OpenCL cards do not tune** (`MiningBackend::memory` is None there): a
+  switch builds the program from source while the card waits, and OpenCL
+  caps one buffer at `CL_DEVICE_MAX_MEM_ALLOC_SIZE`. Untried on AMD and
+  Intel cards.
+- The GUI learns each card's window from `Event::Tables`: the window, the
+  tables' size, whether it is tuning, and what the measurement found.
+
 ## Changing the GPU kernel
 
 `bc3hash.cl` is shared by both backends and compiled two different ways - to
@@ -253,15 +293,18 @@ lab (see "The BC3Hash GPU kernel"); the workflow that catches mistakes here:
 
    ```
    docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.0.1-devel-ubuntu22.04 \
-     sh -c 'for w in 10 12 14 16; do /usr/local/cuda/bin/nvcc --ptx -arch compute_52 \
+     sh -c 'for w in 16 18 19 20; do /usr/local/cuda/bin/nvcc --ptx -arch compute_52 \
        -O3 -DBC3_WINDOW=$w -x cu src/kernels/bc3hash.cl -o src/kernels/bc3hash_w$w.ptx; done'
    ```
 3. **Verify bit-exactness against an independent reference**, not against the
    previous kernel: the node's own C++, which `bc3hash/` builds. Every card's
    self-test does that before it mines (the node's header vectors, random
    headers, a scan through the launch queue against the CPU's hit set), and
-   `cargo test --release -- --ignored` on a GPU runs it at windows 10 and 16,
-   and `cuda_bc3hash_queued_launches_match_the_cpu` on top.
+   `cargo test --release -- --ignored` on a GPU runs it at every window the
+   card has the memory for, switching between them on one context
+   (`cuda_bc3hash_every_window_passes_the_self_test`), and
+   `cuda_bc3hash_queued_launches_match_the_cpu` on top. The lab's 20,000
+   random inputs against the node's code run at window 16.
 4. Check the OpenCL build too - under pocl it runs without a GPU (README). It
    is a different compiler with different rules, and it does not even share
    all of its arithmetic with the CUDA build (the C versions instead of inline
@@ -284,8 +327,9 @@ cargo build --release --features internal-tools
 **No release enables it**: `release.yml`, the Dockerfile and `build.yml`'s
 package all build the default features. A default build has none of the
 options below, not even hidden - passing one is clap's "unexpected argument"
-error - and mines with the defaults they would otherwise override: window 16,
-and the CPU tables picked as `--bc3hash-mode` describes. The code is
+error - and mines with the defaults they would otherwise override: the window
+each card tunes for itself, and the CPU tables picked as `--bc3hash-mode`
+describes. The code is
 `src/internal.rs` (the options and the dispatch), `src/bench.rs` and
 `src/solve.rs`; anything only they use is gated with the feature too, so a
 default build has no dead code. `build.yml` runs `cargo test --release
@@ -295,15 +339,17 @@ default build has no dead code. `build.yml` runs `cargo test --release
 |--------|----------|--------------|
 | `--benchmark` | | Measure instead of mining, see below |
 | `--solve job.json` | | Mine one fixed block template offline, see below |
-| `--bc3-window 10\|12\|14\|16` | `BC3_BC3HASH_WINDOW` | Table window of the GPU's BC3Hash kernel: 7, 22, 76 or 256 MiB of GPU memory. Default 16 |
+| `--bc3-window 16\|18\|19\|20` | `BC3_BC3HASH_WINDOW` | Table window of the GPU's BC3Hash kernel: 256 MiB, 0.9, 1.8 or 3.3 GiB of GPU memory. Fixes it for every card; without it each tunes its own |
+| `--tune` | | Benchmark: leave the window to each card's tuning, as a release does. Measures afresh only with a new `BC3_TUNING_FILE` |
 | `--bc3hash-mode fast\|compact` | `BC3_BC3HASH_MODE` | The CPU's BC3Hash tables: `fast` (~256 MiB of RAM, about 10 s to build) or `compact` (~7 MiB, 10-20 % slower); both find the same shares. Default `compact` when a GPU mines BC3Hash and the CPU only re-checks its hits, `fast` otherwise |
-| `--seconds N` | | Benchmark: seconds a run (default 20 comparing windows, else 60) |
+| `--seconds N` | | Benchmark: seconds a run (default 20 comparing windows, 540 with `--tune`, else 60) |
 | `--difficulty D` | | Benchmark and solve: a fixed share difficulty instead of one from the measured rate |
 | `--gpu-queue 1\|2` (hidden) | | Kernel launches each GPU keeps queued; 1 is the old one-at-a-time loop |
 
 ```
 bc3-miner --benchmark                    # BC3Hash: every GPU, all four table windows
 bc3-miner --benchmark --bc3-window 16    # BC3Hash at one window, 60 s
+BC3_TUNING_FILE=/tmp/t.json bc3-miner --benchmark --tune   # the tuning, from scratch
 bc3-miner --solve job.json
 ```
 
@@ -318,8 +364,9 @@ two runs are averaged: a GPU's clock drifts as it warms up - on a laptop by
 more than the windows differ - and a steady drift cancels out that way.
 Before a window is measured, every card loads its kernel for it; the first
 time on a machine the driver compiles it, which can take up to a minute and
-is not counted. The summary ends with the fastest window for each card. On
-the cards measured so far, window 16 has been the fastest.
+is not counted. The summary ends with the fastest window for each card: on
+an RTX 4090 window 20 (2.66 MH/s against 2.52 at 16, 60 s runs), on an RTX
+3050 Ti laptop 19, the largest its 4 GiB hold.
 
 Reading its output:
 

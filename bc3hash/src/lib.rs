@@ -9,8 +9,12 @@
 //! which is why `initialize` checks the build against the node's vectors
 //! before anything is hashed (see `SELF_TEST`).
 //!
-//! The hash is about 800 times as expensive as SHA3-256t - elliptic-curve
-//! multiplications and big modular exponentiations - and has no GPU kernel.
+//! The hash is about 800 times as expensive as SHA3-256t, the proof of work
+//! before it - elliptic-curve multiplications and big modular
+//! exponentiations. This is the CPU's BC3Hash, and the reference the miner's
+//! GPU kernel (src/kernels/bc3hash.cl) is checked against: its self-test,
+//! and every hit before it is submitted. The kernel's tables come from here
+//! too (`gpu_tables`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
