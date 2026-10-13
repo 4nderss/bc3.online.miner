@@ -41,20 +41,26 @@ const spark = [];
 let sparkAlgo = null; // the PoW the sparkline's samples are of
 let sparkSkip = 0;    // samples to leave out after a change of PoW
 const rates = [];     // the last minute of samples, for the rate shown
+let gpuNames = [];    // the GPUs the miner started with, by slot
+const gpuTables = []; // per GPU slot: the BC3Hash tables it mines with
 
 // ---------- Formatting ----------
 const num1 = new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 // MH/s with one decimal from 10 MH/s up, never GH/s: "1 698,4 MH/s" rather
 // than "1,70 GH/s". The rounding to two decimals of a GH hid the last
 // percent or two, which is exactly the range people tune in. Below 10 MH/s,
-// two decimals for the same reason: an RTX 4090 on BC3Hash is ~1.25 MH/s,
-// and "1,3" would hide the few percent the table windows differ by.
+// two decimals for the same reason: an RTX 4090 on BC3Hash is ~2.6 MH/s,
+// and "2,6" would hide the few percent the table windows differ by.
 function fmtHashrate(h) {
   if (!isFinite(h) || h <= 0) return "0 H/s";
   if (h >= 1e7) return num1.format(h / 1e6) + " MH/s";
   if (h >= 1e6) return num2.format(h / 1e6) + " MH/s";
   if (h >= 1e3) return num2.format(h / 1e3) + " kH/s";
   return numInt.format(Math.round(h)) + " H/s";
+}
+// The memory a GPU's BC3Hash tables take: "256 MB", "3,3 GB".
+function fmtTables(mib) {
+  return mib >= 1024 ? num1.format(mib / 1024) + " GB" : numInt.format(mib) + " MB";
 }
 function fmtDuration(s) {
   if (!isFinite(s) || s <= 0) return "—";
@@ -423,11 +429,42 @@ el("block-close").addEventListener("click", () =>
   el("block-overlay").classList.add("hidden")
 );
 
+// The BACKEND card's line: each GPU, and the BC3Hash tables it mines with.
+// A bigger table window hashes faster where the card has the memory, so
+// each card measures one ("tuning") before it settles on it or on 16.
+function renderDevice() {
+  if (!gpuNames.length) return;
+  el("device").textContent = gpuNames
+    .map((name, i) => {
+      const t = gpuTables[i];
+      if (!t) return name;
+      return `${shortGpu(name)} · ${t.tuning ? "tuning…" : fmtTables(t.mib) + " tables"}`;
+    })
+    .join(", ");
+  el("device").title = gpuNames
+    .map((name, i) => {
+      const t = gpuTables[i];
+      if (!t) return name;
+      return `${name} — BC3Hash table window ${t.window}${t.tuning ? ", measuring a bigger one" : ""}`;
+    })
+    .join("\n");
+}
+// "CUDA #0: NVIDIA GeForce RTX 4090" -> "CUDA", "RTX 4090": the card is
+// narrow, and the tables are what the line is for once they are known.
+function shortGpu(name) {
+  const m = name.match(/^([A-Za-z]+) #\d+:\s*(.*)$/);
+  const card = (m ? m[2] : name).replace(/^(NVIDIA\s+)?GeForce\s+/i, "");
+  return m ? `${m[1]} · ${card}` : card;
+}
+
 // ---------- Events from the miner ----------
 listen("miner-event", ({ payload: ev }) => {
   switch (ev.type) {
     case "startup":
       el("backend").textContent = ev.gpus.length ? "GPU" : "CPU";
+      gpuNames = ev.gpus;
+      gpuTables.length = 0;
+      el("device").title = "";
       el("device").textContent = ev.gpus.length
         ? ev.gpus.join(", ")
         : `${ev.cpu_threads} threads`;
@@ -496,6 +533,21 @@ listen("miner-event", ({ payload: ev }) => {
     case "share":
       noteShare(ev.accepted);
       break;
+    case "tables": {
+      const was = gpuTables[ev.gpu];
+      gpuTables[ev.gpu] = { window: ev.window, mib: ev.mib, tuning: ev.tuning };
+      renderDevice();
+      if (ev.tuning) {
+        log(`GPU ${ev.gpu}: measuring whether bigger BC3Hash tables hash faster — a few minutes, mining all along`);
+      } else if (ev.tried != null && ev.gain_pct != null) {
+        const gain = (ev.gain_pct >= 0 ? "+" : "") + num1.format(ev.gain_pct);
+        const kept = ev.window === ev.tried ? "kept" : "staying at 16";
+        log(`GPU ${ev.gpu}: table window ${ev.tried} measured ${gain} % against 16 — ${kept}, ${fmtTables(ev.mib)} of tables`);
+      } else if (!was || was.window !== ev.window || was.tuning) {
+        log(`GPU ${ev.gpu}: BC3Hash tables ${fmtTables(ev.mib)} (window ${ev.window})`);
+      }
+      break;
+    }
     case "newblockheight": {
       renderJob(ev.height, ev.network_difficulty);
       const diff = ev.network_difficulty > 0 ? ", difficulty " + fmtDiff(ev.network_difficulty) : "";
@@ -514,6 +566,9 @@ listen("miner-log", ({ payload }) => log(payload.text));
 
 listen("miner-stopped", ({ payload: code }) => {
   setRunning(false);
+  gpuTables.length = 0;
+  renderDevice();
+  el("device").title = "";
   setStatus(null, "Idle");
   rates.length = 0;
   setStat("hashrate", "—");
