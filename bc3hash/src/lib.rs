@@ -17,7 +17,7 @@
 //! too (`gpu_tables`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 #[cfg(target_arch = "wasm32")]
 mod wasm_malloc;
@@ -136,6 +136,42 @@ static FAST: AtomicBool = AtomicBool::new(false);
 /// whoever gets there first.
 static READY: OnceLock<Result<(), InitError>> = OnceLock::new();
 
+/// Held for reading by every hash; taken for writing, for good, at exit.
+///
+/// The node's mix.cpp keeps its secp256k1 context and its tables in function
+/// statics, which the C++ runtime destroys when the process exits - with a
+/// worker thread perhaps still inside a hash, reading them. The miner never
+/// joins its workers, and neither do the tests that start them: the 2.1.0
+/// release workflow's test binary died of SIGSEGV after every test had
+/// passed (on a 4-core runner; 0 in 25 runs on 20 cores). `stop_hashing`,
+/// registered to run at exit before those destructors, lets the hashes in
+/// flight finish and starts no new one. A hash costs about a millisecond,
+/// the lock two atomic operations.
+static HASHING: RwLock<()> = RwLock::new(());
+
+/// Register `stop_hashing` to run at exit, ahead of the C++ destructors.
+/// Exit handlers run in the reverse order of their registration, and each
+/// static registered its destructor when it was built - which `initialize`
+/// and its self-test hashes have done by the time this is called.
+#[cfg(not(target_arch = "wasm32"))]
+fn stop_hashing_at_exit() {
+    extern "C" {
+        fn atexit(f: extern "C" fn()) -> std::os::raw::c_int;
+    }
+    extern "C" fn stop_hashing() {
+        // Never given back: the process is ending, and whatever asks for a
+        // hash from here on waits for that.
+        std::mem::forget(HASHING.write().unwrap_or_else(|e| e.into_inner()));
+    }
+    // SAFETY: registers a function that takes nothing and returns nothing,
+    // as atexit requires; called once, from `build_and_check`.
+    unsafe { atexit(stop_hashing) };
+}
+
+/// No exit, and no threads, in the browser.
+#[cfg(target_arch = "wasm32")]
+fn stop_hashing_at_exit() {}
+
 /// Choose the table mode. Only the first `initialize` (or hash) uses it, so
 /// call this before anything hashes.
 pub fn configure(mode: Mode) {
@@ -231,6 +267,7 @@ fn build_and_check() -> Result<(), InitError> {
             });
         }
     }
+    stop_hashing_at_exit();
     Ok(())
 }
 
@@ -255,6 +292,7 @@ pub fn table_bytes() -> usize {
 }
 
 fn raw_hash(data: &[u8]) -> [u8; 32] {
+    let _hashing = HASHING.read().unwrap_or_else(|e| e.into_inner());
     let mut out = [0u8; 32];
     // SAFETY: data/len describe a valid slice and out holds 32 bytes.
     let rc = unsafe { bc3hash_hash(data.as_ptr(), data.len(), out.as_mut_ptr()) };
@@ -284,6 +322,7 @@ pub fn bc3mix(data: &[u8]) -> [u8; 32] {
     if let Err(e) = READY.get_or_init(build_and_check) {
         panic!("{e}");
     }
+    let _hashing = HASHING.read().unwrap_or_else(|e| e.into_inner());
     let mut out = [0u8; 32];
     // SAFETY: as above.
     let rc = unsafe { bc3hash_mix(data.as_ptr(), data.len(), out.as_mut_ptr()) };
