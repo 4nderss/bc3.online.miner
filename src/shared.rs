@@ -184,7 +184,8 @@ pub struct Shared {
     pub started: std::time::Instant,
 }
 
-/// The BC3Hash table window the GPUs use unless told otherwise (`--bc3-window`).
+/// The BC3Hash table window the GPUs use. Only an internal-tools build can
+/// choose another (`--bc3-window`).
 pub const DEFAULT_BC3_WINDOW: u32 = 16;
 
 /// `Shared::gpu_slot_bc3` value for a GPU whose BC3Hash kernel failed to load
@@ -419,7 +420,9 @@ impl Shared {
     }
 
     /// Ask the GPUs for another BC3Hash window; they switch before their next
-    /// BC3Hash job, so publish a job after this.
+    /// BC3Hash job, so publish a job after this. Only the internal tools do:
+    /// a release mines at `DEFAULT_BC3_WINDOW`.
+    #[cfg(feature = "internal-tools")]
     pub fn set_bc3_window(&self, window: u32) {
         self.bc3_window.store(window, Ordering::Relaxed);
     }
@@ -506,7 +509,9 @@ impl Shared {
     }
 
     /// Cap the launches a GPU keeps queued; the default is as many as the
-    /// backends allow.
+    /// backends allow. Only for comparing the two (`--gpu-queue`, internal
+    /// tools).
+    #[cfg(feature = "internal-tools")]
     pub fn set_gpu_queue(&self, launches: u32) {
         self.gpu_queue.store(launches.max(1), Ordering::Relaxed);
     }
@@ -839,8 +844,11 @@ mod tests {
         assert!(!s.gpus_mine(PowAlgo::Bc3Hash));
         assert!(!s.gpus_mine(PowAlgo::Sha3t));
         assert_eq!(s.bc3_window(), DEFAULT_BC3_WINDOW);
-        s.set_bc3_window(12);
-        assert_eq!(s.bc3_window(), 12);
+        #[cfg(feature = "internal-tools")]
+        {
+            s.set_bc3_window(12);
+            assert_eq!(s.bc3_window(), 12);
+        }
     }
 
     /// A change of PoW is announced once, not once per job.

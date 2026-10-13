@@ -115,6 +115,14 @@ jobs:
       # of the kernel algorithm, address validation, and the throttle.
       - name: Test (core)
         run: cargo test --release
+      # The internal tools (--benchmark, --solve; see AGENTS.md) are behind a
+      # feature no release enables. Built and tested here so they cannot rot.
+      # Before "Build miner (CLI)" on purpose: that step builds
+      # target/release/bc3-miner.exe with the default features, whatever an
+      # earlier step left there, and that is the binary the package and the
+      # GUI get.
+      - name: Test (internal tools)
+        run: cargo test --release --features internal-tools
       - name: Test (wasm crate, host target)
         run: cargo test --release --manifest-path wasm/Cargo.toml
 

@@ -33,6 +33,8 @@ src/                 mining core (the bc3-miner CLI)
   kernels/sha3t.cl   GPU kernel - shared source for CUDA and OpenCL
   kernels/sha3t.ptx  GENERATED from sha3t.cl - never hand-edit
   consensus.rs       CPU reference implementation; the correctness oracle
+  internal.rs        --benchmark (bench.rs) and --solve (solve.rs): only
+                     with the internal-tools feature, never in a release
 bc3hash/             BC3Hash, the PoW of the second fork: the node's own C++
   vendor/            src/crypto/bc3 + src/secp256k1 of the node - never edit
   vectors/           the node's test vectors (doc/bc3/vectors)
@@ -124,7 +126,8 @@ directories again, update `SOURCE_COMMIT` and the vectors, and run the tests.
 `src/kernels/bc3hash.cl` is generated outside this repository (the kernel lab,
 from the node's constants) - copy it in whole, never edit it here. It is the
 same CUDA/OpenCL macro scheme as `sha3t.cl`. Its secp256k1 tables come in four
-window sizes, chosen at run time (`--bc3-window`), so it is built four times:
+window sizes, chosen at run time - releases mine with 16, an internal-tools
+build takes `--bc3-window` (see "Internal tools") - so it is built four times:
 
 ```
 for w in 10 12 14 16; do
@@ -166,17 +169,17 @@ reference, and a scan range against the CPU's hit set. A card that fails
 mines no BC3Hash; the CPU takes over. Launches are whole waves of the card
 (`launch_granule`) - a partial last wave cost 14 % on an RTX 3050 Ti.
 
-`bc3-miner --benchmark` measures it through the real worker path with an
-in-process job source, compares the four windows on every card with the
-kernel, and checks every share with the CPU reference. It also prints how
-busy each GPU was: the device time of its launches (CUDA events, OpenCL
-profiling) over the wall time between them.
+`bc3-miner --benchmark`, in an internal-tools build, measures it through the
+real worker path with an in-process job source, compares the four windows on
+every card with the kernel, and checks every share with the CPU reference. It
+also prints how busy each GPU was: the device time of its launches (CUDA
+events, OpenCL profiling) over the wall time between them.
 
 Every GPU keeps two launches queued (`backend::QUEUE_DEPTH`), each with its
 own buffers: the next one waits on the device while the host collects the
 last and re-checks its hits - about a millisecond a BC3Hash hit. The hidden
-`--gpu-queue 1` brings back the one-at-a-time loop, to compare the two with
-`--benchmark`. BC3Hash launches stay long (~400 ms, 8 waves): the first waves
+`--gpu-queue 1` of an internal-tools build brings back the one-at-a-time
+loop, to compare the two with `--benchmark`. BC3Hash launches stay long (~400 ms, 8 waves): the first waves
 of every launch run in lockstep and are slower, 8.4 us a hash at one or two
 waves a launch against 7.9 at eight on an RTX 3050 Ti
 (`cuda_bc3hash_launch_sizes`). A stream per launch did not change that.
@@ -226,10 +229,91 @@ Register spills are catastrophic here, not merely slow: dynamic indexing of the
 state array pushes it to local memory and costs roughly 100x. If `ptxas -v`
 reports any spill, stop and fix that first.
 
+## Internal tools
+
+The benchmark and the offline solver are for measuring the miner and for
+one-off jobs, not for the people running it - `--solve` above all, which
+mines a block template that is not the pool's. They are compiled in only with
+the `internal-tools` feature:
+
+```
+cargo build --release --features internal-tools
+```
+
+**No release enables it**: `release.yml`, the Dockerfile and `build.yml`'s
+package all build the default features. A default build has none of the
+options below, not even hidden - passing one is clap's "unexpected argument"
+error - and mines with the defaults they would otherwise override: window 16,
+and the CPU tables picked as `--bc3hash-mode` describes. The code is
+`src/internal.rs` (the options and the dispatch), `src/bench.rs` and
+`src/solve.rs`; anything only they use is gated with the feature too, so a
+default build has no dead code. `build.yml` runs `cargo test --release
+--features internal-tools` so none of it rots.
+
+| Option | Variable | What it does |
+|--------|----------|--------------|
+| `--benchmark` | | Measure instead of mining, see below |
+| `--solve job.json` | | Mine one fixed block template offline, see below |
+| `--bc3-window 10\|12\|14\|16` | `BC3_BC3HASH_WINDOW` | Table window of the GPU's BC3Hash kernel: 7, 22, 76 or 256 MiB of GPU memory. Default 16 |
+| `--bc3hash-mode fast\|compact` | `BC3_BC3HASH_MODE` | The CPU's BC3Hash tables: `fast` (~256 MiB of RAM, about 10 s to build) or `compact` (~7 MiB, 10-20 % slower); both find the same shares. Default `compact` when a GPU mines BC3Hash and the CPU only re-checks its hits, `fast` otherwise |
+| `--algo bc3hash\|sha3t` | | The PoW the benchmark measures (default `bc3hash`) |
+| `--seconds N` | | Benchmark: seconds a run (default 20 comparing windows, else 60) |
+| `--difficulty D` | | Benchmark and solve: a fixed share difficulty instead of one from the measured rate |
+| `--gpu-queue 1\|2` (hidden) | | Kernel launches each GPU keeps queued; 1 is the old one-at-a-time loop |
+
+```
+bc3-miner --benchmark                    # BC3Hash: every GPU, all four table windows
+bc3-miner --benchmark --bc3-window 16    # BC3Hash at one window, 60 s
+bc3-miner --benchmark --algo sha3t       # SHA3-256t
+bc3-miner --solve job.json
+```
+
+`--benchmark` mines without a pool, a network or an address. An in-process
+job source hands random jobs with the right version bits to the normal
+workers - the same dispatch, kernels and launch queue as real mining, every
+GPU hit re-checked on the CPU - and every share is checked once more against
+the CPU reference, the way the pool checks it. For BC3Hash on GPUs with the
+kernel, and without `--bc3-window`, it compares the four table windows. Each
+window runs twice, once on the way up and once on the way back down, and the
+two runs are averaged: a GPU's clock drifts as it warms up - on a laptop by
+more than the windows differ - and a steady drift cancels out that way.
+Before a window is measured, every card loads its kernel for it; the first
+time on a machine the driver compiles it, which can take up to a minute and
+is not counted. The summary ends with the fastest window for each card. On
+the cards measured so far, window 16 has been the fastest.
+
+Reading its output:
+
+- **Rates** are per device, measured between the ends of whole kernel
+  launches. With NVIDIA, each line also shows the first card's temperature
+  and power.
+- **busy** is the share of the time the GPU spent running kernels, by its
+  own clock, over the wall time between launches. Close to 100 % (99.9 % on
+  the cards measured) means the host keeps the card fed and the rate is the
+  kernel's. Clearly lower means the card waited for the host between
+  launches - a CPU too busy to queue the next launch and re-check hits, for
+  instance. That rate is lost on the host side, and no kernel setting brings
+  it back. Time a card spends drawing the desktop counts as busy.
+- **shares ok/bad**: the last line is `RESULT: ok` (exit code 0). `RESULT:
+  INVALID SHARES` (exit code 1) means this build or this GPU computes wrong
+  hashes. `RESULT: nothing hashed` exits with 2.
+
+`--solve` is for a block that has to be mined before any pool can hand it
+out - the fork's first block was published this way. The job file holds
+`height`, `hashPrevBlock`, `nVersion`, `nTime`, `nBits`, `scriptSigData` (hex,
+put in the coinbase's scriptSig after the height) and `payouts` (a list of
+`scriptPubKey` and `satoshis`). No pool, node or network is involved. It runs
+on the same workers and kernels as pool mining, re-checks every GPU hit on
+the CPU, and draws a random extranonce each run, so several machines - or a
+restart - never search the same space. When a hash meets the block's target,
+it prints the whole block and saves it as `bc3-block-<height>-<hash>.txt`,
+ready for `submitblock` on a node that has the block before it.
+
 ## Testing
 
 ```
 cargo test                              # CPU: consensus vectors, kernel mirror
+cargo test --features internal-tools    # the same, plus the internal tools
 cargo test --release -- --ignored       # GPU tests; need an actual GPU
 ```
 
@@ -240,7 +324,9 @@ so it runs in plain Docker. Both Docker recipes are in the README.
 
 Tag; CI does the rest. `release.yml` runs the tests, builds Windows and Linux,
 writes one `SHA256SUMS` over both, attaches a build provenance attestation, and
-opens a **draft** release. Publishing stays a human click.
+opens a **draft** release. Publishing stays a human click. Every release
+artifact - the binaries, the GUI's sidecar, the container image - is built
+with the default features: never with `internal-tools`.
 
 The checksum and the attestation answer different questions and both have to
 ship: the checksum says the download is intact, the attestation says it came

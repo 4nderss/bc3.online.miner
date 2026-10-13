@@ -101,82 +101,13 @@ Backend selection is automatic: CUDA if an NVIDIA GPU is present, otherwise Open
 | `--backend auto\|cuda\|opencl\|cpu` | Force a backend (default `auto`) |
 | `--gpu-id N` | Use only the N:th detected GPU |
 | `--threads N` | CPU threads, mining every job. Default: all cores in CPU mode. Next to a GPU the CPU does not mine unless you pass the flag: under `--backend auto` every core stands by and mines only what no GPU can (BC3Hash on a card whose kernel failed its self-test, for one), and with `--backend cuda` or `opencl` it stays out. `--threads 0` means "all cores", minus the GPU feeder threads when a GPU is running |
-| `--bc3-window 10\|12\|14\|16` | Table window of the GPU's BC3Hash kernel, in bits: 7, 22, 76 or 256 MiB of GPU memory (default `16`). Bigger is faster as long as the card's L2 cache keeps up; `--benchmark` compares them |
-| `--bc3hash-mode fast\|compact` | BC3Hash tables for the CPU: `fast` (~256 MiB of RAM, about 10 s to build at startup) or `compact` (~7 MiB, 10-20 % slower). Both find exactly the same shares. Default: `compact` when a GPU mines BC3Hash and the CPU only re-checks its hits, `fast` otherwise |
 | `--intensity 1-100` | Percentage of full speed (default `100`). Below 100 the workers idle between passes, which lowers heat and power and keeps the machine usable while mining |
 | `--stats-interval N` | Seconds between statistics lines (default `5`) |
 | `--json` | Emit machine-readable JSON events on stdout (used by the GUI) |
 | `--require-gpu` | Exit instead of falling back to CPU when no GPU is found (for rented GPU hosts, see Docker below) |
 | `--probe` | List the detected hardware and exit. Shows CUDA and OpenCL devices separately, so you can tell which runtimes work on your machine |
-| `--benchmark` | Measure instead of mining: no pool, no network, no address. See *Benchmark* below |
-| `--solve job.json` | Mine one fixed block template offline. See *Solving a block template offline* below |
 
 Solo rewards are paid directly to your address in the block you find.
-
-## Benchmark
-
-```
-bc3-miner --benchmark                    # BC3Hash: every GPU, all four table windows
-bc3-miner --benchmark --bc3-window 16    # BC3Hash at one window, 60 s
-bc3-miner --benchmark --algo sha3t       # SHA3-256t
-```
-
-`--benchmark` mines without a pool, a network or an address. An in-process
-job source hands random jobs with the right version bits to the normal
-workers - the same dispatch, kernels and launch queue as real mining, every
-GPU hit re-checked on the CPU - and every share is checked once more against
-the CPU reference, the way the pool checks it. `--algo bc3hash` is the
-default.
-
-For BC3Hash on GPUs with the kernel, and without `--bc3-window`, it compares
-the four table windows. Each window runs twice, once on the way up and once
-on the way back down (20 s a run; `--seconds N` changes it), and the two
-runs are averaged: a GPU's clock drifts as it warms up - on a laptop by more
-than the windows differ - and a steady drift cancels out that way. Before a
-window is measured, every card loads its kernel for it; the first time on a
-machine the driver compiles it, which can take up to a minute and is not
-counted. The summary ends with the fastest window for each card and the
-flag to mine with it. On the cards measured so far, window 16 (the default)
-has been the fastest.
-
-Reading the output:
-
-- **Rates** are per device, measured between the ends of whole kernel
-  launches. With NVIDIA, each line also shows the first card's temperature
-  and power.
-- **busy** is the share of the time the GPU spent running kernels, by its
-  own clock (CUDA events, OpenCL profiling), over the wall time between
-  launches. Close to 100 % (99.9 % on the cards measured) means the host
-  keeps the card fed and the rate is the kernel's. Clearly lower means the
-  card waited for the host between launches - a CPU too busy to queue the
-  next launch and re-check hits, for instance. That rate is lost on the host
-  side, and no kernel setting brings it back. Time a card spends drawing the
-  desktop counts as busy.
-- **shares ok/bad**: every share is checked against the CPU reference. The
-  last line is `RESULT: ok` (exit code 0). `RESULT: INVALID SHARES` (exit
-  code 1) means this build or this GPU computes wrong hashes - please report
-  it. `RESULT: nothing hashed` exits with 2.
-
-`--difficulty D` fixes the share difficulty, which otherwise follows the
-measured rate for a share every ~3 s.
-
-## Solving a block template offline
-
-```
-bc3-miner --solve job.json
-```
-
-For a block that has to be mined before any pool can hand it out - the
-fork's first block was published this way - `--solve` mines one fixed block
-template from a JSON job file: `height`, `hashPrevBlock`, `nVersion`,
-`nTime`, `nBits`, `scriptSigData` (hex, put in the coinbase's scriptSig
-after the height) and `payouts` (a list of `scriptPubKey` and `satoshis`).
-No pool, node or network is involved. It runs on the same workers and
-kernels as pool mining, re-checks every GPU hit on the CPU, and draws a
-random extranonce each run, so several machines - or a restart - never
-search the same space. When a hash meets the block's target, it prints the
-whole block and saves it as `bc3-block-<height>-<hash>.txt`, ready for
-`submitblock` on a node that has the block before it.
 
 ## Quick start — Docker
 
@@ -216,8 +147,6 @@ instead of `:latest` if you would rather choose when to move.
 | `BC3_THREADS` | none in GPU mode | CPU threads. |
 | `BC3_INTENSITY` | `100` | 1–100. Below 100 the machine stays usable. |
 | `BC3_GPU_ID` | all | Use only this one GPU, counting from 0. |
-| `BC3_BC3HASH_WINDOW` | `16` | BC3Hash GPU table window: 10, 12, 14 or 16. See `--bc3-window`. |
-| `BC3_BC3HASH_MODE` | see `--bc3hash-mode` | `fast` or `compact` BC3Hash tables for the CPU. |
 | `BC3_REQUIRE_GPU` | unset | Exit rather than fall back to CPU. |
 
 Casing does not matter: `BC3_WALLET` and `bc3_wallet` both work. Environment
@@ -265,9 +194,9 @@ Replace the binaries, or pull the new image, **before block 64,360**. The
 address, rig name, pool ports and every 1.x flag work as before, and the GUI
 keeps its settings. What is new:
 
-- BC3Hash needs memory for its tables: up to 256 MiB of GPU memory per card
-  at the default window (`--bc3-window 10` needs 7 MiB), and 7 to 256 MiB of
-  RAM for the CPU's tables (`--bc3hash-mode`).
+- BC3Hash needs memory for its tables: 256 MiB of GPU memory per card, and
+  RAM for the CPU's - about 7 MiB when a GPU mines BC3Hash and the CPU only
+  re-checks its hits, about 256 MiB when the CPU mines it.
 - At startup the miner checks its BC3Hash build against the node's test
   vectors, and every GPU checks its kernel against the CPU before it mines.
   A card that fails mines no BC3Hash - under `--backend auto` the CPU takes
@@ -331,7 +260,7 @@ numbering is the one `--gpu-id` means.
 - **32-bit limbs.** Products, squarings and reductions work on 32-bit limbs, which is what a GPU multiplies. Under CUDA they are inline PTX carry chains (`add.cc`/`addc`), 22 % faster on an RTX 3050 Ti than the same arithmetic in C; OpenCL compiles the C versions in the same file.
 - **Inversions by safegcd** (Bernstein-Yang divsteps), ported from libsecp256k1's `modinv32`: about a quarter of the instructions of Fermat's 255 squarings. Scalar multiplications run four at a time and share one field inversion (Montgomery's trick).
 - **Latency, not throughput, is the limit**: every step is a chain of dependent carries. The independent powers of a round run in pairs, so two chains interleave, and `__launch_bounds__` holds the kernel to 168 registers - three warps per scheduler instead of two. On an RTX 3050 Ti that was 30 % more hashes per clock.
-- **Four table windows.** The curve tables live in GPU memory, in windows of 10, 12, 14 or 16 bits: 7, 22, 76 or 256 MiB (`--bc3-window`, default 16). A bigger window means fewer point additions but more memory traffic, so the best one depends on the card's L2 cache. The PTX is built once per window, and the host builds the matching tables at startup (about 3 s for window 16).
+- **Four table windows.** The curve tables live in GPU memory, in windows of 10, 12, 14 or 16 bits: 7, 22, 76 or 256 MiB. A bigger window means fewer point additions but more memory traffic, so the best one depends on the card's L2 cache. Releases mine with 16, the fastest on every card measured so far; the other three are there for the benchmark to compare (see *Internal tools*). The PTX is built once per window, and the host builds the matching tables at startup (about 3 s for window 16).
 - **Checked bit-exact against the node.** In development: the node's reference vectors and 20,000 random BC3Mix/BC3Hash inputs at each of the four windows, and the PTX arithmetic against the C on inputs that reach every rare carry. On your machine, every card self-tests every window before it mines with it - the node's header vectors, random headers against the CPU reference, and a scan through the launch queue against the CPU's own hit set. A card that fails mines no BC3Hash, and under `--backend auto` the CPU takes over. Every GPU hit, of either proof of work, is re-checked on the CPU before it is submitted.
 
 ### SHA3-256t
@@ -346,9 +275,9 @@ numbering is the one `--gpu-id` means.
 
 | Device | Backend | Hashrate | How measured |
 |--------|---------|----------|--------------|
-| NVIDIA RTX 4090 | CUDA | ~1.98 MH/s | bc3-miner 2.0.0 solving a real block template (`--solve`), on the operator's card |
+| NVIDIA RTX 4090 | CUDA | ~1.98 MH/s | bc3-miner 2.0.0 solving a real block template offline, on the operator's card |
 | NVIDIA RTX 4050 Laptop GPU | CUDA | ~180 kH/s | reported by BC3's developer, with an earlier version of the kernel |
-| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, window 16 | ~165 kH/s | bc3-miner 2.0.0 `--benchmark`; the card is power-capped at ~40 W |
+| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, window 16 | ~165 kH/s | bc3-miner 2.0.0's benchmark (*Internal tools*); the card is power-capped at ~40 W |
 | Intel Core i9-12900HK | CPU, 20 threads, fast tables | ~8 kH/s (~1.1 kH/s on one thread) | through the miner's worker loop, Linux, Clang build |
 
 A laptop GPU's BC3Hash rate is set by its power limit as much as by the
@@ -435,6 +364,21 @@ it. The node's sources are in `bc3hash/vendor` (commit in
 `BC3HASH_VENDOR` and `BC3HASH_VECTORS` point the build and the tests
 somewhere else.
 
+### Internal tools
+
+`--benchmark` (mining without a pool: every GPU, its table windows compared,
+every share checked against the CPU) and `--solve` (mining one fixed block
+template offline) are tools for development, compiled in only with a
+feature that no release enables:
+
+```
+cargo build --release --features internal-tools
+```
+
+With them come `--bc3-window`, `--bc3hash-mode` and the benchmark's own
+options. A release build has none of these, not even hidden. AGENTS.md
+describes them.
+
 ### Tests
 
 CPU tests (consensus vectors, the node's BC3Hash vectors through the miner's own path, and a Rust mirror of the SHA3-256t kernel, verified bit-exactly against the chain-verified reference):
@@ -443,7 +387,7 @@ CPU tests (consensus vectors, the node's BC3Hash vectors through the miner's own
 cargo test
 ```
 
-`cargo test` inside `bc3hash/` runs the node's reference vectors against its C++ build as well.
+`cargo test` inside `bc3hash/` runs the node's reference vectors against its C++ build as well. `cargo test --features internal-tools` adds the tests of the internal tools.
 
 GPU tests (compare the full GPU hit set against the CPU reference on random headers) are `#[ignore]`d by default and require an NVIDIA GPU:
 

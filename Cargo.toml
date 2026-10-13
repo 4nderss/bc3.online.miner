@@ -26,6 +26,10 @@ opencl = ["dep:libloading"]
 # the CPU. Needs a C++20 compiler with unsigned __int128 - GCC or Clang, and
 # clang-cl rather than cl.exe on Windows (bc3hash/build.rs picks it).
 bc3hash = ["dep:bc3hash"]
+# Development tools, never in a release: --benchmark, --solve and the knobs
+# only they need (--bc3-window, --bc3hash-mode, --gpu-queue, ...). Without the
+# feature those options do not exist at all, not even hidden. See AGENTS.md.
+internal-tools = []
 
 [dependencies]
 sha3 = "0.10"

@@ -10,8 +10,8 @@
 //!
 //! BC3Hash is built four times, once per secp256k1 table window (10, 12, 14
 //! and 16 bits, `-DBC3_WINDOW=N`): which one is fastest depends on the card's
-//! L2, so the miner picks at run time (`--bc3-window`) and the benchmark
-//! compares them.
+//! L2. A release mines with 16; an internal-tools build picks one at run time
+//! (`--bc3-window`), and its benchmark compares them.
 //!
 //! Order, per PTX:
 //!   1. An explicit path in the environment (`BC3_PTX_PATH` for SHA3-256t,
