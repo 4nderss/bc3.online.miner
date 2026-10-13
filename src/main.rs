@@ -11,6 +11,9 @@ mod consensus;
 mod gpu_worker;
 mod ipc;
 mod telemetry;
+#[cfg(feature = "bc3hash")]
+#[allow(dead_code)] // wired into the GPU worker with the window switching
+mod tuning;
 mod shared;
 mod solve;
 mod stats;
