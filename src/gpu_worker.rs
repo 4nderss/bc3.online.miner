@@ -530,7 +530,8 @@ impl<'a> Worker<'a> {
                 continue;
             }
             let is_block = run.block_target.is_some_and(|t| hash_meets_target(&hash, &t));
-            self.shared.record_share(run.algo, crate::consensus::difficulty_of_hash(&hash), is_block);
+            let difficulty = crate::consensus::difficulty_of_hash(&hash);
+            self.shared.record_share(run.algo, difficulty, run.job.bits, is_block);
             self.shared.submit(FoundShare {
                 job_id: run.job.job_id.clone(),
                 extranonce2: done.extranonce2.clone(),

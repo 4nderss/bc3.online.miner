@@ -31,24 +31,32 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
 
         let accepted = shared.stats.accepted.load(Ordering::Relaxed);
         let rejected = shared.stats.rejected.load(Ordering::Relaxed);
+        // Read together: the GUI shows them as a pair, the block and its
+        // difficulty.
         let bits = shared.stats.network_bits.load(Ordering::Relaxed);
+        let job_height = shared.stats.job_height.load(Ordering::Relaxed);
         let network_difficulty = if bits != 0 { difficulty_of_bits(bits) } else { 0.0 };
         let eta_secs = (rate > 0.0 && bits != 0)
             .then(|| network_difficulty * 4_294_967_296.0 / rate);
 
         let temps = telemetry.read(0);
         let pool_rtt_ms = shared.pool_rtt_ms();
+        let best = shared.best_share();
+        let (best_share, best_needed) =
+            best.map_or((0.0, 0.0), |b| (b.difficulty, b.network_difficulty));
         crate::ipc::emit(&crate::ipc::Event::Stats {
             hashrate: rate,
             hashrate_gpu: gpu_rate,
             hashrate_cpu: cpu_rate,
             accepted,
             rejected,
-            best_share: shared.best_share(),
+            best_share,
+            best_share_network_difficulty: best_needed,
+            best_share_age_secs: best.map(|b| b.found.elapsed().as_secs_f64()),
             blocks: shared.stats.blocks.load(Ordering::Relaxed),
             eta_secs,
             network_difficulty,
-            job_height: shared.stats.job_height.load(Ordering::Relaxed),
+            job_height,
             pool_rtt_ms,
             telemetry: temps,
         });
@@ -58,17 +66,33 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
             (None, Some(c)) => format!(" | CPU {c}C"),
             (None, None) => String::new(),
         };
-        let best = shared.best_share();
         let blocks = shared.stats.blocks.load(Ordering::Relaxed);
         crate::human!(
             "[miner] {} | shares {accepted} ok, {rejected} rejected | {} | best {} | blocks {blocks} | est. block: {}{}",
             format_hashrate(rate),
             format_pool_rtt(pool_rtt_ms),
-            format_difficulty(best),
+            format_best_share(best_share, best_needed),
             eta_secs.map(format_duration).unwrap_or_else(|| "unknown".into()),
             temp_text
         );
     }
+}
+
+/// "1.460 of 11.280 (12.94%)": the best share against the block difficulty
+/// of the job it was found on - what it would have needed to be a block.
+/// "-" before the first share.
+pub fn format_best_share(best: f64, needed: f64) -> String {
+    if best <= 0.0 {
+        return "-".into();
+    }
+    if needed <= 0.0 {
+        return format_difficulty(best);
+    }
+    let pct = best / needed * 100.0;
+    // Two decimals stop saying anything below 0.01 %, which is where a
+    // BC3Hash share at the pool's start difficulty sits.
+    let pct = if pct >= 0.01 { format!("{pct:.2}%") } else { format!("{pct:.1e}%") };
+    format!("{} of {} ({pct})", format_difficulty(best), format_difficulty(needed))
 }
 
 /// "pool 34 ms": the latest round trip to the pool, "pool -" before one.
@@ -147,6 +171,9 @@ mod tests {
         for ms in [None, Some(0.4), Some(34.4), Some(1234.5)] {
             samples.push(format_pool_rtt(ms));
         }
+        for (best, needed) in [(0.0, 0.0), (2e-6, 11.28), (1.46, 11.28), (5e3, 0.0)] {
+            samples.push(format_best_share(best, needed));
+        }
         for s in samples {
             assert!(s.is_ascii(), "non-ASCII in log output: {s:?}");
         }
@@ -170,5 +197,18 @@ mod tests {
         assert_eq!(format_pool_rtt(None), "pool -");
         assert_eq!(format_pool_rtt(Some(2.34)), "pool 2.3 ms");
         assert_eq!(format_pool_rtt(Some(34.4)), "pool 34 ms");
+    }
+
+    /// The best share is shown against the difficulty its block needed, as
+    /// a percentage - readable from a BC3Hash share at the pool's start
+    /// difficulty up to one that was a block.
+    #[test]
+    fn best_share_against_its_block() {
+        assert_eq!(format_best_share(0.0, 11.28), "-");
+        assert_eq!(format_best_share(1.46, 11.28), "1.460 of 11.280 (12.94%)");
+        assert_eq!(format_best_share(14.0, 11.28), "14.000 of 11.280 (124.11%)");
+        assert_eq!(format_best_share(2.5e-6, 11.28), "2.50e-6 of 11.280 (2.2e-5%)");
+        // No block difficulty to measure against: the share alone.
+        assert_eq!(format_best_share(1.46, 0.0), "1.460");
     }
 }

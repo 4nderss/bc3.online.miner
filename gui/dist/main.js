@@ -40,6 +40,7 @@ let hw = "gpu";       // hardware: gpu | cpu | dual
 const spark = [];
 let sparkAlgo = null; // the PoW the sparkline's samples are of
 let sparkSkip = 0;    // samples to leave out after a change of PoW
+const rates = [];     // the last minute of samples, for the rate shown
 
 // ---------- Formatting ----------
 const num1 = new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
@@ -73,6 +74,21 @@ function fmtDiff(d) {
   for (const [u, f] of units) if (d >= f) return num2.format(d / f) + u;
   return d >= 1 ? num2.format(d) : sig3.format(d);
 }
+// Two decimals, or two significant digits below 1 %, where a BC3Hash best
+// share sits for its first hours. Intl, not toPrecision: that one wrote
+// "0.47" with a point whatever the locale.
+const pct2 = new Intl.NumberFormat(undefined, { style: "percent", minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const pctSig2 = new Intl.NumberFormat(undefined, { style: "percent", maximumSignificantDigits: 2 });
+function fmtPct(ratio) {
+  return ratio >= 0.01 ? pct2.format(ratio) : pctSig2.format(ratio);
+}
+// "12m ago", "2h 5m ago": fmtDuration's units, to the minute - a line that
+// ticked every second would pull the eye for nothing.
+function fmtAgo(s) {
+  if (!(s >= 60)) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return fmtDuration(s) + " ago";
+}
 function setStat(id, value) {
   const e = el(id);
   if (!e || e.textContent === value) return;
@@ -81,6 +97,58 @@ function setStat(id, value) {
   void e.offsetWidth;
   e.classList.add("bump");
 }
+// A sub line with the figure it is about picked out: "difficulty <b>11,28</b>".
+function setSub(id, before, figure = "", after = "") {
+  const e = el(id);
+  if (e.textContent === before + figure + after) return;
+  if (!figure) {
+    e.textContent = before + after;
+    return;
+  }
+  const b = document.createElement("b");
+  b.textContent = figure;
+  e.replaceChildren(before, b, after);
+}
+
+// ---------- Mining block ----------
+// The block the pool is working on - proof that we are in sync - and the
+// difficulty a hash has to reach to be it, from the job's own nBits: with
+// ASERT, since the BC3Hash fork, that is a new figure every block.
+function renderJob(height, difficulty) {
+  if (height > 0) setStat("job-height", "#" + numInt.format(height));
+  if (difficulty > 0) setSub("job-height-sub", "difficulty ", fmtDiff(difficulty));
+  else if (height > 0) setSub("job-height-sub", "in sync with the pool");
+  if (height > 0 || difficulty > 0) el("job-height-card").classList.add("live");
+}
+
+// ---------- Best share ----------
+// Against the difficulty of the block it was found on, which the miner
+// records with it: the difficulty moves every block, and the current one is
+// not what an hour-old share was up against. When the PoW changes the miner
+// starts the best share over, and the whole card goes back to the dash.
+let bestFoundAt = null; // performance.now() when it was found; null = none yet
+function renderBestShare(ev) {
+  const best = ev.best_share, need = ev.best_share_network_difficulty;
+  setStat("best-share", best > 0 ? fmtDiff(best) : "—");
+  if (best > 0 && need > 0) {
+    setSub("best-share-sub", "of ", fmtDiff(need), " needed · " + fmtPct(best / need));
+  } else {
+    setSub("best-share-sub", "highest difficulty hit");
+  }
+  bestFoundAt = best > 0 && ev.best_share_age_secs != null
+    ? performance.now() - ev.best_share_age_secs * 1000
+    : null;
+  renderBestAge();
+}
+// Between stats too, and after the miner stops: the share only gets older.
+function renderBestAge() {
+  const text = bestFoundAt === null
+    ? ""
+    : "found " + fmtAgo((performance.now() - bestFoundAt) / 1000);
+  const e = el("best-share-age");
+  if (e.textContent !== text) e.textContent = text;
+}
+setInterval(renderBestAge, 1000);
 
 // ---------- Log ----------
 function log(text, cls) {
@@ -121,6 +189,29 @@ function flushShares() {
   shareFlush = a || r ? setTimeout(flushShares, 1000) : null;
   if (a) log(`${numInt.format(a)} more share${a === 1 ? "" : "s"} accepted`, "l-ok");
   if (r) log(`${numInt.format(r)} more share${r === 1 ? "" : "s"} rejected`, "l-bad");
+}
+
+// ---------- Hashrate ----------
+// The rate shown, and its GPU/CPU split, are the mean of the last minute of
+// samples; the sparkline keeps every sample. Hashes are counted as a kernel
+// launch completes, so a sample holds whole launches, and one more or less
+// moves a 3 s sample by 7 % with BC3Hash's 0.2 s launches on an RTX 4090,
+// by 10 % with the 0.3 s of smaller cards. 1.83 MH/s here against ~1.9 in
+// the CLI (5 s samples) read as a slower GUI, with both computing the rate
+// the same way. Over a minute, one launch is 0.5 % at most.
+const RATE_WINDOW_MS = 60_000;
+function meanRate(ev) {
+  const now = performance.now();
+  // Zeros before the first hash are the miner starting up, not a rate: the
+  // minute starts at the first hash.
+  if (rates.length || ev.hashrate > 0) {
+    rates.push({ t: now, total: ev.hashrate, gpu: ev.hashrate_gpu, cpu: ev.hashrate_cpu });
+  }
+  while (rates.length && now - rates[0].t >= RATE_WINDOW_MS) rates.shift();
+  if (!rates.length) return { total: ev.hashrate, gpu: ev.hashrate_gpu, cpu: ev.hashrate_cpu };
+  // The plain mean is the time-weighted one: the samples are evenly spaced.
+  const mean = (k) => rates.reduce((sum, r) => sum + r[k], 0) / rates.length;
+  return { total: mean("total"), gpu: mean("gpu"), cpu: mean("cpu") };
 }
 
 // ---------- Hashrate-sparkline ----------
@@ -304,6 +395,7 @@ async function toggle() {
   spark.length = 0;
   sparkAlgo = null;
   sparkSkip = 0;
+  rates.length = 0;
   drawSpark();
   try {
     await invoke("start_mining", {
@@ -351,6 +443,7 @@ listen("miner-event", ({ payload: ev }) => {
       // The first sample after the switch still counts hashes of both.
       if (sparkAlgo !== null && sparkAlgo !== ev.algo) {
         spark.length = 0;
+        rates.length = 0;
         sparkSkip = 1;
         drawSpark();
       }
@@ -363,14 +456,19 @@ listen("miner-event", ({ payload: ev }) => {
       else if (ev.state === "error") setStatus("error", "Error");
       log(ev.message, ev.state === "error" ? "l-bad" : null);
       break;
-    case "stats":
-      setStat("hashrate", fmtHashrate(ev.hashrate));
+    case "stats": {
+      // The first sample after a change of PoW still counts hashes of both:
+      // it goes into neither the sparkline nor the rate shown.
+      const mixed = sparkSkip > 0;
+      if (mixed) sparkSkip--;
+      const rate = mixed ? null : meanRate(ev);
+      setStat("hashrate", rate ? fmtHashrate(rate.total) : "—");
       // Show the split only when both backends actually contribute - and
       // clear it when they stop: in auto the CPU stands in for the GPU until
       // its kernel is ready, and a split left over from those first seconds
       // kept showing a CPU rate that no longer added up to the total.
-      el("hashrate-sub").textContent = ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0
-        ? `GPU ${fmtHashrate(ev.hashrate_gpu)} · CPU ${fmtHashrate(ev.hashrate_cpu)}`
+      el("hashrate-sub").textContent = rate && ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0
+        ? `GPU ${fmtHashrate(rate.gpu)} · CPU ${fmtHashrate(rate.cpu)}`
         : "";
       setStat("accepted", numInt.format(ev.accepted));
       setStat("rejected", numInt.format(ev.rejected));
@@ -379,43 +477,29 @@ listen("miner-event", ({ payload: ev }) => {
       setStat("shares-sub", ev.pool_rtt_ms != null
         ? `accepted / rejected · pool ${numInt.format(Math.round(ev.pool_rtt_ms))} ms`
         : "accepted / rejected");
-      setStat("eta", ev.eta_secs ? fmtDuration(ev.eta_secs) : "—");
-      setStat("best-share", ev.best_share > 0 ? fmtDiff(ev.best_share) : "—");
+      // A block takes difficulty x 2^32 hashes on average - at the rate
+      // shown, not the last sample's, or the time to block jumped with it.
+      setStat("eta", rate && rate.total > 0 && ev.network_difficulty > 0
+        ? fmtDuration(ev.network_difficulty * 2 ** 32 / rate.total)
+        : "—");
+      renderBestShare(ev);
       setStat("blocks", numInt.format(ev.blocks || 0));
-      // How close to a block the best share was (network difficulty = 100%).
-      // The miner starts the best share over when the PoW changes; so does
-      // this line, or the last SHA3-256t figure stayed under the dash.
-      if (ev.best_share > 0 && ev.network_difficulty > 0) {
-        const pct = (ev.best_share / ev.network_difficulty) * 100;
-        el("best-share-sub").textContent =
-          (pct >= 1 ? num2.format(pct) : pct.toPrecision(2)) + "% of a block";
-      } else if (!(ev.best_share > 0)) {
-        el("best-share-sub").textContent = "highest difficulty hit";
-      }
-      el("netdiff").textContent = "network difficulty " + fmtDiff(ev.network_difficulty);
-      // The height the pool is working on - proof that we are in sync.
-      if (ev.job_height > 0) {
-        setStat("job-height", "#" + numInt.format(ev.job_height));
-        el("job-height-sub").textContent = "in sync with the pool";
-        el("job-height-card").classList.add("live");
-      }
+      renderJob(ev.job_height, ev.network_difficulty);
       renderTemps(ev);
-      if (sparkSkip > 0) {
-        sparkSkip--;
-      } else {
+      if (!mixed) {
         spark.push(ev.hashrate);
         while (spark.length > 60) spark.shift();
         drawSpark();
       }
       break;
+    }
     case "share":
       noteShare(ev.accepted);
       break;
     case "newblockheight": {
-      setStat("job-height", "#" + numInt.format(ev.height));
-      el("job-height-sub").textContent = "in sync with the pool";
-      el("job-height-card").classList.add("live");
-      log("pool started on block #" + numInt.format(ev.height), "l-accent");
+      renderJob(ev.height, ev.network_difficulty);
+      const diff = ev.network_difficulty > 0 ? ", difficulty " + fmtDiff(ev.network_difficulty) : "";
+      log("pool started on block #" + numInt.format(ev.height) + diff, "l-accent");
       break;
     }
     case "block":
@@ -431,7 +515,9 @@ listen("miner-log", ({ payload }) => log(payload.text));
 listen("miner-stopped", ({ payload: code }) => {
   setRunning(false);
   setStatus(null, "Idle");
+  rates.length = 0;
   setStat("hashrate", "—");
+  el("hashrate-sub").textContent = "";
   setStat("job-height", "—");
   el("job-height-sub").textContent = "waiting for a job";
   el("job-height-card").classList.remove("live");
