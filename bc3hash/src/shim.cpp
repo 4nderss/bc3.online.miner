@@ -89,9 +89,82 @@ int curve_table(const U256& px, const U256& py, unsigned window, std::uint64_t* 
     }
     return 0;
 }
+// One row of a curve's table on its own: b * 2^(w*row) * P for b = 1 ..
+// 2^w - 1 (the last row only up to its bits, padded with zeros), the same
+// points as curve_table's row - whose base comes from the row before it, here
+// straight from P by one scalar multiplication, so that every row of every
+// curve can be built at once. 0 = ok, -1 = secp256k1 refused something.
+int curve_row(const U256& px, const U256& py, unsigned window, unsigned row, std::uint64_t* out)
+{
+    struct Context {
+        secp256k1_context* p = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+        ~Context() { secp256k1_context_destroy(p); }
+    } ctx;
+    if (!ctx.p) return -1;
+    const unsigned digits = (256 + window - 1) / window;
+    const unsigned entries = (1u << window) - 1;
+    const unsigned last_entries = (1u << (256 - window * (digits - 1))) - 1;
+    const unsigned count = row + 1 == digits ? last_entries : entries;
+    std::array<unsigned char, 65> encoded{};
+    encoded[0] = 4;
+    px.store(encoded.data() + 1);
+    py.store(encoded.data() + 33);
+    secp256k1_pubkey base;
+    if (!secp256k1_ec_pubkey_parse(ctx.p, &base, encoded.data(), 65)) return -1;
+    if (row) {
+        // 2^(w*row) as a big-endian scalar; w*row <= 255 - w, below n.
+        std::array<unsigned char, 32> scalar{};
+        const unsigned bit = window * row;
+        scalar[31 - bit / 8] = static_cast<unsigned char>(1u << (bit % 8));
+        if (!secp256k1_ec_pubkey_tweak_mul(ctx.p, &base, scalar.data())) return -1;
+    }
+    secp256k1_pubkey point = base;
+    std::size_t k = 0;
+    for (unsigned j = 0; j < entries; ++j, k += 8) {
+        if (j >= count) {
+            std::memset(out + k, 0, 8 * sizeof(std::uint64_t));
+            continue;
+        }
+        if (j) {
+            const secp256k1_pubkey* points[] = {&point, &base};
+            secp256k1_pubkey next;
+            if (!secp256k1_ec_pubkey_combine(ctx.p, &next, points, 2)) return -1;
+            point = next;
+        }
+        std::size_t length = 65;
+        if (!secp256k1_ec_pubkey_serialize(ctx.p, encoded.data(), &length, &point, SECP256K1_EC_UNCOMPRESSED)) return -1;
+        const auto x = U256::load(encoded.data() + 1), y = U256::load(encoded.data() + 33);
+        for (std::size_t l = 0; l < 4; ++l) {
+            out[k + l] = x.v[l];
+            out[k + 4 + l] = y.v[l];
+        }
+    }
+    return 0;
+}
 } // namespace
 
 extern "C" {
+// Rows of a curve table at window `window`: how many, and u64s in each.
+unsigned bc3hash_gpu_rows(unsigned window) noexcept { return (256 + window - 1) / window; }
+std::size_t bc3hash_gpu_row_u64(unsigned window) noexcept { return std::size_t((1u << window) - 1) * 8; }
+
+// Fill row `row` of curve `curve` (0..3: H, J, K, L). 0 = ok, -1 = failed,
+// -2 = wrong window, curve, row or size.
+int bc3hash_gpu_curve_row(unsigned window, int curve, unsigned row, std::uint64_t* out, std::size_t len) noexcept
+{
+    try {
+        if (window < 2 || window > 24 || curve < 0 || curve > 3 || row >= bc3hash_gpu_rows(window) ||
+            len != bc3hash_gpu_row_u64(window))
+            return -2;
+        using namespace bc3::detail::constants;
+        const U256 xs[4] = {H_x, J_x, K_x, L_x};
+        const U256 ys[4] = {H_y, J_y, K_y, L_y};
+        return curve_row(xs[curve], ys[curve], window, row, out);
+    } catch (...) {
+        return -1;
+    }
+}
+
 
 // The GPU table buffer for a curve window of `window` bits comes in five
 // parts, in this order - the BC3_TABLE_* layout of src/kernels/bc3hash.cl:
