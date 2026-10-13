@@ -166,9 +166,40 @@ fn check_driver() -> Result<(), String> {
     Ok(())
 }
 
+/// The kernel's machine code, by window and architecture (build.rs).
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/sass.rs"));
+}
+
+/// The machine code for a card of architecture `sm` (major * 10 + minor) at
+/// `window`, and the architecture it was made for: the card's own, or the
+/// newest earlier minor of its major - machine code runs on the later minors
+/// of its own major (sm_86 code on sm_87), never on an earlier one or another
+/// major. None: the card JITs the PTX.
+fn pick_sass(
+    sass: &'static [(u32, u32, &'static [u8])],
+    window: u32,
+    sm: u32,
+) -> Option<(u32, &'static [u8])> {
+    sass.iter()
+        .filter(|(w, s, _)| *w == window && s / 10 == sm / 10 && *s <= sm)
+        .max_by_key(|(_, s, _)| *s)
+        .map(|(_, s, code)| (*s, *code))
+}
+
+/// The PTX of the kernel for `window`.
+fn bc3hash_ptx(window: u32) -> Result<&'static str, String> {
+    BC3HASH_PTX
+        .iter()
+        .find(|(w, _)| *w == window)
+        .map(|(_, ptx)| *ptx)
+        .ok_or_else(|| format!("no BC3Hash kernel for a window of {window} bits"))
+}
+
 /// Compile the BC3Hash kernel for `window` into the driver's JIT cache, so
 /// that loading it later - when the window tuning switches the card - comes
-/// from the cache in about a second instead of 10-60 s of JIT.
+/// from the cache in about a second instead of 10-60 s of JIT. Only for a
+/// card this build has no machine code for (`pick_sass`).
 ///
 /// On a context of its own: a JIT on the mining context blocks every launch
 /// on it until it is done (window 16 on an i9-12900HK: 16.7 s, and one launch
@@ -177,11 +208,7 @@ fn check_driver() -> Result<(), String> {
 /// memory it held with it.
 pub fn compile_bc3hash_ahead(index: usize, window: u32) -> Result<Duration, String> {
     let t0 = std::time::Instant::now();
-    let ptx = BC3HASH_PTX
-        .iter()
-        .find(|(w, _)| *w == window)
-        .map(|(_, ptx)| *ptx)
-        .ok_or_else(|| format!("no BC3Hash kernel for a window of {window} bits"))?;
+    let ptx = bc3hash_ptx(window)?;
     let ctx = CudaContext::new_non_primary(index, 0).map_err(|e| format!("context: {e}"))?;
     ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx))
         .map_err(|e| format!("could not load the BC3Hash kernel (window {window}): {e}"))?;
@@ -202,6 +229,11 @@ pub struct CudaBackend {
     next_slot: usize,
     /// The BC3Hash kernel in use - loaded on demand, for one window at a time.
     bc3: Option<Bc3Kernel>,
+    /// The card's architecture, major * 10 + minor: which machine code it
+    /// takes (`pick_sass`).
+    sm: u32,
+    /// Whether the card has been told that it JITs the PTX - said once.
+    told_jit: bool,
 }
 
 impl Drop for CudaBackend {
@@ -219,22 +251,58 @@ impl CudaBackend {
         let name = ctx.name().unwrap_or_else(|_| format!("CUDA device {index}"));
         let stream = ctx.default_stream();
         let slots = (0..QUEUE_DEPTH).map(|_| Slot::new(&ctx, &stream)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { index, ctx, stream, name, slots, queued: VecDeque::new(), next_slot: 0, bc3: None })
+        use sys::CUdevice_attribute::{
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR as MAJOR,
+            CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR as MINOR,
+        };
+        let sm = (ctx.attribute(MAJOR).unwrap_or(0) * 10 + ctx.attribute(MINOR).unwrap_or(0)).max(0) as u32;
+        Ok(Self {
+            index,
+            ctx,
+            stream,
+            name,
+            slots,
+            queued: VecDeque::new(),
+            next_slot: 0,
+            bc3: None,
+            sm,
+            told_jit: false,
+        })
     }
 
-    /// Load the BC3Hash kernel for `window` and upload its tables. The JIT
-    /// of a 2.8 MB PTX takes a while the first time on a card; the driver
-    /// caches the result.
+    /// The BC3Hash kernel for `window`: the machine code built for this
+    /// card's architecture where this build has it, else the PTX, which the
+    /// driver JITs - 20-60 s, unless its cache has the result.
+    fn load_module(&mut self, window: u32) -> Result<Arc<cudarc::driver::CudaModule>, String> {
+        match pick_sass(embedded::SASS, window, self.sm) {
+            Some((sm, packed)) => match miniz_oxide::inflate::decompress_to_vec(packed) {
+                Ok(code) => match self.ctx.load_module(cudarc::nvrtc::Ptx::from_binary(code)) {
+                    Ok(module) => return Ok(module),
+                    Err(e) => eprintln!(
+                        "[gpu] {}: the machine code for sm_{sm} would not load ({e}) - the driver \
+                         compiles the kernel instead",
+                        self.name
+                    ),
+                },
+                Err(e) => eprintln!("[gpu] {}: the machine code for sm_{sm} is damaged ({e:?})", self.name),
+            },
+            None if !self.told_jit => crate::human!(
+                "[gpu] {}: this build has no machine code for sm_{} - the driver compiles the \
+                 kernel, which takes up to a minute where it has not cached it",
+                self.name,
+                self.sm
+            ),
+            None => {}
+        }
+        self.told_jit = true;
+        self.ctx
+            .load_module(cudarc::nvrtc::Ptx::from_src(bc3hash_ptx(window)?))
+            .map_err(|e| format!("could not load the BC3Hash kernel (window {window}): {e}"))
+    }
+
+    /// Load the BC3Hash kernel for `window` and upload its tables.
     fn load_bc3(&mut self, window: u32) -> Result<Bc3Kernel, String> {
-        let ptx = BC3HASH_PTX
-            .iter()
-            .find(|(w, _)| *w == window)
-            .map(|(_, ptx)| *ptx)
-            .ok_or_else(|| format!("no BC3Hash kernel for a window of {window} bits"))?;
-        let module = self
-            .ctx
-            .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
-            .map_err(|e| format!("could not load the BC3Hash kernel (window {window}): {e}"))?;
+        let module = self.load_module(window)?;
         let scan = module
             .load_function("bc3hash_scan")
             .map_err(|e| format!("load_function bc3hash_scan: {e}"))?;
@@ -380,6 +448,10 @@ impl MiningBackend for CudaBackend {
     }
 
     fn compile_bc3hash_ahead(&self, window: u32) -> Option<std::sync::mpsc::Receiver<()>> {
+        // Machine code for the card: the switch loads it as it is.
+        if pick_sass(embedded::SASS, window, self.sm).is_some() {
+            return None;
+        }
         let (index, name) = (self.index, self.name());
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name(format!("jit-{index}")).spawn(move || {
@@ -530,6 +602,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn machine_code_is_the_cards_own_or_its_majors_earlier_minor() {
+        static HAVE: [(u32, u32, &[u8]); 5] =
+            [(16, 61, b"61"), (16, 75, b"75"), (16, 86, b"86"), (16, 89, b"89"), (16, 120, b"120")];
+        let pick = |sm| pick_sass(&HAVE, 16, sm).map(|(s, _)| s);
+        assert_eq!(pick(86), Some(86));
+        assert_eq!(pick(89), Some(89));
+        assert_eq!(pick(87), Some(86), "Jetson Orin runs Ampere's code");
+        assert_eq!(pick(121), Some(120));
+        assert_eq!(pick(62), Some(61));
+        assert_eq!(pick(80), None, "an A100 cannot run sm_86 code");
+        assert_eq!(pick(90), None);
+        assert_eq!(pick(70), None, "nor a V100 Turing's");
+        assert_eq!(pick(60), None);
+        assert_eq!(pick_sass(&HAVE, 18, 86), None, "nor one window another's");
+    }
+
+    /// What build.rs embedded unpacks to cubins, for windows there is a PTX
+    /// for. Empty in a build without tools/sass.sh's output.
+    #[test]
+    fn the_embedded_machine_code_unpacks_to_cubins() {
+        for (window, sm, packed) in embedded::SASS {
+            assert!(BC3HASH_PTX.iter().any(|(w, _)| w == window), "window {window}");
+            let code = miniz_oxide::inflate::decompress_to_vec(packed).expect("inflate");
+            assert_eq!(&code[..4], b"\x7fELF", "window {window}, sm_{sm}");
+        }
+    }
+
     /// Every window the card has the memory for passes the self-test - the
     /// node's header vectors, random headers against the CPU reference, a
     /// scan against the CPU's hit set - and the card switches between them
@@ -610,3 +710,4 @@ mod tests {
         }
     }
 }
+

@@ -223,9 +223,11 @@ and the GUI keeps its settings. What is new:
   vectors, and every GPU checks its kernel against the CPU before it mines.
   A card that fails mines no BC3Hash - under `--backend auto` the CPU takes
   over - and the log and the GUI say why.
-- The first time a card needs its BC3Hash kernel, the driver compiles it -
-  about 20 s on a fast CPU, up to a minute on a slow one - and caches the
-  result.
+- GTX 10 and 16 series and RTX 20, 30, 40 and 50 series cards load
+  machine code built for them and mine within seconds of the start. Other
+  NVIDIA cards (V100, A100, H100 and the like) have their driver compile the
+  kernel the first time - about 20 s on a fast CPU, up to a minute on a slow
+  one - and use its cache after that.
 
 If you upgrade from 1.2.5 or older, read the next section too.
 
@@ -265,6 +267,7 @@ numbering is the one `--gpu-id` means.
 - **The proof of work is read per job** from the block version, as the node's `CBlockHeader::GetHash` reads it: bit 11 (`0x800`) is BC3Hash and wins over bit 12 (`0x1000`, SHA3-256t). Only BC3Hash is mined: every worker sits out a job without bit 11, and the status says why.
 - The CPU builds coinbase/merkle root per extranonce2; the GPU grinds the 2³² nonce space in auto-tuned batches (~400 ms per launch). Every GPU hit is re-verified on the CPU against the consensus reference before submission.
 - **The CUDA kernel is precompiled to PTX at build time** (see `build.rs`), once per table window, and embedded in the binary. NVRTC ships with the CUDA *Toolkit*, not with the graphics driver, so runtime compilation would fail on end-user machines. The driver JITs the embedded PTX for whatever card is installed — the binary only needs `nvcuda.dll`.
+- **Release builds also carry machine code** for Pascal, Turing, Ampere, Ada and Blackwell (sm_61, 75, 86, 89 and 120), made from the same PTX by the CUDA 12.9 `ptxas` in CI (`tools/sass.sh`). Those cards skip the JIT - 20-60 s at a start where the driver has not cached it, and at each switch of the table-window tuning - and load their kernel in a second. It is the same code the JIT makes; anything else, or a driver that refuses it, gets the PTX.
 - **The PTX is built with the CUDA 12.0 toolkit, and `build.rs` refuses anything newer.** A driver can only JIT the PTX ISA versions it knows: the embedded kernel declares ISA 8.0, which needs driver **R525 or newer**. Building it with a newer toolkit raises that requirement — ISA 8.8 from CUDA 12.9 needs R575 — and on an older driver `cuModuleLoadData` fails, the card is found, and the miner hashes nothing on it while looking connected. That shipped once; the version check in `build.rs` is there so it cannot ship again. With a driver older than R525 the CUDA backend does not open the card at all, and the miner falls back to the same card through OpenCL; it exits with an error if no GPU worker survives and no CPU threads are running.
 - **Both GPU runtimes are loaded dynamically** — CUDA via cudarc's fallback loader, OpenCL via `src/backend/cl_sys.rs`. Neither `nvcuda.dll` nor `OpenCL.dll` appears in the binary's import table, so one build runs everywhere: CUDA on NVIDIA, OpenCL on AMD/Intel, CPU if neither is present. Linking against `OpenCL.lib` instead would make the binary refuse to start on machines without an OpenCL runtime.
 

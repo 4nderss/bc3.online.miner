@@ -29,3 +29,7 @@ gui/src-tauri/binaries/*.exe
 # own tests or benchmark from inside it writes a second lockfile; that one is
 # noise.
 /bc3hash/Cargo.lock
+
+# Machine code of the GPU kernel (tools/sass.sh): built in CI for each
+# release from the committed PTX, never committed itself.
+/src/kernels/sass/

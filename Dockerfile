@@ -17,6 +17,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+# The release workflow puts the kernel's machine code (tools/sass.sh) in the
+# context and sets this: build.rs then fails rather than build an image whose
+# every card JITs the PTX. A local build embeds whatever is there.
+ARG BC3_REQUIRE_SASS
 RUN cargo build --release --locked
 
 FROM debian:trixie-slim

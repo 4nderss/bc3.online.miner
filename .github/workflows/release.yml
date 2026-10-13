@@ -34,11 +34,36 @@ permissions:
   contents: read
 
 jobs:
+  # Machine code of the kernel for the common GPU architectures, from the
+  # tagged PTX (tools/sass.sh) - see build.yml and AGENTS.md. Every binary
+  # and the image below embed it, and fail to build without it.
+  sass:
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.9.1-devel-ubuntu22.04
+    steps:
+      - name: git, which the CUDA image does not ship
+        run: apt-get update && apt-get install -y --no-install-recommends git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Machine code for every window and architecture
+        run: sh tools/sass.sh src/kernels/sass
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sass
+          path: src/kernels/sass/
+
   windows:
     if: github.event_name != 'release'
+    needs: sass
     runs-on: windows-latest
+    env:
+      BC3_REQUIRE_SASS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sass
+          path: src/kernels/sass
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -93,9 +118,16 @@ jobs:
 
   linux:
     if: github.event_name != 'release'
+    needs: sass
     runs-on: ubuntu-latest
+    env:
+      BC3_REQUIRE_SASS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sass
+          path: src/kernels/sass
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -133,6 +165,7 @@ jobs:
   # ghcr.io/OWNER/bc3-miner:1.2.0 gets you exactly what the zip contains.
   image:
     if: github.event_name != 'release'
+    needs: sass
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -141,6 +174,10 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sass
+          path: src/kernels/sass
 
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -178,6 +215,9 @@ jobs:
         with:
           context: .
           push: true
+          # The machine code downloaded above is in the context; this makes
+          # the image's build fail without it, as the binaries' do.
+          build-args: BC3_REQUIRE_SASS=1
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

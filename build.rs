@@ -8,10 +8,15 @@
 //! (the driver), which JITs the PTX to machine code for the exact card
 //! installed.
 //!
-//! The kernel is built four times, once per secp256k1 table window (10, 12,
-//! 14 and 16 bits, `-DBC3_WINDOW=N`): which one is fastest depends on the
-//! card's L2. A release mines with 16; an internal-tools build picks one at
-//! run time (`--bc3-window`), and its benchmark compares them.
+//! The kernel is built four times, once per secp256k1 table window (16, 18,
+//! 19 and 20 bits, `-DBC3_WINDOW=N`): every card starts at 16, and the window
+//! tuning (src/tuning.rs) moves a card that hashes faster with a bigger one.
+//!
+//! Beside the PTX goes the machine code tools/sass.sh made from it for the
+//! common architectures (`embed_sass`): a card that has its own loads it in
+//! a second, where the driver's JIT of the PTX takes 20-60 s - at every
+//! start where its cache does not keep the result, and at every switch of
+//! the window tuning.
 //!
 //! Order, per PTX:
 //!   1. An explicit path in the environment (`BC3_BC3HASH_W<N>_PTX_PATH`) -
@@ -84,6 +89,89 @@ fn main() {
     for window in WINDOWS {
         build_kernel(&Kernel { window }, &out_dir);
     }
+    embed_sass(&out_dir);
+}
+
+/// The architectures there is machine code for (tools/sass.sh): Pascal,
+/// Turing, Ampere, Ada and Blackwell - sm_61 runs on sm_62, sm_86 on sm_87,
+/// sm_120 on sm_121. Anything else (sm_70, sm_80, sm_90, sm_100) JITs the PTX.
+const SASS_ARCHS: [u32; 5] = [61, 75, 86, 89, 120];
+
+/// Embed the kernel's machine code from tools/sass.sh - BC3_SASS_DIR, else
+/// src/kernels/sass - deflated, and write `sass.rs` to OUT_DIR: the table the
+/// CUDA backend loads a card's code from. A window's code goes in only if the
+/// manifest says it was made from the very PTX this build embeds; stale code
+/// would at best fail the cards' self-test. With BC3_REQUIRE_SASS set, as in
+/// the release workflow, anything missing fails the build. Without it the
+/// build goes on with what there is, and the other cards JIT the PTX.
+fn embed_sass(out_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=BC3_SASS_DIR");
+    println!("cargo:rerun-if-env-changed=BC3_REQUIRE_SASS");
+    let dir = std::env::var_os("BC3_SASS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("src/kernels/sass"));
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let require = std::env::var("BC3_REQUIRE_SASS").is_ok_and(|v| !v.is_empty() && v != "0");
+    let manifest = std::fs::read_to_string(dir.join("manifest.txt")).unwrap_or_default();
+
+    let mut entries = Vec::new();
+    let mut missing = Vec::new();
+    for window in WINDOWS {
+        let name = Kernel { window }.name();
+        // The PTX embedded beside it, its line endings as tools/sass.sh hashed
+        // them: a Windows checkout has CRLF.
+        let ptx = std::fs::read(out_dir.join(format!("{name}.ptx"))).expect("the embedded PTX");
+        let lf: Vec<u8> = ptx.into_iter().filter(|&b| b != b'\r').collect();
+        let digest = sha256_hex(&lf);
+        let made_from = manifest.lines().find_map(|l| {
+            let (hash, file) = l.split_once("  ")?;
+            (file.trim() == format!("{name}.ptx")).then(|| hash.trim().to_string())
+        });
+        if made_from.as_deref() != Some(digest.as_str()) {
+            if !manifest.is_empty() {
+                println!(
+                    "cargo:warning=no machine code for window {window}: {} was made from another \
+                     PTX - run tools/sass.sh again",
+                    dir.display()
+                );
+            }
+            missing.extend(SASS_ARCHS.iter().map(|sm| format!("{name}_sm{sm}")));
+            continue;
+        }
+        for sm in SASS_ARCHS {
+            let Ok(code) = std::fs::read(dir.join(format!("{name}_sm{sm}.cubin"))) else {
+                missing.push(format!("{name}_sm{sm}"));
+                continue;
+            };
+            let file = format!("{name}_sm{sm}.cubin.z");
+            std::fs::write(out_dir.join(&file), miniz_oxide::deflate::compress_to_vec(&code, 10))
+                .expect("write the packed machine code");
+            entries.push((window, sm, file));
+        }
+    }
+    if require && !missing.is_empty() {
+        panic!(
+            "BC3_REQUIRE_SASS is set, and machine code is missing or stale: {}\n\
+             Run tools/sass.sh (see AGENTS.md).",
+            missing.join(", ")
+        );
+    }
+    let mut src = String::from(
+        "/// The BC3Hash kernel's machine code, deflated: (window, sm, bytes). See build.rs.\n\
+         pub static SASS: &[(u32, u32, &[u8])] = &[\n",
+    );
+    for (window, sm, file) in &entries {
+        src.push_str(&format!(
+            "    ({window}, {sm}, include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{file}\"))),\n"
+        ));
+    }
+    src.push_str("];\n");
+    std::fs::write(out_dir.join("sass.rs"), src).expect("write sass.rs");
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn build_kernel(k: &Kernel, out_dir: &Path) {

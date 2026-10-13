@@ -1,9 +1,12 @@
 # Builds and tests on every push, and uploads the Windows binaries.
 #
-# No CUDA toolkit is installed on purpose: build.rs falls back to the PTX
-# checked into src/kernels/, and cudarc loads the driver dynamically, so one
-# binary runs with CUDA, with OpenCL, or on CPU alone. Installing the toolkit
-# would only slow the build down and risk shipping a kernel nobody reviewed.
+# No CUDA toolkit is installed for the build on purpose: build.rs falls back
+# to the PTX checked into src/kernels/, and cudarc loads the driver
+# dynamically, so one binary runs with CUDA, with OpenCL, or on CPU alone.
+# Installing the toolkit would only slow the build down and risk shipping a
+# kernel nobody reviewed. The toolkit runs in containers of its own only: the
+# ptx job checks the committed PTX against its source, and the sass job makes
+# machine code from that PTX, which the build embeds beside it.
 #
 # Actions are pinned by commit SHA, not by tag. Tags move; a compromised or
 # retagged action would otherwise run inside the job that produces the binaries
@@ -88,10 +91,39 @@ jobs:
             fi
           done
 
+  # Machine code of the kernel for the common GPU architectures, from the
+  # committed PTX (tools/sass.sh): a card with its own loads it in a second,
+  # where the driver's JIT of the PTX takes 20-60 s. Built here for every
+  # build, never committed. CUDA 12.9: the newest toolkit whose machine code
+  # every CUDA 12 driver loads, and one that knows Blackwell. See AGENTS.md.
+  sass:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.9.1-devel-ubuntu22.04
+    steps:
+      - name: git, which the CUDA image does not ship
+        run: apt-get update && apt-get install -y --no-install-recommends git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Machine code for every window and architecture
+        run: sh tools/sass.sh src/kernels/sass
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sass
+          path: src/kernels/sass/
+          retention-days: 14
+
   windows:
+    needs: sass
     runs-on: windows-latest
+    # build.rs fails the build if the machine code is missing or was made
+    # from another PTX, rather than ship a binary that JITs on every card.
+    env:
+      BC3_REQUIRE_SASS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sass
+          path: src/kernels/sass
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --no-self-update

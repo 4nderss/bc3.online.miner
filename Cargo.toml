@@ -19,7 +19,7 @@ path = "src/main.rs"
 default = ["cuda", "opencl", "bc3hash"]
 # Both GPU backends bring bc3hash with them: BC3Hash is the only kernel either
 # has, and its GPU tables and the CPU re-check of every hit come from it.
-cuda = ["dep:cudarc", "dep:nvml-wrapper", "bc3hash"]
+cuda = ["dep:cudarc", "dep:nvml-wrapper", "dep:miniz_oxide", "bc3hash"]
 # OpenCL is loaded dynamically via src/backend/cl_sys.rs - NOT linked against
 # OpenCL.lib/libOpenCL.so. Static linking would have made the binary refuse
 # to start on machines without an OpenCL runtime.
@@ -50,10 +50,19 @@ cudarc = { version = "0.19", default-features = false, features = [
     "std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-12040",
 ], optional = true }
 libloading = { version = "0.8", optional = true }
+# Inflates the kernel's machine code, which build.rs embeds deflated: 45 MB
+# of it across the windows and architectures, 12 MB packed.
+miniz_oxide = { version = "0.8", optional = true }
 
 # Never in a wasm build: the browser miner has no C++ toolchain behind it.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 bc3hash = { path = "bc3hash", optional = true }
+
+[build-dependencies]
+# build.rs: the kernel's machine code, deflated, and the SHA-256 of the PTX
+# it was made from (tools/sass.sh writes the same into its manifest).
+miniz_oxide = "0.8"
+sha2 = "0.10"
 
 # Note: not panic = "abort" - cudarc's dynamic loader panics if libcuda is
 # missing, and the CUDA detection catches that with catch_unwind (CPU

@@ -66,6 +66,31 @@ graphics driver, so the kernel must be compiled ahead of time and embedded.
 The `cuda` and `opencl` features bring `bc3hash` with them - BC3Hash is the
 only kernel either backend has.
 
+Beside the PTX, `build.rs` embeds the kernel's **machine code** (SASS) for
+sm_61, sm_75, sm_86, sm_89 and sm_120 - Pascal, Turing, Ampere, Ada and
+Blackwell - from `src/kernels/sass/` (or `BC3_SASS_DIR`), deflated: ~45 MB of
+cubins, 13.6 MB in the binary. A card with its own architecture, or an
+earlier minor of its major (sm_86 code runs on sm_87), loads it in a second;
+anything else JITs the PTX as before, 20-60 s where the driver has not cached
+it. The cubins are never committed. `tools/sass.sh` makes them from the
+committed PTX in the CUDA 12.9 image:
+
+```
+docker run --rm -v "$PWD:/work" -w /work nvidia/cuda:12.9.1-devel-ubuntu22.04 sh tools/sass.sh
+```
+
+and writes a manifest with the SHA-256 of each PTX; `build.rs` embeds a
+window's code only while the PTX it embeds is that one. Both workflows build
+the cubins in a `sass` job and set `BC3_REQUIRE_SASS=1`, which makes a build
+without them fail. CUDA 12.9 because its machine code loads on every CUDA 12
+driver (R525 and up, as the PTX needs) and it knows Blackwell; a CUDA 13
+toolkit's would need R580. On sm_86 its ptxas makes what the driver's JIT
+makes - 119,232 instructions both, 168 registers and 3360 bytes of stack,
+568 lines in another order - and hashes as fast. The link API
+(`cuLinkAddData` + `cuLinkComplete`) was tried for machine code made at run
+time and dropped: it compiles relocatable code, 4056 bytes of stack and
+1.4 % slower.
+
 ### BC3Hash and its C++
 
 The version bits pick the PoW per job, exactly as the node's `GetHash` does:
@@ -262,13 +287,14 @@ picks the same job up where the cursor stopped.
   directory (`BC3_TUNING_FILE` overrides it; the Docker image points
   `XDG_CACHE_HOME` at a directory its user may write). A new driver or
   miner version measures again.
-- **The switch is quick only with the driver's JIT cache.** The compile
-  ahead fills the cache, and the switch loads from it in about a second.
-  The cache lives in `$HOME/.nv` unless `CUDA_CACHE_PATH` says otherwise,
-  and the Docker image's user has no home: in 2.1.0 every load compiled the
-  kernel again, ~15 s on a 64-core EPYC, at every start and every switch.
-  The image sets `CUDA_CACHE_PATH`; anything else that runs the miner
-  without a writable home needs it too.
+- **The switch is quick because the card loads machine code** made for it
+  (see "Building"). In 2.1.0 every card JITted the PTX: 23-26 s of idle card
+  a switch on a host with three RTX 5090s, three switches a tuning, and 31 s
+  at every start - the Docker image's user had no home for the driver's JIT
+  cache. A card this build has no machine code for still relies on that
+  cache: the compile ahead fills it, and the switch loads from it. It lives
+  in `$HOME/.nv` unless `CUDA_CACHE_PATH` says otherwise, which the image
+  sets. Under WSL2 the driver caches for root only.
 - **OpenCL cards do not tune** (`MiningBackend::memory` is None there): a
   switch builds the program from source while the card waits, and OpenCL
   caps one buffer at `CL_DEVICE_MAX_MEM_ALLOC_SIZE`. Untried on AMD and
@@ -294,6 +320,10 @@ lab (see "The BC3Hash GPU kernel"); the workflow that catches mistakes here:
    fails the build above ISA 8.0 for exactly that reason, and the CUDA backend
    refuses a driver older than R525 when it opens a card (`check_driver`), so
    that card goes to OpenCL. Commit the regenerated PTX - the build embeds it.
+   Then run `tools/sass.sh` again before testing on a GPU: the machine code
+   of the old PTX is no longer embedded (the manifest no longer matches), so
+   the cards would JIT the new PTX - correct, but not what a release does.
+   CI makes its own cubins; nothing of them is committed.
    Build it in `/work`: nvcc derives the names of internal functions from the
    source's absolute path, and the committed PTX was built there (CI's
    comparison ignores those names, see `build.yml`).
