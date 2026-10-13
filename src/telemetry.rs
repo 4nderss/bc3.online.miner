@@ -57,7 +57,9 @@ impl Telemetry {
         Self {}
     }
 
-    /// The NVIDIA driver's version, where NVML is there to tell.
+    /// The NVIDIA driver's version, where NVML is there to tell. For the
+    /// benchmark's report.
+    #[cfg(feature = "internal-tools")]
     pub fn driver_version(&self) -> Option<String> {
         #[cfg(feature = "cuda")]
         if let Some(nvml) = &self.nvml {

@@ -1,6 +1,7 @@
-//! Search kernels for the web miner, compiled to WebAssembly: SHA3-256t, and
-//! BC3Hash (the PoW of the second fork) when built with the `bc3hash` feature
-//! (the default) - the node's own C++ via the `bc3hash` crate, as in the CLI.
+//! The search kernel for the web miner, compiled to WebAssembly: BC3Hash, the
+//! PoW since the second fork, with the `bc3hash` feature (the default) - the
+//! node's own C++ via the `bc3hash` crate, as in the CLI. A job without
+//! BC3Hash's version bit is refused, as the CLI refuses it.
 //!
 //! Deliberately WITHOUT wasm-bindgen: the interface is four numbers and two
 //! byte buffers, so bindgen would only add glue and a build dependency. JS
@@ -16,7 +17,7 @@
 #[path = "../../src/consensus.rs"]
 mod consensus;
 
-use consensus::{hash_meets_target, sha3t, PowAlgo, Target};
+use consensus::{hash_meets_target, PowAlgo, Target};
 
 /// PoW algorithms as the numbers JS passes across the wasm boundary. Part of
 /// the ABI: a number, once given out, keeps its meaning.
@@ -43,9 +44,9 @@ fn algo_from_id(id: u32) -> Option<PowAlgo> {
 /// decision the CLI makes at notify time.
 ///
 /// Returns the algorithm id for `search_algo`, or -1 for a PoW this module
-/// cannot hash (BC3Hash in a build without the `bc3hash` feature): the page
-/// must stop hashing and tell the user, not grind SHA3-256t into rejected
-/// shares.
+/// does not hash - every one but BC3Hash, and BC3Hash too in a build without
+/// the `bc3hash` feature: the page must stop hashing and tell the user, not
+/// grind the job into rejected shares.
 #[no_mangle]
 pub extern "C" fn job_pow_algo(version: u32) -> i32 {
     let algo = PowAlgo::for_version(version);
@@ -80,8 +81,8 @@ pub extern "C" fn bc3hash_init() -> i32 {
     }
 }
 
-/// The search loop, generic over the hash so each algorithm gets its own
-/// monomorphized loop - no dispatch per nonce.
+/// The search loop over one nonce range, with the job's hash. Next to a
+/// BC3Hash a call through a function pointer per nonce is noise.
 fn search_with(
     pow: impl Fn(&[u8; 80]) -> [u8; 32],
     mut header: [u8; 80],
@@ -132,18 +133,11 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Search a nonce range for a SHA3-256t hash that meets the target.
-///
-/// The original export, kept with its signature for the deployed page; new
-/// code calls `search_algo` with the id from `job_pow_algo`.
-///
-/// `header_ptr` points at 80 bytes of serialized block header; the nonce at
-/// offset 76 is overwritten for every attempt. `target_ptr` points at 32
-/// bytes of big-endian target (the pool's share target, not the network's).
-///
-/// Returns the nonce as an f64 - `-1.0` means "found nothing in the range".
-/// f64 instead of i64 to avoid BigInt in JS; every u32 fits exactly in an
-/// f64.
+/// The original export: search a nonce range for a SHA3-256t hash, which
+/// this module no longer computes. It returns `-2.0` ("cannot hash this"),
+/// as `search_algo` does for SHA3-256t's id. Kept with its signature for a
+/// page that still looks for it; the page calls `search_algo` whenever the
+/// module has it, and every module that has no SHA3-256t does.
 ///
 /// # Safety
 /// The buffers must be 80 and 32 bytes respectively and come from `alloc`.
@@ -157,9 +151,17 @@ pub unsafe extern "C" fn search(
     search_algo(algo_id(PowAlgo::Sha3t) as u32, header_ptr, target_ptr, nonce_start, nonce_count)
 }
 
-/// `search` for the algorithm `algo` (an id from `job_pow_algo`). Returns
-/// `-2.0` for an id this module does not know, so a page newer than its wasm
-/// cannot mistake "cannot hash this" for "found nothing".
+/// Search a nonce range for a hash of the algorithm `algo` (an id from
+/// `job_pow_algo`) that meets the target.
+///
+/// `header_ptr` points at 80 bytes of serialized block header; the nonce at
+/// offset 76 is overwritten for every attempt. `target_ptr` points at 32
+/// bytes of big-endian target (the pool's share target, not the network's).
+///
+/// Returns the nonce as an f64 - `-1.0` means "found nothing in the range".
+/// f64 instead of i64 to avoid BigInt in JS; every u32 fits exactly in an
+/// f64. Returns `-2.0` for an id this module does not hash, so a page newer
+/// than its wasm cannot mistake "cannot hash this" for "found nothing".
 ///
 /// # Safety
 /// The buffers must be 80 and 32 bytes respectively and come from `alloc`.
@@ -174,28 +176,20 @@ pub unsafe extern "C" fn search_algo(
     if header_ptr.is_null() || target_ptr.is_null() {
         return -1.0;
     }
-    let Some(algo) = algo_from_id(algo) else {
+    let Some(pow) = algo_from_id(algo).and_then(|a| a.hash_fn()) else {
         return -2.0;
     };
     // Copy the header onto the stack: writing the nonce through a raw
     // pointer in the loop blocks optimizations and forces one read per
     // iteration.
     let (header, target) = read_header_target(header_ptr, target_ptr);
-    match algo {
-        PowAlgo::Sha256d => {
-            search_with(|h| consensus::sha256d(h), header, &target, nonce_start, nonce_count)
-        }
-        PowAlgo::Sha3t => search_with(|h| sha3t(h), header, &target, nonce_start, nonce_count),
-        PowAlgo::Bc3Hash => match algo.hash_fn() {
-            Some(pow) => search_with(pow, header, &target, nonce_start, nonce_count),
-            None => -2.0,
-        },
-    }
+    search_with(pow, header, &target, nonce_start, nonce_count)
 }
 
-/// Hash a header once and write the result to `out_ptr` (32 bytes). Used by
-/// the main thread to verify a hit before it is submitted, and by the self
-/// test below.
+/// The original export: SHA3-256t of a header, which this module no longer
+/// computes - it writes nothing. Kept with its signature for a page that
+/// still looks for it; the page calls `hash_header_algo` whenever the module
+/// has it.
 ///
 /// # Safety
 /// `header_ptr` must point at 80 bytes, `out_ptr` at at least 32.
@@ -204,9 +198,10 @@ pub unsafe extern "C" fn hash_header(header_ptr: *const u8, out_ptr: *mut u8) {
     hash_header_algo(algo_id(PowAlgo::Sha3t) as u32, header_ptr, out_ptr);
 }
 
-/// `hash_header` for the algorithm `algo` (an id from `job_pow_algo`).
-/// Returns 1 when it hashed, 0 for an unknown id or a null pointer - then
-/// nothing is written.
+/// Hash a header once with the algorithm `algo` (an id from `job_pow_algo`)
+/// and write the result to `out_ptr` (32 bytes). Used by the main thread to
+/// verify a hit before it is submitted. Returns 1 when it hashed, 0 for an id
+/// this module does not hash or a null pointer - then nothing is written.
 ///
 /// # Safety
 /// `header_ptr` must point at 80 bytes, `out_ptr` at at least 32.
@@ -372,106 +367,105 @@ pub unsafe extern "C" fn difficulty_of_hash(hash_ptr: *const u8) -> f64 {
     consensus::difficulty_of_hash(&h)
 }
 
-/// Self test against a chain-verified vector. Returns 1 on the right answer.
+/// Self test against a chain-verified vector: BC3's genesis block, whose hash
+/// is SHA256d over its header - the header serialization and the SHA256d the
+/// page builds every header, txid and merkle root with. Returns 1 on the
+/// right answer.
 ///
 /// It exists so that the web miner can refuse to start if the compiled
 /// module hashes incorrectly - a broken kernel would otherwise just produce
-/// rejected shares without anyone understanding why.
+/// rejected shares without anyone understanding why. BC3Hash has its own
+/// check against the node's vectors, `bc3hash_init`. (Until SHA3-256t was
+/// removed this checked a SHA3-256t digest; the page only asks for 1.)
 #[no_mangle]
 pub extern "C" fn self_test() -> u32 {
-    // BC3's genesis header (the same vector as the CLI miner's tests).
-    let mut header = [0u8; 80];
-    header[0..4].copy_from_slice(&1u32.to_le_bytes());
-    let hash = sha3t(&header);
-    // We do not compare against genesis here (the header above is not
-    // genesis) but against a fixed expected value for exactly this input,
-    // computed with the same code in the test
-    // `wasm_self_test_vector_matches` below.
-    let expected: [u8; 32] = SELF_TEST_DIGEST;
-    u32::from(hash == expected)
+    let Ok(Ok(mut merkle_root)) = hex::decode(GENESIS_MERKLE_ROOT).map(<[u8; 32]>::try_from) else {
+        return 0;
+    };
+    merkle_root.reverse(); // display order -> internal
+    let genesis = consensus::BlockHeader {
+        version: 1,
+        prev_hash: [0u8; 32],
+        merkle_root,
+        time: 1_777_245_555,
+        bits: 0x1d00_ffff,
+        nonce: 2_442_659_435,
+    };
+    u32::from(consensus::hash_to_display(&consensus::sha256d(&genesis.serialize())) == GENESIS_HASH)
 }
 
-/// The expected value for `self_test`. Locked down by the unit test at the
-/// bottom, which computes the same value with the shared consensus code.
-const SELF_TEST_DIGEST: [u8; 32] = [
-    0x6b, 0x5a, 0xb1, 0x5c, 0xea, 0x4b, 0x19, 0xaa, 0x64, 0x94, 0x5e, 0x06, 0xfa, 0xf0, 0x2e, 0x00,
-    0xdb, 0x3c, 0x48, 0x84, 0xf3, 0x47, 0xc0, 0xe0, 0x74, 0x72, 0x52, 0xb0, 0x5e, 0xd9, 0xc6, 0xa6,
-];
+/// BC3's genesis block as an explorer shows it: its merkle root and its hash
+/// (byte-reversed hex). The same chain-verified vector as the CLI's
+/// `consensus::tests::genesis_vectors`.
+const GENESIS_MERKLE_ROOT: &str = "8e1df52fddd25c460304ff8ea7bcb570850bf0b0c027eecf8ebf8ab17d3e93b1";
+const GENESIS_HASH: &str = "000000000c226a41e70717f6d4fbdcb6bfb4fdc40831ccc87fa9cfdd2c57bff6";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The search loop must find exactly the nonce whose hash meets the
-    /// target, and return -1 when the range holds no hits.
+    /// The search loop finds exactly the first nonce whose hash meets the
+    /// target, with the nonce at offset 76, little-endian - the header the
+    /// pool validates - and returns -1 when the range holds none. SHA256d
+    /// stands in for the hash: the loop is the same for any.
     #[test]
-    fn search_finds_the_matching_nonce() {
+    fn search_finds_the_first_matching_nonce() {
+        let pow = |h: &[u8; 80]| consensus::sha256d(h);
         let mut header = [0u8; 80];
-        header[0..4].copy_from_slice(&0x2000_1000u32.to_le_bytes());
-        // A loose target: first byte < 0x10 is enough, so a hit is nearby.
+        header[0..4].copy_from_slice(&0x2000_1800u32.to_le_bytes());
+        // A loose target: one hash in sixteen.
         let mut target = [0xffu8; 32];
         target[0] = 0x0f;
-
-        // Expected value computed straightforwardly with the same hash
-        // function.
-        let mut expected = None;
-        for n in 0..200_000u32 {
-            let mut h = header;
-            h[76..80].copy_from_slice(&n.to_le_bytes());
-            if hash_meets_target(&sha3t(&h), &target) {
-                expected = Some(n);
-                break;
-            }
-        }
-        let expected = expected.expect("a loose target must produce a hit");
-
-        let got = unsafe { search(header.as_ptr(), target.as_ptr(), 0, 200_000) };
-        assert_eq!(got, expected as f64, "search hittade fel nonce");
-
+        let expected = (0..2000u32)
+            .find(|&n| {
+                let mut h = header;
+                h[76..80].copy_from_slice(&n.to_le_bytes());
+                hash_meets_target(&pow(&h), &target)
+            })
+            .expect("a loose target must produce a hit");
+        assert_eq!(search_with(pow, header, &target, 0, 2000), expected as f64);
         // A range that ends before the hit -> no hit.
-        let miss = unsafe { search(header.as_ptr(), target.as_ptr(), 0, expected) };
-        assert_eq!(miss, -1.0, "search must not report a hit outside the range");
-    }
-
-    /// The nonce is written at the right offset (76..80, little-endian). If
-    /// it is written wrong, the web miner hashes a different header than the
-    /// one the pool validates.
-    #[test]
-    fn nonce_is_written_at_offset_76_little_endian() {
-        let header = [0u8; 80];
-        let mut target = [0u8; 32]; // impossible target -> search returns -1
-        target[31] = 1;
-        let _ = unsafe { search(header.as_ptr(), target.as_ptr(), 0, 1) };
-
-        // Verify against hash_header with a manually set nonce.
-        let mut manual = [0u8; 80];
-        let nonce = 0x1234_5678u32;
-        manual[76..80].copy_from_slice(&nonce.to_le_bytes());
-        assert_eq!(manual[76], 0x78, "little-endian: lowest byte first");
-        assert_eq!(manual[79], 0x12);
-
-        let mut out = [0u8; 32];
-        unsafe { hash_header(manual.as_ptr(), out.as_mut_ptr()) };
-        assert_eq!(out, sha3t(&manual), "hash_header must agree with sha3t");
+        assert_eq!(search_with(pow, header, &target, 0, expected), -1.0, "a hit outside the range");
     }
 
     /// A nonce close to u32::MAX must not panic - the range wraps.
     #[test]
     fn nonce_wraps_instead_of_panicking() {
-        let header = [0u8; 80];
+        let pow = |h: &[u8; 80]| consensus::sha256d(h);
         let target = [0u8; 32]; // never hit
-        let got = unsafe { search(header.as_ptr(), target.as_ptr(), u32::MAX - 2, 10) };
-        assert_eq!(got, -1.0);
+        assert_eq!(search_with(pow, [0u8; 80], &target, u32::MAX - 2, 10), -1.0);
+    }
+
+    /// The PoWs before the second fork are not hashed: their ids, and the
+    /// original SHA3-256t exports, refuse instead - nothing written, -2 from
+    /// a search - so a page cannot grind such a job into rejected shares.
+    #[test]
+    fn the_older_pows_are_refused() {
+        assert_eq!(job_pow_algo(0x2000_1000), -1);
+        assert_eq!(job_pow_algo(0x2000_0000), -1);
+        assert_eq!(algo_id(PowAlgo::Sha256d), 0);
+        assert_eq!(algo_id(PowAlgo::Sha3t), 1);
+        let header = [0u8; 80];
+        let target = [0xffu8; 32]; // any hash would meet it
+        for id in [0, 1, 99] {
+            assert_eq!(algo_from_id(id), None, "id {id}");
+            assert_eq!(unsafe { search_algo(id, header.as_ptr(), target.as_ptr(), 0, 10) }, -2.0, "id {id}");
+            let mut out = [7u8; 32];
+            assert_eq!(unsafe { hash_header_algo(id, header.as_ptr(), out.as_mut_ptr()) }, 0, "id {id}");
+            assert_eq!(out, [7u8; 32], "id {id} wrote a hash");
+        }
+        assert_eq!(unsafe { search(header.as_ptr(), target.as_ptr(), 0, 10) }, -2.0);
+        let mut out = [7u8; 32];
+        unsafe { hash_header(header.as_ptr(), out.as_mut_ptr()) };
+        assert_eq!(out, [7u8; 32], "hash_header wrote a hash");
     }
 
     /// The page asks the module which PoW a job uses, by the same version-bit
     /// rule as the CLI. Without the `bc3hash` feature BC3Hash is -1 and
-    /// refused everywhere rather than hashed as SHA3-256t.
+    /// refused everywhere rather than hashed with something else.
     #[test]
     #[cfg(not(feature = "bc3hash"))]
     fn job_pow_algo_follows_the_version_bits() {
-        assert_eq!(job_pow_algo(0x2000_1000), 1);
-        assert_eq!(job_pow_algo(0x2000_0000), 0);
         assert_eq!(job_pow_algo(0x2000_1800), -1);
         assert_eq!(job_pow_algo(0x2000_0800), -1);
         assert_eq!(algo_id(PowAlgo::Bc3Hash), 2);
@@ -489,8 +483,6 @@ mod tests {
     #[test]
     #[cfg(feature = "bc3hash")]
     fn job_pow_algo_follows_the_version_bits() {
-        assert_eq!(job_pow_algo(0x2000_1000), 1);
-        assert_eq!(job_pow_algo(0x2000_0000), 0);
         assert_eq!(job_pow_algo(0x2000_1800), 2);
         assert_eq!(job_pow_algo(0x2000_0800), 2);
         assert_eq!(bc3hash_init(), 1);
@@ -517,32 +509,6 @@ mod tests {
         assert_eq!(got, expected as f64);
         let miss = unsafe { search_algo(2, header.as_ptr(), target.as_ptr(), 0, expected) };
         assert_eq!(miss, -1.0);
-    }
-
-    /// The per-algorithm exports agree with the reference, and an unknown id
-    /// is refused rather than hashed with something else.
-    #[test]
-    fn algo_exports_dispatch_correctly() {
-        let mut header = [0u8; 80];
-        header[0..4].copy_from_slice(&0x2000_0000u32.to_le_bytes());
-        let mut out = [0u8; 32];
-        assert_eq!(unsafe { hash_header_algo(0, header.as_ptr(), out.as_mut_ptr()) }, 1);
-        assert_eq!(out, consensus::sha256d(&header));
-        assert_eq!(unsafe { hash_header_algo(1, header.as_ptr(), out.as_mut_ptr()) }, 1);
-        assert_eq!(out, sha3t(&header));
-        assert_eq!(unsafe { hash_header_algo(99, header.as_ptr(), out.as_mut_ptr()) }, 0);
-
-        let mut target = [0xffu8; 32];
-        target[0] = 0x0f;
-        let legacy = unsafe { search(header.as_ptr(), target.as_ptr(), 0, 100_000) };
-        let sha3t_id = unsafe { search_algo(1, header.as_ptr(), target.as_ptr(), 0, 100_000) };
-        assert_eq!(legacy, sha3t_id, "search is search_algo with SHA3-256t");
-        let d = unsafe { search_algo(0, header.as_ptr(), target.as_ptr(), 0, 100_000) };
-        assert!(d >= 0.0);
-        let mut h = header;
-        h[76..80].copy_from_slice(&(d as u32).to_le_bytes());
-        assert!(hash_meets_target(&consensus::sha256d(&h), &target));
-        assert_eq!(unsafe { search_algo(99, header.as_ptr(), target.as_ptr(), 0, 10) }, -2.0);
     }
 
     /// The native half of the cross-check in wasm/test/vectors.mjs: SHA-256
@@ -572,19 +538,21 @@ mod tests {
     #[cfg(feature = "bc3hash")]
     const CROSS_CHECK: &str = "0b625bcc9887a866a75689b8b1a91f21a5c0fee4b3ce7c319aef84e146a3ebeb";
 
-    /// Locks down the expected value in `SELF_TEST_DIGEST`. If this test
-    /// breaks, the hash implementation has changed - and then the web
-    /// miner's self test is wrong too.
+    /// The self test passes on a correct build - and only on the genesis
+    /// block: the same header with another nonce does not hash to it.
     #[test]
-    fn wasm_self_test_vector_matches() {
-        let mut header = [0u8; 80];
-        header[0..4].copy_from_slice(&1u32.to_le_bytes());
-        let hash = sha3t(&header);
-        assert_eq!(
-            hash, SELF_TEST_DIGEST,
-            "uppdatera SELF_TEST_DIGEST till {:02x?}",
-            hash
-        );
+    fn the_self_test_passes_on_the_genesis_block() {
         assert_eq!(self_test(), 1);
+        let mut merkle_root: [u8; 32] = hex::decode(GENESIS_MERKLE_ROOT).unwrap().try_into().unwrap();
+        merkle_root.reverse();
+        let other = consensus::BlockHeader {
+            version: 1,
+            prev_hash: [0u8; 32],
+            merkle_root,
+            time: 1_777_245_555,
+            bits: 0x1d00_ffff,
+            nonce: 2_442_659_436,
+        };
+        assert_ne!(consensus::hash_to_display(&consensus::sha256d(&other.serialize())), GENESIS_HASH);
     }
 }

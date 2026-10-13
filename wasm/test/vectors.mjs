@@ -35,6 +35,9 @@ const imports = WebAssembly.Module.imports(module);
 check(imports.length === 0, `no imports (${imports.map((i) => `${i.module}.${i.name}`).join(", ") || "none"})`);
 const { exports: w } = new WebAssembly.Instance(module, {});
 console.log(`module: ${bytes.length} bytes`);
+// The page refuses to start unless this is 1: the chain-verified genesis
+// block hash, through the module's header serialization and SHA256d.
+check(w.self_test() === 1, "self_test() = 1 (the genesis block)");
 
 const t0 = performance.now();
 const init = w.bc3hash_init();
@@ -74,15 +77,24 @@ check(n >= 4, `${n} reference vectors`);
 
 // header-vectors.json: one header under all four combinations of bits 11 and
 // 12, through the page's path - version -> job_pow_algo -> hash_header_algo.
+// With bit 11 it is BC3Hash and must give the node's digest; without it the
+// module refuses the job (-1) and hashes nothing, as the CLI does: SHA256d
+// (id 0) and SHA3-256t (id 1) are not mined since the second fork.
 const headers = JSON.parse(readFileSync(join(vectorsDir, "header-vectors.json"), "utf8"));
 for (const v of headers) {
   const h = unhex(v.header);
   const version = new DataView(h.buffer).getUint32(0, true);
+  const name = `header version ${version.toString(16).padStart(8, "0")}`;
   const algo = w.job_pow_algo(version);
   view().set(h, header);
-  const rc = w.hash_header_algo(algo, header, out);
-  const got = hex(view().slice(out, out + 32));
-  check(rc === 1 && got === v.digest, `header version ${version.toString(16).padStart(8, "0")} -> algo ${algo}: ${got}`);
+  if (version & 0x800) {
+    const rc = w.hash_header_algo(algo, header, out);
+    const got = hex(view().slice(out, out + 32));
+    check(algo === 2 && rc === 1 && got === v.digest, `${name} -> algo ${algo}: ${got}`);
+  } else {
+    const refused = w.hash_header_algo(0, header, out) === 0 && w.hash_header_algo(1, header, out) === 0;
+    check(algo === -1 && refused, `${name} -> algo ${algo}, not hashed`);
+  }
 }
 check(headers.length === 4, `${headers.length} header vectors`);
 

@@ -28,7 +28,7 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.ico"],
     "externalBin": ["binaries/bc3-miner"],
-    "shortDescription": "BC3 (SHA3-256t) GPU/CPU miner",
+    "shortDescription": "BC3 (BC3Hash) GPU/CPU miner",
     "longDescription": "Mine BC3 (BitcoinIII) on the bc3.online pool — solo or PPLNS, with CUDA GPU support."
   }
 }

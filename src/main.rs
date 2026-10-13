@@ -6,12 +6,17 @@
 //! channel.
 
 mod backend;
+// The internal tools: only with the `internal-tools` feature - see internal.rs.
+#[cfg(feature = "internal-tools")]
 mod bench;
 mod consensus;
 mod gpu_worker;
+#[cfg(feature = "internal-tools")]
+mod internal;
 mod ipc;
 mod telemetry;
 mod shared;
+#[cfg(feature = "internal-tools")]
 mod solve;
 mod stats;
 mod stratum;
@@ -59,63 +64,18 @@ struct Args {
     gpu_id: Option<usize>,
 
     /// Number of CPU threads (0 = all cores), mining every job. Without the
-    /// flag a GPU in --backend auto leaves the CPU idle until a job comes that
-    /// the GPU has no kernel for, and then mines it on all cores; with
+    /// flag a GPU in --backend auto leaves the CPU idle unless the GPU cannot
+    /// mine (its BC3Hash kernel failed), and then mines on all cores; with
     /// --backend cuda or opencl the CPU does not mine at all.
     #[arg(long, env = "BC3_THREADS")]
     threads: Option<usize>,
 
-    /// BC3Hash lookup tables for the CPU: fast (~256 MiB of RAM) or compact
-    /// (~7 MiB, 10-20 % slower). Both find exactly the same shares. Default:
-    /// compact when a GPU mines BC3Hash and the CPU only checks its shares,
-    /// fast otherwise.
-    #[cfg(feature = "bc3hash")]
-    #[arg(long, value_enum, env = "BC3_BC3HASH_MODE")]
-    bc3hash_mode: Option<Bc3HashMode>,
-
-    /// Table window of the GPU's BC3Hash kernel in bits: 10 (7 MiB), 12
-    /// (22 MiB), 14 (76 MiB) or 16 (256 MiB of GPU memory). Bigger is faster
-    /// as long as the card's L2 keeps up; `--benchmark` without it compares
-    /// all four. Default 16.
-    #[cfg(feature = "bc3hash")]
-    #[arg(long, env = "BC3_BC3HASH_WINDOW", value_parser = parse_bc3_window)]
-    bc3_window: Option<u32>,
-
-    /// Benchmark instead of mining: an in-process job source serves random
-    /// jobs to the normal workers - same dispatch, same kernels, every GPU
-    /// hit re-checked - and checks every share with the CPU reference. No
-    /// pool, no network, no address needed.
-    #[arg(long)]
-    benchmark: bool,
-
-    /// Solve one fixed block template offline instead of mining for a pool: a
-    /// job file with the block's height, previous hash, version, time, bits,
-    /// coinbase text and outputs, as published for the hard fork's first
-    /// block. No pool, no node, no network; the whole block is printed and
-    /// saved to a file when it is found.
-    #[arg(long, value_name = "JOB.json", conflicts_with = "benchmark")]
-    solve: Option<std::path::PathBuf>,
-
-    /// Benchmark: the PoW to measure.
-    #[arg(long, value_enum, default_value_t = BenchAlgo::Bc3hash)]
-    algo: BenchAlgo,
-
-    /// Benchmark: seconds to measure. Comparing the BC3Hash windows, each
-    /// window runs twice for this long (default 20); otherwise 60.
-    #[arg(long)]
-    seconds: Option<u64>,
-
-    /// Benchmark: share difficulty. By default it is set from the measured
-    /// hashrate so that a share comes every few seconds.
-    #[arg(long)]
-    difficulty: Option<f64>,
-
-    /// Kernel launches each GPU keeps queued. 2 keeps the card busy while the
-    /// host collects and checks the previous launch; 1 is the old
-    /// one-at-a-time loop, kept to compare the two with --benchmark.
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=2),
-          hide = true)]
-    gpu_queue: u32,
+    // --benchmark, --solve and their options - internal builds only. Here,
+    // not at the end, so such a build lists its options in the order they
+    // always had.
+    #[cfg(feature = "internal-tools")]
+    #[command(flatten)]
+    internal: internal::Tools,
 
     /// Intensity 1-100 %. Below 100 the workers idle between passes, which
     /// lowers heat/power draw and keeps the machine usable while mining.
@@ -149,52 +109,6 @@ struct Args {
     probe: bool,
 }
 
-/// The PoW `--benchmark` measures.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
-enum BenchAlgo {
-    Bc3hash,
-    Sha3t,
-}
-
-impl From<BenchAlgo> for consensus::PowAlgo {
-    fn from(a: BenchAlgo) -> Self {
-        match a {
-            BenchAlgo::Bc3hash => consensus::PowAlgo::Bc3Hash,
-            BenchAlgo::Sha3t => consensus::PowAlgo::Sha3t,
-        }
-    }
-}
-
-#[cfg(feature = "bc3hash")]
-fn parse_bc3_window(s: &str) -> Result<u32, String> {
-    match s.parse::<u32>() {
-        Ok(w) if BC3_WINDOWS.contains(&w) => Ok(w),
-        _ => Err(format!("must be one of {BC3_WINDOWS:?}")),
-    }
-}
-
-/// The table windows there is a GPU kernel for (see build.rs).
-#[cfg(feature = "bc3hash")]
-const BC3_WINDOWS: [u32; 4] = [10, 12, 14, 16];
-
-/// Size of the BC3Hash tables - see `bc3hash::Mode`.
-#[cfg(feature = "bc3hash")]
-#[derive(Copy, Clone, PartialEq, Eq, Debug, clap::ValueEnum)]
-enum Bc3HashMode {
-    Compact,
-    Fast,
-}
-
-#[cfg(feature = "bc3hash")]
-impl From<Bc3HashMode> for bc3hash::Mode {
-    fn from(mode: Bc3HashMode) -> Self {
-        match mode {
-            Bc3HashMode::Compact => bc3hash::Mode::Compact,
-            Bc3HashMode::Fast => bc3hash::Mode::Fast,
-        }
-    }
-}
-
 /// Payout mode. Only the port differs, but nobody should have to remember
 /// which port is which.
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -222,9 +136,12 @@ impl Mode {
 /// Only our own BC3_* names are touched, and only when the canonical one is
 /// unset, so nothing else in the environment can be shadowed.
 fn normalise_env() {
-    const VARS: [&str; 11] = [
+    const VARS: &[&str] = &[
         "BC3_WALLET", "BC3_WORKER", "BC3_USER", "BC3_MODE", "BC3_POOL",
-        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID", "BC3_BC3HASH_MODE",
+        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID",
+        #[cfg(feature = "internal-tools")]
+        "BC3_BC3HASH_MODE",
+        #[cfg(feature = "internal-tools")]
         "BC3_BC3HASH_WINDOW",
     ];
     let present: Vec<(String, String)> = std::env::vars().collect();
@@ -295,8 +212,14 @@ fn main() {
         return;
     }
 
+    // Mining for no pool: the benchmark or --solve of an internal build.
+    #[cfg(feature = "internal-tools")]
+    let offline = args.internal.offline();
+    #[cfg(not(feature = "internal-tools"))]
+    let offline = false;
+
     // --user wins; otherwise build it from --wallet and --rig, which is the
-    // shape a container environment hands us. The benchmark needs neither.
+    // shape a container environment hands us. Offline needs neither.
     let user = args.user.clone().or_else(|| {
         args.wallet.as_ref().map(|w| match args.rig.as_deref() {
             Some(r) if !r.is_empty() => format!("{w}.{r}"),
@@ -305,7 +228,7 @@ fn main() {
     });
     let user = match user {
         Some(user) => user,
-        None if args.benchmark || args.solve.is_some() => String::new(),
+        None if offline => String::new(),
         None => {
             eprintln!("bc3-miner: set --user <address[.rig]>, or --wallet with an optional --rig");
             std::process::exit(2);
@@ -346,16 +269,13 @@ fn main() {
         cpu_fallback_threads: if role == CpuRole::GpuFallback { threads } else { 0 },
         gpu_kernel: consensus::PowAlgo::ALL
             .map(|a| gpus.iter().any(|g| backend::device_has_kernel(g, a))),
-        compile_ahead: !args.benchmark && args.solve.is_none(),
     };
     let gpu_bc3 = plan.gpu_kernel[consensus::PowAlgo::Bc3Hash.index()];
     #[cfg(not(feature = "bc3hash"))]
     let _ = gpu_bc3;
-    let gpu_names: Vec<String> = gpus.iter().map(|g| g.describe()).collect();
-    let gpu_bc3_slots: Vec<bool> = gpus
-        .iter()
-        .map(|g| backend::device_has_kernel(g, consensus::PowAlgo::Bc3Hash))
-        .collect();
+    // What the internal tools report on, taken before the workers own the GPUs.
+    #[cfg(feature = "internal-tools")]
+    let devices = internal::Devices::new(&gpus, threads);
 
     human!(
         "bc3-miner {} - {} GPU(s), {} CPU thread(s)",
@@ -368,7 +288,7 @@ fn main() {
     }
     if plan.cpu_fallback_threads > 0 {
         human!(
-            "[cpu] {} thread(s) standing by for jobs the GPU has no kernel for (BC3Hash)",
+            "[cpu] {} thread(s) standing by, to mine BC3Hash should a GPU's kernel fail",
             plan.cpu_fallback_threads
         );
     }
@@ -390,31 +310,31 @@ fn main() {
     // BC3Hash, so nothing is built.
     #[cfg(feature = "bc3hash")]
     {
-        let mode = args.bc3hash_mode.unwrap_or(if gpu_bc3 {
-            Bc3HashMode::Compact
-        } else {
-            Bc3HashMode::Fast
-        });
-        bc3hash::configure(mode.into());
+        let mode = if gpu_bc3 { bc3hash::Mode::Compact } else { bc3hash::Mode::Fast };
+        #[cfg(feature = "internal-tools")]
+        let mode = args.internal.bc3hash_mode().unwrap_or(mode);
+        bc3hash::configure(mode);
         if threads > 0 || gpu_bc3 {
             std::thread::Builder::new()
                 .name("bc3hash-init".into())
                 .spawn(move || {
                     let t0 = std::time::Instant::now();
-                    // No exit: SHA3-256t, on the GPU above all, mines on
-                    // regardless. The CPU threads see the same result through
-                    // worker::cpu_supports and leave BC3Hash alone - shares
-                    // from a wrong build would only ever be rejected.
+                    // No exit: the error stays on screen, in the log and in
+                    // the GUI, while nothing is mined. The CPU threads see the
+                    // same result through worker::cpu_supports and leave
+                    // BC3Hash alone, and so do the GPUs, which need this
+                    // reference for their self-test and for every hit -
+                    // shares from a wrong build would only ever be rejected.
                     if let Err(e) = bc3hash::initialize() {
-                        let message = match e {
-                            bc3hash::InitError::Tables { .. } => format!(
-                                "BC3Hash: NOT mining - {e} With little memory, start with \
-                                 --bc3hash-mode compact."
-                            ),
-                            bc3hash::InitError::WrongResult { .. } => {
-                                format!("BC3Hash: NOT mining - {e}")
+                        use bc3hash::InitError::{Tables, WrongResult};
+                        let hint = match e {
+                            // Only an internal build can choose the tables.
+                            Tables { .. } if cfg!(feature = "internal-tools") => {
+                                " With little memory, start with --bc3hash-mode compact."
                             }
+                            Tables { .. } | WrongResult { .. } => "",
                         };
+                        let message = format!("BC3Hash: NOT mining - {e}{hint}");
                         eprintln!("bc3-miner: {message}");
                         ipc::emit(&ipc::Event::Status {
                             state: ipc::StatusState::Error,
@@ -440,13 +360,10 @@ fn main() {
     if args.intensity < 100 {
         human!("[miner] intensity {}%", args.intensity);
     }
-    shared.set_gpu_queue(args.gpu_queue);
+    #[cfg(feature = "internal-tools")]
+    args.internal.configure(&shared);
     if !gpus.is_empty() && shared.gpu_queue() != backend::QUEUE_DEPTH {
         human!("[gpu] {} kernel launch(es) queued per GPU", shared.gpu_queue());
-    }
-    #[cfg(feature = "bc3hash")]
-    if let Some(window) = args.bc3_window {
-        shared.set_bc3_window(window);
     }
 
     // CPU threads and GPUs share one common disjoint extranonce2 partition.
@@ -471,7 +388,7 @@ fn main() {
             .spawn(move || gpu_worker::run_gpu_worker(s, gpu, g, threads + g, total_workers))
             .expect("could not start a GPU thread");
     }
-    if !args.benchmark && args.solve.is_none() {
+    if !offline {
         let s = shared.clone();
         let interval = args.stats_interval;
         std::thread::spawn(move || stats::run_reporter(s, interval));
@@ -511,44 +428,9 @@ fn main() {
         });
     }
 
-    if let Some(path) = args.solve.clone() {
-        let code = solve::run(
-            shared,
-            submit_rx,
-            solve::Config {
-                path,
-                difficulty: args.difficulty,
-                gpus: gpu_names.len(),
-                cpu_threads: threads,
-            },
-        );
-        std::process::exit(code);
-    }
-
-    if args.benchmark {
-        #[cfg(feature = "bc3hash")]
-        let windows = match args.bc3_window {
-            Some(w) => vec![w],
-            None if args.algo == BenchAlgo::Bc3hash && gpu_bc3 => BC3_WINDOWS.to_vec(),
-            None => vec![shared.bc3_window()],
-        };
-        #[cfg(not(feature = "bc3hash"))]
-        let windows = vec![shared.bc3_window()];
-        let compare = windows.len() > 1;
-        let code = bench::run(
-            shared,
-            submit_rx,
-            bench::Config {
-                algo: args.algo.into(),
-                seconds: args.seconds.unwrap_or(if compare { 20 } else { 60 }),
-                difficulty: args.difficulty,
-                windows,
-                gpu_names,
-                gpu_bc3: gpu_bc3_slots,
-                cpu_threads: threads,
-            },
-        );
-        std::process::exit(code);
+    #[cfg(feature = "internal-tools")]
+    if offline {
+        std::process::exit(args.internal.run(shared, submit_rx, devices));
     }
 
     stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user });
@@ -562,8 +444,8 @@ fn main() {
 /// starve and the GPU hashrate drops more than the CPU adds. So `--threads 0`
 /// reserves one core per GPU plus one more.
 ///
-/// The stand-ins are different. They only run when the GPU has nothing to do,
-/// on BC3Hash, which has no kernel; then its feeder needs no core, and they
+/// The stand-ins are different. They only run when the GPU has nothing to do -
+/// its BC3Hash kernel failed - and then its feeder needs no core, and they
 /// get all of them.
 fn plan_cpu(
     backend: BackendKind,
@@ -578,7 +460,7 @@ fn plan_cpu(
         // Pure CPU mining, as before.
         (None, 0) => (all_cores, CpuRole::All),
         // A GPU in auto: no CPU mining next to it, but every core stands by
-        // for what it cannot do. Since the fork that is everything.
+        // for what it cannot do - BC3Hash, should its kernel fail.
         (None, _) if backend == BackendKind::Auto => (all_cores, CpuRole::GpuFallback),
         // A GPU backend the user chose by name: the CPU stays out of it.
         (None, _) => (0, CpuRole::All),
@@ -590,7 +472,7 @@ mod tests {
     use super::*;
 
     /// The fallback decision for every way the miner can be started. The case
-    /// the fork hinges on: auto with a GPU and no --threads stands every core
+    /// that matters most: auto with a GPU and no --threads stands every core
     /// by for BC3Hash, while a GPU backend chosen by name leaves the CPU alone.
     #[test]
     fn cpu_threads_and_their_role() {

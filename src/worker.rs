@@ -9,21 +9,13 @@ use crate::shared::{AlgoGate, FoundShare, MinerJob, Shared};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// How often the threads check for new jobs, counted in SHA3-256t hashes.
-const CHECK_INTERVAL: u32 = 4096;
-
 /// Hashes per batch: the job check, the stats and the throttle run once per
-/// batch, so a batch should take a few milliseconds whatever the PoW - long
-/// enough that the check is free, short enough that a new block is picked up
-/// at once. 4096 SHA3-256t hashes are ~5 ms on one thread; 4096 BC3Hash
-/// hashes would leave a thread ~4 s on a stale job after every block, so it
-/// checks every 4 (~4 ms at ~1100 H/s per thread).
-fn batch_size(algo: PowAlgo) -> u32 {
-    match algo {
-        PowAlgo::Sha256d | PowAlgo::Sha3t => CHECK_INTERVAL,
-        PowAlgo::Bc3Hash => 4,
-    }
-}
+/// batch, so a batch should take a few milliseconds - long enough that the
+/// check is free, short enough that a new block is picked up at once. 4
+/// BC3Hash hashes are ~4 ms at ~1100 H/s per thread; 4096, the batch
+/// SHA3-256t used, would leave a thread ~4 s on a stale job after every
+/// block.
+const BATCH: u32 = 4;
 
 /// Can this process hash `algo` on the CPU? BC3Hash needs the node's C++
 /// linked in, its tables built, and the build's self-test passed - the first
@@ -42,7 +34,13 @@ pub fn cpu_may_support(algo: PowAlgo) -> bool {
 /// (without `wait`) while BC3Hash is still being set up.
 pub fn cpu_unavailable(algo: PowAlgo, wait: bool) -> Option<String> {
     match algo {
-        PowAlgo::Sha256d | PowAlgo::Sha3t => None,
+        // The PoWs before the second fork: no GPU kernel and no CPU path any
+        // more, see `PowAlgo::hash_fn`.
+        PowAlgo::Sha256d | PowAlgo::Sha3t => Some(
+            "the job's version lacks bit 11 (0x800), and BC3Hash is the only proof of work \
+             this miner mines"
+                .into(),
+        ),
         PowAlgo::Bc3Hash => bc3hash_unavailable(wait),
     }
 }
@@ -66,10 +64,9 @@ fn bc3hash_unavailable(_wait: bool) -> Option<String> {
 pub enum CpuRole {
     /// Every job the CPU can hash: CPU mining, or `--threads` next to a GPU.
     All,
-    /// A stand-in for the GPUs: only jobs whose PoW no GPU kernel implements,
-    /// which since the fork is every job - BC3Hash has no GPU kernel. While
-    /// the GPUs have work, these threads sleep on the job condvar and cost
-    /// nothing.
+    /// A stand-in for the GPUs: only jobs no GPU takes - BC3Hash on a card
+    /// whose kernel failed to load or failed its self-test. While the GPUs
+    /// have work, these threads sleep on the job condvar and cost nothing.
     GpuFallback,
 }
 
@@ -117,9 +114,8 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize, rol
             en2 = thread_id as u64;
             nonce = 0;
         }
-        let batch = batch_size(job.algo);
         let exhausted =
-            mine_job(&shared, &job, pow, batch, generation, num_threads, &mut en2, &mut nonce);
+            mine_job(&shared, &job, pow, BATCH, generation, num_threads, &mut en2, &mut nonce);
         if exhausted {
             if let Some(label) = label {
                 eprintln!(
@@ -141,8 +137,7 @@ fn mine_job(
     shared: &Shared,
     job: &MinerJob,
     // Resolved once per job, so the loop below calls a plain function with no
-    // match per nonce. Next to a triple keccak, let alone a BC3Hash, the
-    // indirect call is noise.
+    // match per nonce. Next to a BC3Hash the indirect call is noise.
     pow: PowFn,
     batch: u32,
     generation: u64,
@@ -187,11 +182,11 @@ fn mine_job(
             let batch_start = std::time::Instant::now();
             // Count iterations rather than compare against an end value.
             //
-            // `nonce.saturating_add(CHECK_INTERVAL)` saturates at u32::MAX, so
+            // `nonce.saturating_add(batch)` saturates at u32::MAX, so
             // `nonce < batch_end` is false there: the inner loop runs zero
             // times, the nonce never wraps to 0, and the outer loop spins
-            // forever - while adding 4096 to stats every turn without hashing
-            // anything. A burned core and an invented hashrate. Nonce
+            // forever - while adding a batch to stats every turn without
+            // hashing anything. A burned core and an invented hashrate. Nonce
             // 0xFFFFFFFF was never hashed either. The GPU path already handled
             // this boundary with overflowing_add; now this one does too.
             let mut done: u32 = 0;
@@ -314,7 +309,7 @@ mod tests {
 
     /// The nonce loop must get past u32::MAX instead of livelocking.
     ///
-    /// With `batch_end = nonce.saturating_add(CHECK_INTERVAL)` the condition
+    /// With `batch_end = nonce.saturating_add(batch)` the condition
     /// `nonce < batch_end` was false at MAX: zero iterations, no wrap, and the
     /// outer loop span forever. This runs the same arithmetic as mine_job,
     /// without the hashing.
@@ -328,7 +323,7 @@ mod tests {
             assert!(batches < 10, "the loop does not end - livelock");
             let mut done: u32 = 0;
             let mut wrapped_out = false;
-            while done < CHECK_INTERVAL {
+            while done < BATCH {
                 hashed.push(nonce);
                 done += 1;
                 let (next, wrapped) = nonce.overflowing_add(1);
@@ -338,8 +333,8 @@ mod tests {
                     break;
                 }
             }
-            // The batch before the wrap is shorter than CHECK_INTERVAL.
-            assert!(done <= CHECK_INTERVAL);
+            // The batch before the wrap is shorter than BATCH.
+            assert!(done <= BATCH);
             if wrapped_out {
                 assert_eq!(nonce, 0);
                 break;
@@ -424,11 +419,11 @@ mod tests {
         }
     }
 
-    /// The fork as a GPU rig in `--backend auto` sees it. The stand-in CPU
-    /// thread leaves to the GPU whatever the GPU claims - not one hash - and
-    /// takes over the moment it does not: a PoW without a GPU kernel, or a
-    /// GPU kernel that drops out (failed self-test) in the middle of a job,
-    /// without waiting for the next one.
+    /// A GPU rig in `--backend auto`. The stand-in CPU thread leaves to the
+    /// GPU whatever the GPU claims - not one hash - and takes over the moment
+    /// it does not: a GPU kernel that drops out (failed self-test) in the
+    /// middle of a job, without waiting for the next one. A job without
+    /// BC3Hash's version bit it does not touch either: nothing mines that.
     #[cfg(feature = "bc3hash")]
     #[test]
     fn a_stand_in_thread_mines_only_what_the_gpus_cannot() {
@@ -437,14 +432,13 @@ mod tests {
             gpus: 1,
             cpu_threads: 0,
             cpu_fallback_threads: 1,
-            gpu_kernel: [false, true, true],
-            compile_ahead: false,
+            gpu_kernel: [false, false, true],
         };
         let shared = Arc::new(Shared::new(tx, plan));
-        // The GPU worker's claim: SHA3-256t, for now.
+        // The card claims BC3Hash when it opens: the stand-in leaves it alone...
         let mut gpu = crate::shared::GpuCapability::new(&shared);
-        gpu.set(PowAlgo::Sha3t, true);
-        shared.publish_job(easy_job("sha3t", PowAlgo::Sha3t));
+        gpu.set(PowAlgo::Bc3Hash, true);
+        shared.publish_job(easy_job("gpu", PowAlgo::Bc3Hash));
         let s = shared.clone();
         std::thread::spawn(move || run_worker(s, 1, 2, CpuRole::GpuFallback));
 
@@ -452,33 +446,29 @@ mod tests {
         assert!(rx.try_recv().is_err(), "the stand-in submitted a share for the GPU's job");
         assert_eq!(shared.stats.hashes.load(Ordering::Relaxed), 0, "the stand-in hashed the GPU's job");
 
-        // No GPU kernel for BC3Hash (an OpenCL card): the CPU takes it.
-        shared.publish_job(easy_job("fork", PowAlgo::Bc3Hash));
-        let share = rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the stand-in did not take over the BC3Hash job");
-        assert_eq!(share.job_id, "fork");
-
-        shared.publish_job(easy_job("sha3t-again", PowAlgo::Sha3t));
-        wait_until_idle(&shared, &rx);
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(rx.try_recv().is_err(), "a share was submitted after the GPU took over again");
-
-        // A CUDA card claims BC3Hash: the stand-in leaves it alone...
-        gpu.set(PowAlgo::Bc3Hash, true);
-        shared.publish_job(easy_job("fork-gpu", PowAlgo::Bc3Hash));
-        std::thread::sleep(Duration::from_millis(300));
-        let hashed = shared.stats.hashes.load(Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(shared.stats.hashes.load(Ordering::Relaxed), hashed, "the stand-in hashed the GPU's BC3Hash");
-        assert!(rx.try_recv().is_err());
         // ...until its kernel fails the self-test: no new job, and the CPU
         // still takes over at once.
         gpu.set(PowAlgo::Bc3Hash, false);
         let share = rx
             .recv_timeout(Duration::from_secs(30))
             .expect("the stand-in did not take over when the GPU dropped BC3Hash");
-        assert_eq!(share.job_id, "fork-gpu");
+        assert_eq!(share.job_id, "gpu");
+
+        // A job of the PoW before the fork: no GPU takes it, and the stand-in
+        // does not hash it either.
+        shared.publish_job(easy_job("sha3t", PowAlgo::Sha3t));
+        wait_until_idle(&shared, &rx);
+        let hashed = shared.stats.hashes.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(rx.try_recv().is_err(), "a share was submitted for a SHA3-256t job");
+        assert_eq!(shared.stats.hashes.load(Ordering::Relaxed), hashed, "a SHA3-256t job was hashed");
+
+        // And BC3Hash again: the CPU is back on it while no GPU claims it.
+        shared.publish_job(easy_job("bc3", PowAlgo::Bc3Hash));
+        let share = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stand-in did not pick BC3Hash up again");
+        assert_eq!(share.job_id, "bc3");
         shared.clear_job();
     }
 
@@ -502,15 +492,9 @@ mod tests {
             assert_eq!(share.job_id, "fork");
             let hash = ::bc3hash::bc3hash(&header_of(&job, &share.extranonce2, share.nonce));
             assert!(hash_meets_target(&hash, &job.share_target), "the share does not meet its target");
-            assert_ne!(hash, sha3t_of(&job, &share), "hashed with SHA3-256t, not BC3Hash");
             assert_eq!(share.hash_display, hash_to_display(&hash));
         }
         shared.clear_job();
-    }
-
-    #[cfg(feature = "bc3hash")]
-    fn sha3t_of(job: &MinerJob, share: &FoundShare) -> [u8; 32] {
-        crate::consensus::sha3t(&header_of(job, &share.extranonce2, share.nonce))
     }
 
     /// BC3Hash rate through the real worker loop, to hold against
@@ -552,17 +536,19 @@ mod tests {
             coinb1: vec![9; 50],
             coinb2: vec![8; 20],
             merkle_steps: vec![],
-            version: 0x2000_1000,
+            version: 0x2000_1800,
             prev_hash: [6u8; 32],
             bits: 0x1d00_ffff,
             ntime: 1_700_000_000,
             share_target: [0; 32],
             height: None,
-            algo: PowAlgo::Sha3t,
+            algo: PowAlgo::Bc3Hash,
         };
         shared.publish_job(job.clone());
         let (generation, _) = shared.wait_for_job();
-        let pow = PowAlgo::Sha3t.hash_fn().unwrap();
+        // SHA256d stands in for BC3Hash: the loop is the same for any PoW,
+        // and this one needs no tables.
+        let pow: PowFn = |h| sha256d(h);
         // The last four nonces of extranonce2 255 - the last one a byte holds.
         let (mut en2, mut nonce) = (255u64, u32::MAX - 3);
         assert!(mine_job(&shared, &job, pow, 16, generation, 1, &mut en2, &mut nonce));
@@ -583,21 +569,19 @@ mod tests {
         assert!(CpuRole::All.takes(false));
     }
 
-    /// A batch stays a few milliseconds long whatever the PoW, so a new block
-    /// is picked up at once - BC3Hash is about 1000 times slower per hash.
-    #[test]
-    fn batches_are_sized_per_pow() {
-        assert_eq!(batch_size(PowAlgo::Sha3t), CHECK_INTERVAL);
-        assert!(batch_size(PowAlgo::Bc3Hash) * 1000 <= CHECK_INTERVAL * 2);
-        assert!(batch_size(PowAlgo::Bc3Hash) >= 1);
-    }
-
     /// The CPU path hashes exactly what the GPU re-check and consensus.rs
-    /// would: the serialized-once header with the nonce patched in.
+    /// would: the serialized-once header with the nonce patched in. And it
+    /// hashes nothing but BC3Hash.
     #[test]
     fn cpu_hash_matches_the_header_reference() {
+        assert!(!cpu_supports(PowAlgo::Sha3t) && !cpu_supports(PowAlgo::Sha256d));
+        assert!(cpu_unavailable(PowAlgo::Sha3t, false).is_some_and(|why| why.contains("bit 11")));
+        assert_eq!(cpu_supports(PowAlgo::Bc3Hash), cfg!(feature = "bc3hash"));
+        if !cfg!(feature = "bc3hash") {
+            return;
+        }
         let mut h = BlockHeader {
-            version: 0x2000_1000,
+            version: 0x2000_1800,
             prev_hash: [1u8; 32],
             merkle_root: [2u8; 32],
             time: 1_700_000_000,
@@ -605,13 +589,12 @@ mod tests {
             nonce: 0,
         };
         let mut ser = h.serialize();
+        let pow = PowAlgo::Bc3Hash.hash_fn().unwrap();
         for nonce in [0u32, 1, 0xdead_beef, u32::MAX] {
             ser[76..80].copy_from_slice(&nonce.to_le_bytes());
             h.nonce = nonce;
-            assert_eq!((PowAlgo::Sha3t.hash_fn().unwrap())(&ser), h.hash());
+            assert_eq!(pow(&ser), h.hash());
         }
-        assert!(cpu_supports(PowAlgo::Sha3t) && cpu_supports(PowAlgo::Sha256d));
-        assert_eq!(cpu_supports(PowAlgo::Bc3Hash), cfg!(feature = "bc3hash"));
     }
 
     /// The workers must NEVER grind on the same thing. Every worker starts at

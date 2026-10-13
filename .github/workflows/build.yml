@@ -33,11 +33,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The committed PTX is the one file in the repository nobody can review by
-  # reading it - 39,000 lines of generated assembly. Without this job a pull
-  # request could change it alone, leaving the kernel source saying one thing
-  # and the binary doing another, and every human reviewer would see a diff
-  # they have no way to check.
+  # The committed PTX is the one kind of file in the repository nobody can
+  # review by reading it - generated assembly, tens of thousands of lines per
+  # table window. Without this job a pull request could change it alone,
+  # leaving the kernel source saying one thing and the binary doing another,
+  # and every human reviewer would see a diff they have no way to check.
   #
   # The toolkit version is pinned to 12.0 for the same reason build.rs caps the
   # ISA version: it decides which drivers can load the result. See AGENTS.md.
@@ -52,11 +52,9 @@ jobs:
       - name: git, which the CUDA image does not ship
         run: apt-get update && apt-get install -y --no-install-recommends git
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Regenerate the PTX from the kernel sources
+      - name: Regenerate the PTX from the kernel source
         run: |
-          /usr/local/cuda/bin/nvcc --ptx -arch compute_52 -O3 -x cu \
-            src/kernels/sha3t.cl -o /tmp/sha3t.ptx
-          # BC3Hash: one PTX per secp256k1 table window, see build.rs.
+          # One PTX per secp256k1 table window, see build.rs.
           for w in 10 12 14 16; do
             /usr/local/cuda/bin/nvcc --ptx -arch compute_52 -O3 -DBC3_WINDOW=$w -x cu \
               src/kernels/bc3hash.cl -o /tmp/bc3hash_w$w.ptx
@@ -68,17 +66,16 @@ jobs:
           #
           # Nor is the hash in the names nvcc gives functions with internal
           # linkage (_INTERNAL_<hash>_...): it is derived from the absolute
-          # path of the source file. The committed BC3Hash PTX was built in
-          # /work, as AGENTS.md says (fdfb051c); built from a checkout in
+          # path of the source file. The committed PTX was built in /work, as
+          # AGENTS.md says (fdfb051c); built from a checkout in
           # /__w/bc3.online.miner/bc3.online.miner it gets 2495b0d9, and no
-          # other line differs. sha3t.cl inlines everything, so it has no
-          # such names.
+          # other line differs.
           #
           # POSIX sh, not bash: this job runs in a container, where the step
           # shell is /bin/sh - dash on Ubuntu. Process substitution here was a
           # syntax error, so the check exited 2 without ever comparing anything.
           # A check that cannot fail for the right reason is worse than none.
-          for k in sha3t bc3hash_w10 bc3hash_w12 bc3hash_w14 bc3hash_w16; do
+          for k in bc3hash_w10 bc3hash_w12 bc3hash_w14 bc3hash_w16; do
             sed -e '/^\/\//d' -e 's/_INTERNAL_[0-9a-f]*_/_INTERNAL_/g' \
               src/kernels/$k.ptx > /tmp/committed.ptx
             sed -e '/^\/\//d' -e 's/_INTERNAL_[0-9a-f]*_/_INTERNAL_/g' \
@@ -111,10 +108,18 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       # The GPU tests are #[ignore]d and stay that way: no runner has a GPU.
-      # What runs here is the CPU half - the consensus vectors, the Rust mirror
-      # of the kernel algorithm, address validation, and the throttle.
+      # What runs here is the CPU half - the consensus vectors, the node's
+      # BC3Hash vectors, the worker pipelines, and the pool protocol.
       - name: Test (core)
         run: cargo test --release
+      # The internal tools (--benchmark, --solve; see AGENTS.md) are behind a
+      # feature no release enables. Built and tested here so they cannot rot.
+      # Before "Build miner (CLI)" on purpose: that step builds
+      # target/release/bc3-miner.exe with the default features, whatever an
+      # earlier step left there, and that is the binary the package and the
+      # GUI get.
+      - name: Test (internal tools)
+        run: cargo test --release --features internal-tools
       - name: Test (wasm crate, host target)
         run: cargo test --release --manifest-path wasm/Cargo.toml
 

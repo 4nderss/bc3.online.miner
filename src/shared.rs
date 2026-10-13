@@ -184,7 +184,8 @@ pub struct Shared {
     pub started: std::time::Instant,
 }
 
-/// The BC3Hash table window the GPUs use unless told otherwise (`--bc3-window`).
+/// The BC3Hash table window the GPUs use. Only an internal-tools build can
+/// choose another (`--bc3-window`).
 pub const DEFAULT_BC3_WINDOW: u32 = 16;
 
 /// `Shared::gpu_slot_bc3` value for a GPU whose BC3Hash kernel failed to load
@@ -243,9 +244,6 @@ pub struct MiningPlan {
     /// Per PoW (`PowAlgo::index`): do the started GPUs have a kernel for it?
     /// Only for telling "no kernel" apart from "not ready" in the status.
     pub gpu_kernel: [bool; 3],
-    /// GPUs mining SHA3-256t compile their BC3Hash kernel in the background,
-    /// ready for the fork. Off for the benchmark, which loads it at once.
-    pub compile_ahead: bool,
 }
 
 /// Where the jobs of one PoW are hashed.
@@ -290,9 +288,6 @@ impl MiningPlan {
                 true,
                 format!("{name}: mining on CPU - the GPU is not ready for it, or failed its self-test"),
             ),
-            (false, true) if self.gpus > 0 => {
-                (true, format!("{name}: mining on CPU (no GPU kernel yet)"))
-            }
             (false, true) => (true, format!("{name}: mining on CPU")),
             (false, false) if !crate::worker::cpu_may_support(algo) => {
                 let why = crate::worker::cpu_unavailable(algo, false).unwrap_or_default();
@@ -301,8 +296,8 @@ impl MiningPlan {
             (false, false) => (
                 false,
                 format!(
-                    "{name}: NOT mining - there is no GPU kernel for it yet and no CPU threads \
-                     are running. Use --backend auto, or add --threads N"
+                    "{name}: NOT mining - no GPU mines it and no CPU threads are running. Use \
+                     --backend auto, or add --threads N"
                 ),
             ),
         }
@@ -419,7 +414,9 @@ impl Shared {
     }
 
     /// Ask the GPUs for another BC3Hash window; they switch before their next
-    /// BC3Hash job, so publish a job after this.
+    /// BC3Hash job, so publish a job after this. Only the internal tools do:
+    /// a release mines at `DEFAULT_BC3_WINDOW`.
+    #[cfg(feature = "internal-tools")]
     pub fn set_bc3_window(&self, window: u32) {
         self.bc3_window.store(window, Ordering::Relaxed);
     }
@@ -506,7 +503,9 @@ impl Shared {
     }
 
     /// Cap the launches a GPU keeps queued; the default is as many as the
-    /// backends allow.
+    /// backends allow. Only for comparing the two (`--gpu-queue`, internal
+    /// tools).
+    #[cfg(feature = "internal-tools")]
     pub fn set_gpu_queue(&self, launches: u32) {
         self.gpu_queue.store(launches.max(1), Ordering::Relaxed);
     }
@@ -725,26 +724,27 @@ mod tests {
         Shared::new(tx, MiningPlan::default())
     }
 
-    /// The GPU kernels only do SHA3-256t: a GPU worker sits out BC3Hash (and
-    /// SHA256d) instead of grinding it, and says so once.
+    /// A job without BC3Hash's version bit has no kernel and no CPU path:
+    /// every worker sits it out instead of grinding it, and says so once.
+    /// BC3Hash goes through wherever this build has it.
     #[test]
     fn the_gate_lets_through_only_what_the_backend_supports() {
         let gpu = crate::backend::kernel_supports;
         let mut gate = AlgoGate::default();
-        assert_eq!(gate.check(PowAlgo::Sha3t, Some("gpu"), gpu), Some(PowAlgo::Sha3t));
-        assert_eq!(gate.check(PowAlgo::Bc3Hash, Some("gpu"), gpu), None);
-        assert_eq!(gate.warned, Some(PowAlgo::Bc3Hash), "said once, remembered");
-        assert_eq!(gate.check(PowAlgo::Bc3Hash, Some("gpu"), gpu), None);
+        assert_eq!(gate.check(PowAlgo::Sha3t, Some("gpu"), gpu), None);
+        assert_eq!(gate.warned, Some(PowAlgo::Sha3t), "said once, remembered");
+        assert_eq!(gate.check(PowAlgo::Sha3t, Some("gpu"), gpu), None);
         assert_eq!(gate.check(PowAlgo::Sha256d, Some("gpu"), gpu), None);
-        assert_eq!(gate.check(PowAlgo::Sha3t, Some("gpu"), gpu), Some(PowAlgo::Sha3t));
-        assert_eq!(gate.warned, None, "back to normal");
-        // The CPU hashes whatever this build implements.
+        assert_eq!(gate.warned, Some(PowAlgo::Sha256d));
+        let bc3 = cfg!(feature = "bc3hash");
+        assert_eq!(gate.check(PowAlgo::Bc3Hash, Some("gpu"), gpu).is_some(), bc3);
+        if bc3 {
+            assert_eq!(gate.warned, None, "back to normal");
+        }
         let cpu = crate::worker::cpu_supports;
-        assert_eq!(gate.check(PowAlgo::Sha3t, Some("cpu"), cpu), Some(PowAlgo::Sha3t));
-        assert_eq!(
-            gate.check(PowAlgo::Bc3Hash, Some("cpu"), cpu).is_some(),
-            cfg!(feature = "bc3hash")
-        );
+        assert_eq!(gate.check(PowAlgo::Sha3t, Some("cpu"), cpu), None);
+        assert_eq!(gate.check(PowAlgo::Sha256d, Some("cpu"), cpu), None);
+        assert_eq!(gate.check(PowAlgo::Bc3Hash, Some("cpu"), cpu).is_some(), bc3);
     }
 
     /// Where each PoW is mined, for every way main can start the workers -
@@ -757,38 +757,34 @@ mod tests {
             let d = plan.devices_for(algo, gpu);
             (d.gpu, d.cpu)
         };
-        let sha3_only = [false, true, false];
-        let both = [false, true, true];
-        // --backend auto with an OpenCL GPU: no BC3Hash kernel, so the CPU
-        // threads stand in for it.
-        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 20, gpu_kernel: sha3_only, compile_ahead: true };
-        assert_eq!(devices(auto, PowAlgo::Sha3t, true), (true, false));
+        let bc3 = [false, false, true];
+        // --backend auto: the GPU takes BC3Hash, and the CPU threads stand
+        // by - until its kernel is not ready or failed its self-test.
+        let auto = MiningPlan { gpus: 1, cpu_threads: 0, cpu_fallback_threads: 20, gpu_kernel: bc3 };
+        assert_eq!(devices(auto, PowAlgo::Bc3Hash, true), (true, false));
+        assert_eq!(auto.status(PowAlgo::Bc3Hash, true), (true, "BC3Hash: mining on GPU".into()));
         assert_eq!(devices(auto, PowAlgo::Bc3Hash, false), (false, true));
-        assert_eq!(auto.status(PowAlgo::Sha3t, true), (true, "SHA3-256t: mining on GPU".into()));
-        assert_eq!(
-            auto.status(PowAlgo::Bc3Hash, false),
-            (true, "BC3Hash: mining on CPU (no GPU kernel yet)".into())
-        );
-        // With CUDA the GPU takes BC3Hash too, and the CPU stays out - unless
-        // the kernel is not ready or failed its self-test.
-        let cuda = MiningPlan { gpu_kernel: both, ..auto };
-        assert_eq!(devices(cuda, PowAlgo::Bc3Hash, true), (true, false));
-        assert_eq!(cuda.status(PowAlgo::Bc3Hash, true), (true, "BC3Hash: mining on GPU".into()));
-        assert_eq!(devices(cuda, PowAlgo::Bc3Hash, false), (false, true));
-        assert!(cuda.status(PowAlgo::Bc3Hash, false).1.contains("self-test"));
-        // A forced OpenCL backend has no CPU threads: BC3Hash is not mined,
-        // and that must read as an error, not as "Mining".
-        let forced = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 0, gpu_kernel: sha3_only, compile_ahead: true };
-        assert_eq!(devices(forced, PowAlgo::Sha3t, true), (true, false));
+        assert!(auto.status(PowAlgo::Bc3Hash, false).1.contains("self-test"));
+        // A job without bit 11 is mined by nothing, and that must read as an
+        // error that says why, not as "Mining".
+        for algo in [PowAlgo::Sha3t, PowAlgo::Sha256d] {
+            assert_eq!(devices(auto, algo, false), (false, false));
+            let (mining, message) = auto.status(algo, false);
+            assert!(!mining && message.contains("NOT mining") && message.contains("bit 11"), "{message}");
+        }
+        // A forced backend has no CPU threads: a card whose kernel failed
+        // leaves BC3Hash unmined, and that is an error too.
+        let forced = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 0, gpu_kernel: bc3 };
+        assert_eq!(devices(forced, PowAlgo::Bc3Hash, true), (true, false));
         assert_eq!(devices(forced, PowAlgo::Bc3Hash, false), (false, false));
         let (mining, message) = forced.status(PowAlgo::Bc3Hash, false);
         assert!(!mining && message.contains("NOT mining"), "{message}");
-        // GPU plus --threads: both on SHA3-256t, the CPU alone on BC3Hash.
-        let dual = MiningPlan { gpus: 1, cpu_threads: 4, cpu_fallback_threads: 0, gpu_kernel: sha3_only, compile_ahead: true };
-        assert_eq!(devices(dual, PowAlgo::Sha3t, true), (true, true));
-        assert_eq!(devices(dual, PowAlgo::Bc3Hash, false), (false, true));
+        // GPU plus --threads: both on BC3Hash.
+        let dual = MiningPlan { gpus: 1, cpu_threads: 4, cpu_fallback_threads: 0, gpu_kernel: bc3 };
+        assert_eq!(devices(dual, PowAlgo::Bc3Hash, true), (true, true));
+        assert_eq!(dual.status(PowAlgo::Bc3Hash, true), (true, "BC3Hash: mining on GPU and CPU".into()));
         // CPU only.
-        let cpu = MiningPlan { gpus: 0, cpu_threads: 8, cpu_fallback_threads: 0, gpu_kernel: [false; 3], compile_ahead: true };
+        let cpu = MiningPlan { gpus: 0, cpu_threads: 8, cpu_fallback_threads: 0, gpu_kernel: [false; 3] };
         assert_eq!(devices(cpu, PowAlgo::Bc3Hash, false), (false, true));
         assert_eq!(cpu.status(PowAlgo::Bc3Hash, false), (true, "BC3Hash: mining on CPU".into()));
         assert_eq!(PowDevices { gpu: true, cpu: true }.label(), "gpu+cpu");
@@ -797,6 +793,7 @@ mod tests {
     /// The pool's first job comes before the GPU has opened its backend:
     /// the CPU stands in, and that is reported as a start, not as a failed
     /// self-test. Once the GPU is open, the real reason shows.
+    #[cfg(feature = "bc3hash")]
     #[test]
     fn a_starting_gpu_is_not_reported_as_failed() {
         let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
@@ -804,16 +801,15 @@ mod tests {
             gpus: 1,
             cpu_threads: 0,
             cpu_fallback_threads: 20,
-            gpu_kernel: [false, true, true],
-            compile_ahead: true,
+            gpu_kernel: [false, false, true],
         };
         let s = Shared::new(tx, plan);
         assert_eq!(
-            s.status(PowAlgo::Sha3t),
-            (true, "SHA3-256t: mining on CPU until the GPU is ready".into())
+            s.status(PowAlgo::Bc3Hash),
+            (true, "BC3Hash: mining on CPU until the GPU is ready".into())
         );
         s.gpu_opened();
-        assert!(s.status(PowAlgo::Sha3t).1.contains("self-test"));
+        assert!(s.status(PowAlgo::Bc3Hash).1.contains("self-test"));
         // No GPU kernel for SHA256d at all: never "until the GPU is ready".
         let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
         let s = Shared::new(tx, plan);
@@ -839,8 +835,11 @@ mod tests {
         assert!(!s.gpus_mine(PowAlgo::Bc3Hash));
         assert!(!s.gpus_mine(PowAlgo::Sha3t));
         assert_eq!(s.bc3_window(), DEFAULT_BC3_WINDOW);
-        s.set_bc3_window(12);
-        assert_eq!(s.bc3_window(), 12);
+        #[cfg(feature = "internal-tools")]
+        {
+            s.set_bc3_window(12);
+            assert_eq!(s.bc3_window(), 12);
+        }
     }
 
     /// A change of PoW is announced once, not once per job.

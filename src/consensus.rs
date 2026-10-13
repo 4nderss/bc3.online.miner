@@ -1,31 +1,20 @@
-//! BC3 consensus primitives the miner needs: the PoW functions, header
+//! BC3 consensus primitives the miner needs: the choice of PoW, header
 //! serialization, targets and merkle folding.
 //!
 //! Deliberately duplicated from the pool's private `bc3-core` (this client is
 //! open source). The test vectors at the bottom are chain-verified - the same
 //! expected values as the pool's - and lock the implementations to each other.
-//! BC3Hash is the exception: it is the node's own C++ (the `bc3hash` crate),
-//! because a port could differ from the node in one bit and nobody would know
-//! until no block was ever accepted.
-
-use sha3::{Digest, Sha3_256};
+//! BC3Hash, the one PoW the miner mines, is the node's own C++ (the `bc3hash`
+//! crate), because a port could differ from the node in one bit and nobody
+//! would know until no block was ever accepted.
 
 /// Version bit marking SHA3-256t hashing (set in every block since the first
-/// fork, and still set after the second).
+/// fork, and still set after the second). The miner no longer mines it.
 pub const SHA3_VBIT: u32 = 0x0000_1000;
 
 /// Version bit 11, marking BC3Hash (set from the second fork on). It takes
 /// precedence over `SHA3_VBIT`; both stay in the hashed header.
 pub const BC3HASH_VBIT: u32 = 0x0000_0800;
-
-/// SHA3-256t: triple NIST SHA3-256 - BC3's PoW function.
-#[inline]
-pub fn sha3t(data: &[u8]) -> [u8; 32] {
-    let h1 = Sha3_256::digest(data);
-    let h2 = Sha3_256::digest(h1);
-    let h3 = Sha3_256::digest(h2);
-    h3.into()
-}
 
 /// SHA256d - for txids/merkle (unchanged from Bitcoin).
 pub fn sha256d(data: &[u8]) -> [u8; 32] {
@@ -37,18 +26,21 @@ pub fn sha256d(data: &[u8]) -> [u8; 32] {
 /// A proof-of-work function, chosen per job.
 ///
 /// BC3 has changed its PoW twice (SHA256d -> SHA3-256t -> BC3Hash), each time
-/// at a version bit. Everything that hashes a header goes through this enum,
-/// and every `match` on it is exhaustive on purpose: a new variant must fail
-/// to compile at each place that has to learn about it, rather than silently
-/// fall into a default arm.
+/// at a version bit. Every job is classified by its version, as the node
+/// does, but only BC3Hash is mined: the older two have no hash function here
+/// (`hash_fn`), so every worker sits a job of theirs out (`shared::AlgoGate`)
+/// and the status says why - rather than grinding it into shares the pool
+/// rejects. Every `match` on this enum is exhaustive on purpose: a new variant
+/// must fail to compile at each place that has to learn about it, rather than
+/// silently fall into a default arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowAlgo {
-    /// No version bit: blocks before the first fork. Never sent by the pool;
-    /// kept so the chain-verified genesis vector still runs through this path.
+    /// No version bit: the blocks before the first fork. Not mined.
     Sha256d,
-    /// `SHA3_VBIT` without `BC3HASH_VBIT`.
+    /// `SHA3_VBIT` without `BC3HASH_VBIT`: the blocks from the first fork up
+    /// to 64,359. Not mined - the chain is past the second fork.
     Sha3t,
-    /// `BC3HASH_VBIT`. CPU only: there is no GPU kernel for it.
+    /// `BC3HASH_VBIT`: the PoW the miner mines.
     Bc3Hash,
 }
 
@@ -99,12 +91,12 @@ impl PowAlgo {
 
     /// The CPU implementation of this PoW, as a plain function so a hot loop
     /// resolves it once per job instead of matching on every nonce. It is the
-    /// reference every GPU hit is re-checked against. None where this build
-    /// has no implementation - BC3Hash in the browser build.
+    /// reference every GPU hit is re-checked against. None for a PoW the
+    /// miner does not mine - every one but BC3Hash, and BC3Hash too in a
+    /// build without the `bc3hash` feature. Nothing hashes a job without it.
     pub fn hash_fn(&self) -> Option<PowFn> {
         match self {
-            PowAlgo::Sha256d => Some(|h: &[u8; 80]| sha256d(h)),
-            PowAlgo::Sha3t => Some(|h: &[u8; 80]| sha3t(h)),
+            PowAlgo::Sha256d | PowAlgo::Sha3t => None,
             PowAlgo::Bc3Hash => BC3HASH,
         }
     }
@@ -138,18 +130,14 @@ impl BlockHeader {
         out
     }
 
-    /// The block hash, as the node's `GetHash` computes it. Test-only: mining
-    /// resolves the job's `PowAlgo` once per job instead of once per header.
+    /// The block hash, as the node's `GetHash` computes it - for a header the
+    /// miner can hash. Test-only: mining resolves the job's `PowAlgo` once
+    /// per job instead of once per header.
     #[cfg(test)]
     pub fn hash(&self) -> [u8; 32] {
         let algo = PowAlgo::for_version(self.version);
         algo.hash(&self.serialize())
-            .unwrap_or_else(|| panic!("this build has no {}", algo.name()))
-    }
-
-    #[cfg(test)]
-    pub fn hash_display(&self) -> String {
-        hash_to_display(&self.hash())
+            .unwrap_or_else(|| panic!("the miner does not hash {}", algo.name()))
     }
 }
 
@@ -367,7 +355,9 @@ mod tests {
     }
 
     // Same chain-verified expected values as the pool's bc3-core - this is
-    // what locks the two implementations together.
+    // what locks the two implementations together. The genesis block predates
+    // both forks: its hash is SHA256d over the serialized header, the same
+    // SHA256d the miner builds every txid and merkle root with.
     #[test]
     fn genesis_vectors() {
         let genesis = BlockHeader {
@@ -380,15 +370,10 @@ mod tests {
             bits: 0x1d00ffff,
             nonce: 2_442_659_435,
         };
+        assert_eq!(PowAlgo::for_version(genesis.version), PowAlgo::Sha256d);
         assert_eq!(
-            genesis.hash_display(),
+            hash_to_display(&sha256d(&genesis.serialize())),
             "000000000c226a41e70717f6d4fbdcb6bfb4fdc40831ccc87fa9cfdd2c57bff6"
-        );
-        let mut h = sha3t(&genesis.serialize());
-        h.reverse();
-        assert_eq!(
-            hex::encode(h),
-            "e60e0c32fbfed8d800c0d179a1843c0537d20ab2c8b7c2859bca4bf142cac9b5"
         );
     }
 
@@ -548,34 +533,44 @@ mod tests {
         }
     }
 
-    /// `hash`, `hash_fn` and the version-bit `BlockHeader::hash` must agree.
+    /// Only BC3Hash is hashed. Neither older PoW has a function any more, so
+    /// nothing can grind a job of theirs into shares the pool rejects; where
+    /// there is one, `hash`, `hash_fn` and the version-bit `BlockHeader::hash`
+    /// agree.
     #[test]
-    fn pow_algo_dispatch_matches_the_reference() {
-        let h = BlockHeader {
-            version: 0x2000_1000,
+    fn only_bc3hash_is_hashed() {
+        let mut h = BlockHeader {
+            version: 0,
             prev_hash: [3u8; 32],
             merkle_root: [5u8; 32],
             time: 1_777_245_555,
             bits: 0x1d00ffff,
             nonce: 42,
         };
-        let ser = h.serialize();
-        assert_eq!(PowAlgo::Sha3t.hash(&ser), Some(sha3t(&ser)));
-        assert_eq!(PowAlgo::Sha3t.hash(&ser), Some(h.hash()));
-        assert_eq!(PowAlgo::Sha256d.hash(&ser), Some(sha256d(&ser)));
-        for algo in [PowAlgo::Sha256d, PowAlgo::Sha3t, PowAlgo::Bc3Hash] {
-            if let Some(f) = algo.hash_fn() {
-                assert_eq!(Some(f(&ser)), algo.hash(&ser), "{}", algo.name());
-            }
+        for version in [0x2000_0000, 0x2000_1000] {
+            h.version = version;
+            let algo = PowAlgo::for_version(version);
+            assert!(algo.hash_fn().is_none(), "{}", algo.name());
+            assert_eq!(algo.hash(&h.serialize()), None, "{}", algo.name());
         }
         // Only the browser build may lack BC3Hash.
         assert_eq!(PowAlgo::Bc3Hash.hash_fn().is_some(), cfg!(feature = "bc3hash"));
+        if cfg!(feature = "bc3hash") {
+            h.version = 0x2000_1800;
+            let ser = h.serialize();
+            let f = PowAlgo::Bc3Hash.hash_fn().unwrap();
+            assert_eq!(Some(f(&ser)), PowAlgo::Bc3Hash.hash(&ser));
+            assert_eq!(Some(h.hash()), PowAlgo::Bc3Hash.hash(&ser));
+        }
     }
 
     /// The node's header vectors (doc/bc3/vectors/header-vectors.json): one
     /// 80-byte header under all four combinations of bits 11 and 12, with the
     /// digest `GetHash` gives and the block id RPC shows. Run through the
-    /// miner's own path - version -> PowAlgo -> hash - not the crate's.
+    /// miner's own path - version -> PowAlgo -> hash - not the crate's: the
+    /// two with bit 11 hash to the node's digests, the two without it are not
+    /// hashed at all. The SHA256d one still checks the classification
+    /// against the node, through the SHA256d the miner keeps for merkle roots.
     #[cfg(feature = "bc3hash")]
     #[test]
     fn node_header_vectors_through_the_miner_path() {
@@ -604,9 +599,19 @@ mod tests {
             let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
             let algo = PowAlgo::for_version(version);
             seen.insert(version & (BC3HASH_VBIT | SHA3_VBIT));
-            let digest = algo.hash(&header).unwrap();
-            assert_eq!(hex::encode(digest), v["digest"], "version {version:08x}, {}", algo.name());
-            assert_eq!(hash_to_display(&digest), v["block_id"], "version {version:08x}");
+            match algo {
+                PowAlgo::Bc3Hash => {
+                    let digest = algo.hash(&header).unwrap();
+                    assert_eq!(hex::encode(digest), v["digest"], "version {version:08x}");
+                    assert_eq!(hash_to_display(&digest), v["block_id"], "version {version:08x}");
+                }
+                PowAlgo::Sha256d | PowAlgo::Sha3t => {
+                    assert_eq!(algo.hash(&header), None, "version {version:08x} was hashed");
+                }
+            }
+            if algo == PowAlgo::Sha256d {
+                assert_eq!(hex::encode(sha256d(&header)), v["digest"], "version {version:08x}");
+            }
         }
         assert_eq!(seen.len(), 4, "the vectors must cover all four bit combinations");
     }

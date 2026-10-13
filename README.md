@@ -1,47 +1,46 @@
 # bc3.online miner
 
-GPU/CPU miner for BC3 (BitcoinIII): BC3Hash, the proof of work from block 64,360 on, and SHA3-256t before it. Connects to the [bc3.online](https://bc3.online) pool — PPLNS or solo.
+GPU/CPU miner for BC3 (BitcoinIII): BC3Hash, its proof of work since block 64,360. Connects to the [bc3.online](https://bc3.online) pool — PPLNS or solo.
 
-- **Core:** Rust — CUDA and OpenCL GPU backends sharing one kernel source per proof of work, plus multi-threaded CPU mining
-- **Proof of work:** picked per job from the block version, as the node picks it. BC3Hash runs on a GPU kernel of our own and on the CPU through the node's own C++
+- **Core:** Rust — CUDA and OpenCL GPU backends sharing one kernel source, plus multi-threaded CPU mining
+- **Proof of work:** BC3Hash, on a GPU kernel of our own and on the CPU through the node's own C++. Each job's block version must select it, as the node reads it; the miner mines nothing else
 - **GPUs:** NVIDIA via CUDA; AMD and Intel (including integrated graphics) via OpenCL
 - **Pool endpoints:** `bc3.online:3111` (PPLNS), `bc3.online:3112` (solo)
 - **Protocol:** Stratum v1
 
-## The hard fork at block 64,360: BC3Hash
+## BC3Hash, since the hard fork at block 64,360
 
-At block 64,360 BC3 replaces SHA3-256t with **BC3Hash**, a proof of work of
-its own, and changes how difficulty is set:
+At block 64,360 BC3 replaced SHA3-256t with **BC3Hash**, a proof of work of
+its own, and changed how difficulty is set:
 
 - **Version bit 11 (`0x800`) selects BC3Hash**, and it takes precedence over
   bit 12 (`0x1000`, SHA3-256t). The node sets it in every block template from
-  the fork height on. The miner picks the hash per job from the version, the
-  way the node's `GetHash` does, so there is no height rule in the miner that
-  could disagree with the node.
+  the fork height on. The miner reads the proof of work from each job's
+  version, the way the node's `GetHash` does, so there is no height rule in
+  the miner that could disagree with the node - and it mines BC3Hash only. A
+  job without bit 11 is not mined at all: the miner idles on it and says why,
+  in the log and in the GUI, rather than hash it into shares the pool would
+  reject.
 - **Difficulty is ASERT** (aserti9-2d) instead of 2016-block epochs, and it
   adjusts every block. Block 64,360 has a fixed difficulty of 16; after it,
   each block's difficulty follows from how far the chain is ahead of or
   behind an absolute ten-minute schedule, with a half-life of two days.
-- **Hashrates drop by about three orders of magnitude.** One BC3Hash costs
-  about as much as 800 SHA3-256t hashes, so a card that did GH/s now does
-  MH/s or kH/s. That is the algorithm, not a fault.
+- **Hashrates are about three orders of magnitude below the old ones.** One
+  BC3Hash costs about as much as 800 SHA3-256t hashes, so a card that did
+  GH/s before the fork does MH/s or kH/s. That is the algorithm, not a fault.
 
-**bc3-miner 2.0.0 switches by itself.** It mines SHA3-256t until the pool
-hands out the first BC3Hash job, and BC3Hash from then on - per job, without
-a restart. An NVIDIA card compiles its BC3Hash kernel in the background
-while it is still mining SHA3-256t, so at the switch it is ready within
-seconds; an OpenCL card builds its kernel at the switch.
+2.0.0 mined SHA3-256t up to the fork and switched to BC3Hash by itself. The
+chain is past the fork now, and the miner has no SHA3-256t any more.
 
-**1.x cannot mine after the fork: upgrade before block 64,360.** A 1.x miner
-has no BC3Hash. After the fork the pool refuses it, with a message that
-points to the [releases page](../../releases); the GUI of 1.2.0 and later
-also shows a banner linking to the new release once it is published. Docker
-users pull the new image - see *Quick start — Docker* below.
+**1.x cannot mine since the fork.** A 1.x miner has no BC3Hash, and the pool
+refuses it with a message that points to the [releases page](../../releases);
+the GUI of 1.2.0 and later also shows a banner linking to the new release.
+Docker users pull the new image - see *Quick start — Docker* below.
 
-Right after the switch the pool starts every connection at a very low share
-difficulty, and a fast card gets "too many shares per second" answers until
-vardiff has raised it. That is expected. The miner prints the first such
-reject at once and then one line every 10 s counting the repeats.
+When the pool starts a connection at a very low share difficulty, a fast card
+gets "too many shares per second" answers until vardiff has raised it. That
+is expected. The miner prints the first such reject at once and then one line
+every 10 s counting the repeats.
 
 ## Download
 
@@ -61,8 +60,9 @@ gh attestation verify bc3-miner-2.0.0-windows-x86_64.zip --repo 4nderss/bc3.onli
 The Windows binaries need the Microsoft Visual C++ Redistributable (x64),
 which most machines already have. 2.0.0 uses its `MSVCP140.dll` as well as
 the `VCRUNTIME140.dll` earlier versions needed; if Windows says either is
-missing, install the redistributable from Microsoft. On NVIDIA cards both
-GPU kernels need driver R525 or newer.
+missing, install the redistributable from Microsoft. On NVIDIA cards the GPU
+kernel needs driver R525 or newer; with an older one the miner falls back to
+the card's OpenCL runtime.
 
 ## Quick start — GUI
 
@@ -101,82 +101,13 @@ Backend selection is automatic: CUDA if an NVIDIA GPU is present, otherwise Open
 | `--backend auto\|cuda\|opencl\|cpu` | Force a backend (default `auto`) |
 | `--gpu-id N` | Use only the N:th detected GPU |
 | `--threads N` | CPU threads, mining every job. Default: all cores in CPU mode. Next to a GPU the CPU does not mine unless you pass the flag: under `--backend auto` every core stands by and mines only what no GPU can (BC3Hash on a card whose kernel failed its self-test, for one), and with `--backend cuda` or `opencl` it stays out. `--threads 0` means "all cores", minus the GPU feeder threads when a GPU is running |
-| `--bc3-window 10\|12\|14\|16` | Table window of the GPU's BC3Hash kernel, in bits: 7, 22, 76 or 256 MiB of GPU memory (default `16`). Bigger is faster as long as the card's L2 cache keeps up; `--benchmark` compares them |
-| `--bc3hash-mode fast\|compact` | BC3Hash tables for the CPU: `fast` (~256 MiB of RAM, about 10 s to build at startup) or `compact` (~7 MiB, 10-20 % slower). Both find exactly the same shares. Default: `compact` when a GPU mines BC3Hash and the CPU only re-checks its hits, `fast` otherwise |
 | `--intensity 1-100` | Percentage of full speed (default `100`). Below 100 the workers idle between passes, which lowers heat and power and keeps the machine usable while mining |
 | `--stats-interval N` | Seconds between statistics lines (default `5`) |
 | `--json` | Emit machine-readable JSON events on stdout (used by the GUI) |
 | `--require-gpu` | Exit instead of falling back to CPU when no GPU is found (for rented GPU hosts, see Docker below) |
 | `--probe` | List the detected hardware and exit. Shows CUDA and OpenCL devices separately, so you can tell which runtimes work on your machine |
-| `--benchmark` | Measure instead of mining: no pool, no network, no address. See *Benchmark* below |
-| `--solve job.json` | Mine one fixed block template offline. See *Solving a block template offline* below |
 
 Solo rewards are paid directly to your address in the block you find.
-
-## Benchmark
-
-```
-bc3-miner --benchmark                    # BC3Hash: every GPU, all four table windows
-bc3-miner --benchmark --bc3-window 16    # BC3Hash at one window, 60 s
-bc3-miner --benchmark --algo sha3t       # SHA3-256t
-```
-
-`--benchmark` mines without a pool, a network or an address. An in-process
-job source hands random jobs with the right version bits to the normal
-workers - the same dispatch, kernels and launch queue as real mining, every
-GPU hit re-checked on the CPU - and every share is checked once more against
-the CPU reference, the way the pool checks it. `--algo bc3hash` is the
-default.
-
-For BC3Hash on GPUs with the kernel, and without `--bc3-window`, it compares
-the four table windows. Each window runs twice, once on the way up and once
-on the way back down (20 s a run; `--seconds N` changes it), and the two
-runs are averaged: a GPU's clock drifts as it warms up - on a laptop by more
-than the windows differ - and a steady drift cancels out that way. Before a
-window is measured, every card loads its kernel for it; the first time on a
-machine the driver compiles it, which can take up to a minute and is not
-counted. The summary ends with the fastest window for each card and the
-flag to mine with it. On the cards measured so far, window 16 (the default)
-has been the fastest.
-
-Reading the output:
-
-- **Rates** are per device, measured between the ends of whole kernel
-  launches. With NVIDIA, each line also shows the first card's temperature
-  and power.
-- **busy** is the share of the time the GPU spent running kernels, by its
-  own clock (CUDA events, OpenCL profiling), over the wall time between
-  launches. Close to 100 % (99.9 % on the cards measured) means the host
-  keeps the card fed and the rate is the kernel's. Clearly lower means the
-  card waited for the host between launches - a CPU too busy to queue the
-  next launch and re-check hits, for instance. That rate is lost on the host
-  side, and no kernel setting brings it back. Time a card spends drawing the
-  desktop counts as busy.
-- **shares ok/bad**: every share is checked against the CPU reference. The
-  last line is `RESULT: ok` (exit code 0). `RESULT: INVALID SHARES` (exit
-  code 1) means this build or this GPU computes wrong hashes - please report
-  it. `RESULT: nothing hashed` exits with 2.
-
-`--difficulty D` fixes the share difficulty, which otherwise follows the
-measured rate for a share every ~3 s.
-
-## Solving a block template offline
-
-```
-bc3-miner --solve job.json
-```
-
-For a block that has to be mined before any pool can hand it out - the
-fork's first block was published this way - `--solve` mines one fixed block
-template from a JSON job file: `height`, `hashPrevBlock`, `nVersion`,
-`nTime`, `nBits`, `scriptSigData` (hex, put in the coinbase's scriptSig
-after the height) and `payouts` (a list of `scriptPubKey` and `satoshis`).
-No pool, node or network is involved. It runs on the same workers and
-kernels as pool mining, re-checks every GPU hit on the CPU, and draws a
-random extranonce each run, so several machines - or a restart - never
-search the same space. When a hash meets the block's target, it prints the
-whole block and saves it as `bc3-block-<height>-<hash>.txt`, ready for
-`submitblock` on a node that has the block before it.
 
 ## Quick start — Docker
 
@@ -216,8 +147,6 @@ instead of `:latest` if you would rather choose when to move.
 | `BC3_THREADS` | none in GPU mode | CPU threads. |
 | `BC3_INTENSITY` | `100` | 1–100. Below 100 the machine stays usable. |
 | `BC3_GPU_ID` | all | Use only this one GPU, counting from 0. |
-| `BC3_BC3HASH_WINDOW` | `16` | BC3Hash GPU table window: 10, 12, 14 or 16. See `--bc3-window`. |
-| `BC3_BC3HASH_MODE` | see `--bc3hash-mode` | `fast` or `compact` BC3Hash tables for the CPU. |
 | `BC3_REQUIRE_GPU` | unset | Exit rather than fall back to CPU. |
 
 Casing does not matter: `BC3_WALLET` and `bc3_wallet` both work. Environment
@@ -261,21 +190,20 @@ host's restart policy or alerting has something to notice.
 
 ## Upgrading from 1.x
 
-Replace the binaries, or pull the new image, **before block 64,360**. The
-address, rig name, pool ports and every 1.x flag work as before, and the GUI
-keeps its settings. What is new:
+Replace the binaries, or pull the new image: 1.x cannot mine since block
+64,360. The address, rig name, pool ports and every 1.x flag work as before,
+and the GUI keeps its settings. What is new:
 
-- BC3Hash needs memory for its tables: up to 256 MiB of GPU memory per card
-  at the default window (`--bc3-window 10` needs 7 MiB), and 7 to 256 MiB of
-  RAM for the CPU's tables (`--bc3hash-mode`).
+- BC3Hash needs memory for its tables: 256 MiB of GPU memory per card, and
+  RAM for the CPU's - about 7 MiB when a GPU mines BC3Hash and the CPU only
+  re-checks its hits, about 256 MiB when the CPU mines it.
 - At startup the miner checks its BC3Hash build against the node's test
   vectors, and every GPU checks its kernel against the CPU before it mines.
   A card that fails mines no BC3Hash - under `--backend auto` the CPU takes
   over - and the log and the GUI say why.
 - The first time a card needs its BC3Hash kernel, the driver compiles it -
   about 20 s on a fast CPU, up to a minute on a slow one - and caches the
-  result. An NVIDIA card mining SHA3-256t does this in the background
-  before the fork.
+  result.
 
 If you upgrade from 1.2.5 or older, read the next section too.
 
@@ -312,10 +240,10 @@ numbering is the one `--gpu-id` means.
 
 ## Architecture
 
-- **The proof of work is chosen per job**, from the block version, as the node's `CBlockHeader::GetHash` chooses it: bit 11 (`0x800`) is BC3Hash and wins over bit 12 (`0x1000`), SHA3-256t.
-- The CPU builds coinbase/merkle root per extranonce2; the GPU grinds the 2³² nonce space in auto-tuned batches (~100 ms per launch for SHA3-256t, ~400 ms for BC3Hash). Every GPU hit is re-verified on the CPU against the consensus reference before submission.
-- **The CUDA kernels are precompiled to PTX at build time** (see `build.rs`) and embedded in the binary. NVRTC ships with the CUDA *Toolkit*, not with the graphics driver, so runtime compilation would fail on end-user machines. The driver JITs the embedded PTX for whatever card is installed — the binary only needs `nvcuda.dll`.
-- **The PTX is built with the CUDA 12.0 toolkit, and `build.rs` refuses anything newer.** A driver can only JIT the PTX ISA versions it knows: the embedded kernels, SHA3-256t and BC3Hash alike, declare ISA 8.0, which needs driver **R525 or newer**. Building it with a newer toolkit raises that requirement — ISA 8.8 from CUDA 12.9 needs R575 — and on an older driver `cuModuleLoadData` fails, the card is found but no backend opens, and the miner hashes nothing while looking connected. That shipped once; the version check in `build.rs` is there so it cannot ship again. If the CUDA load fails anyway, the miner now falls back to the same card through OpenCL, and exits with an error if no GPU worker survives and no CPU threads are running.
+- **The proof of work is read per job** from the block version, as the node's `CBlockHeader::GetHash` reads it: bit 11 (`0x800`) is BC3Hash and wins over bit 12 (`0x1000`, SHA3-256t). Only BC3Hash is mined: every worker sits out a job without bit 11, and the status says why.
+- The CPU builds coinbase/merkle root per extranonce2; the GPU grinds the 2³² nonce space in auto-tuned batches (~400 ms per launch). Every GPU hit is re-verified on the CPU against the consensus reference before submission.
+- **The CUDA kernel is precompiled to PTX at build time** (see `build.rs`), once per table window, and embedded in the binary. NVRTC ships with the CUDA *Toolkit*, not with the graphics driver, so runtime compilation would fail on end-user machines. The driver JITs the embedded PTX for whatever card is installed — the binary only needs `nvcuda.dll`.
+- **The PTX is built with the CUDA 12.0 toolkit, and `build.rs` refuses anything newer.** A driver can only JIT the PTX ISA versions it knows: the embedded kernel declares ISA 8.0, which needs driver **R525 or newer**. Building it with a newer toolkit raises that requirement — ISA 8.8 from CUDA 12.9 needs R575 — and on an older driver `cuModuleLoadData` fails, the card is found, and the miner hashes nothing on it while looking connected. That shipped once; the version check in `build.rs` is there so it cannot ship again. With a driver older than R525 the CUDA backend does not open the card at all, and the miner falls back to the same card through OpenCL; it exits with an error if no GPU worker survives and no CPU threads are running.
 - **Both GPU runtimes are loaded dynamically** — CUDA via cudarc's fallback loader, OpenCL via `src/backend/cl_sys.rs`. Neither `nvcuda.dll` nor `OpenCL.dll` appears in the binary's import table, so one build runs everywhere: CUDA on NVIDIA, OpenCL on AMD/Intel, CPU if neither is present. Linking against `OpenCL.lib` instead would make the binary refuse to start on machines without an OpenCL runtime.
 
 ### BC3Hash
@@ -326,29 +254,21 @@ numbering is the one `--gpu-id` means.
 
 ### The BC3Hash GPU kernel
 
-`src/kernels/bc3hash.cl` is a kernel of our own, built from the node's constants, with one source for CUDA and OpenCL like `sha3t.cl`:
+`src/kernels/bc3hash.cl` is a kernel of our own, built from the node's constants, with one source for CUDA and OpenCL:
 
 - **32-bit limbs.** Products, squarings and reductions work on 32-bit limbs, which is what a GPU multiplies. Under CUDA they are inline PTX carry chains (`add.cc`/`addc`), 22 % faster on an RTX 3050 Ti than the same arithmetic in C; OpenCL compiles the C versions in the same file.
 - **Inversions by safegcd** (Bernstein-Yang divsteps), ported from libsecp256k1's `modinv32`: about a quarter of the instructions of Fermat's 255 squarings. Scalar multiplications run four at a time and share one field inversion (Montgomery's trick).
 - **Latency, not throughput, is the limit**: every step is a chain of dependent carries. The independent powers of a round run in pairs, so two chains interleave, and `__launch_bounds__` holds the kernel to 168 registers - three warps per scheduler instead of two. On an RTX 3050 Ti that was 30 % more hashes per clock.
-- **Four table windows.** The curve tables live in GPU memory, in windows of 10, 12, 14 or 16 bits: 7, 22, 76 or 256 MiB (`--bc3-window`, default 16). A bigger window means fewer point additions but more memory traffic, so the best one depends on the card's L2 cache. The PTX is built once per window, and the host builds the matching tables at startup (about 3 s for window 16).
-- **Checked bit-exact against the node.** In development: the node's reference vectors and 20,000 random BC3Mix/BC3Hash inputs at each of the four windows, and the PTX arithmetic against the C on inputs that reach every rare carry. On your machine, every card self-tests every window before it mines with it - the node's header vectors, random headers against the CPU reference, and a scan through the launch queue against the CPU's own hit set. A card that fails mines no BC3Hash, and under `--backend auto` the CPU takes over. Every GPU hit, of either proof of work, is re-checked on the CPU before it is submitted.
-
-### SHA3-256t
-
-- SHA3-256t = three sequential rounds of NIST SHA3-256 over the 80-byte block header. The header fits in a single SHA3-256 rate block, so each hash is exactly 3 keccak-f[1600] permutations.
-- One shared kernel source (`src/kernels/sha3t.cl`) is compiled both to CUDA PTX (at build time) and by the OpenCL runtime. The keccak core is the same code for both; the two backends differ only in the intrinsics for the three-input XOR, the 32-bit rotate and the leading-zero count, and in whether the rounds are unrolled, all isolated in macros at the top of the file. Both are verified bit-exact against the same reference.
-- The kernel keeps every 64-bit keccak lane **bit-interleaved**: one 32-bit word of the even bits and one of the odd bits. The host does the interleaving of the header and the target (`backend::kernel_lanes`, `backend::kernel_target`), the kernel interleaves the nonce, and only the most significant limb of the final hash leaves the GPU. See the note at the top of the kernel source for why.
+- **Four table windows.** The curve tables live in GPU memory, in windows of 10, 12, 14 or 16 bits: 7, 22, 76 or 256 MiB. A bigger window means fewer point additions but more memory traffic, so the best one depends on the card's L2 cache. Releases mine with 16, the fastest on every card measured so far; the other three are there for the benchmark to compare (see *Internal tools*). The PTX is built once per window, and the host builds the matching tables at startup (about 3 s for window 16).
+- **Checked bit-exact against the node.** In development: the node's reference vectors and 20,000 random BC3Mix/BC3Hash inputs at each of the four windows, and the PTX arithmetic against the C on inputs that reach every rare carry. On your machine, every card self-tests every window before it mines with it - the node's header vectors, random headers against the CPU reference, and a scan through the launch queue against the CPU's own hit set. A card that fails mines no BC3Hash, and under `--backend auto` the CPU takes over. Every GPU hit is re-checked on the CPU before it is submitted.
 
 ## Performance
 
-### BC3Hash
-
 | Device | Backend | Hashrate | How measured |
 |--------|---------|----------|--------------|
-| NVIDIA RTX 4090 | CUDA | ~1.98 MH/s | bc3-miner 2.0.0 solving a real block template (`--solve`), on the operator's card |
+| NVIDIA RTX 4090 | CUDA | ~1.98 MH/s | bc3-miner 2.0.0 solving a real block template offline, on the operator's card |
 | NVIDIA RTX 4050 Laptop GPU | CUDA | ~180 kH/s | reported by BC3's developer, with an earlier version of the kernel |
-| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, window 16 | ~165 kH/s | bc3-miner 2.0.0 `--benchmark`; the card is power-capped at ~40 W |
+| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, window 16 | ~165 kH/s | bc3-miner 2.0.0's benchmark (*Internal tools*); the card is power-capped at ~40 W |
 | Intel Core i9-12900HK | CPU, 20 threads, fast tables | ~8 kH/s (~1.1 kH/s on one thread) | through the miner's worker loop, Linux, Clang build |
 
 A laptop GPU's BC3Hash rate is set by its power limit as much as by the
@@ -358,63 +278,6 @@ with power headroom gains more. On the laptop CPU the rate per thread falls
 as threads are added: 1.1 kH/s on one thread, 3.9 on four, 6.3 on eight,
 8.2 on all twenty.
 
-### SHA3-256t (until block 64,359)
-
-| Device | Backend | Hashrate | How measured |
-|--------|---------|----------|--------------|
-| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, interleaved kernel (1.3.0) | ~165 MH/s | kernel benchmark, alternated A/B against the 1.2.x kernel: +4.6 % |
-| NVIDIA RTX 4090 | CUDA, 1.2.x kernel | ~1.60 GH/s | in the miner, sustained |
-| NVIDIA RTX 3050 Ti Laptop GPU | CUDA, 1.2.x kernel | ~158 MH/s | kernel benchmark |
-| NVIDIA RTX 3050 Ti Laptop GPU + Intel Iris Xe | OpenCL, both devices | ~140–142 MH/s | in the miner, before the kernel work below |
-
-The kernel is ALU-bound and at the hardware ceiling. SHA3-256t is three full
-keccak-f[1600] permutations per nonce, and a GPU emulates its 64-bit
-arithmetic with 32-bit ops, so throughput is set by how many integer
-instructions the SM can issue - not by memory, occupancy or batch size. On the
-3050 Ti the measured rate is within 0.1 % of 64 ALU instructions per clock per
-SM at the clock sampled under load; the card is power-capped there, so cooling
-and power limits move the hashrate more than anything else on the machine.
-
-One keccak round compiles to ~168 SASS instructions on sm_86: 117 `LOP3` and
-50 `SHF`. Every instruction is accounted for - 20 column parities, 50 theta,
-50 chi, one or two iota and 47 rotates - and that is the floor for a machine
-whose primitives are a three-input logic op and a funnel shift. Three things
-get it there:
-
-- **Bit-interleaved lanes.** Each 64-bit lane is one word of even bits and one
-  of odd bits. A rotate by 2k is then two independent 32-bit rotates, and a
-  rotate by 1 is a single one - the other word is a register rename. Keccak
-  rotates by 1 six times per round (five in theta, one in rho); the word-split
-  kernel this replaced spent two funnel shifts on each. Measured on the 3050
-  Ti with the two kernels alternated in one process: 165.5 vs 158.2 MH/s,
-  12 160 vs 12 592 SASS per hash, the same 64 registers.
-- **Theta as three-input XOR.** Ampere and Ada compute an arbitrary function of
-  three inputs in one `LOP3`. Writing theta's column sums and application that
-  way, instead of chains of two-input XORs, folds `C[x-1]` and `ROTL(C[x+1],1)`
-  into the same instruction.
-- **Full unroll of the 24 rounds** (CUDA only). Removes the per-round overhead
-  and lets ptxas fit the kernel in 64 registers, which is 32 warps per SM.
-  Partial unrolling is *worse* than none.
-
-Batches are auto-tuned toward ~100 ms of work per launch; on a 4090 a launch
-that is too small pays full synchronisation overhead against very little work,
-which shows up directly as lost GPU utilisation.
-
-Measured and rejected, so nobody has to measure them again: moving the
-rotates to the multiplier pipe (`IMAD.HI` and `IMAD.WIDE` are half rate on
-Ampere and Ada, and five variants came out 22-33 % slower), two nonces per
-thread with the chains interleaved, `__launch_bounds__`, block sizes from 128
-to 1024, and pruning the last round by hand (ptxas already does it; 40
-instructions of 12 000). The compiled kernel from `nvcc` 12.0, `nvcc` 12.4 and
-the driver's own JIT are the same to within a handful of instructions.
-
-OpenCL on the same NVIDIA card performs on par with CUDA. Adding the integrated
-Iris Xe on top gained nothing measurable on this laptop: the discrete and
-integrated GPUs share a thermal and power budget, so the driver throttles one to
-feed the other (hashrate swung 92–159 MH/s with the GPU pinned at 75 °C before
-settling back to ~140). On a desktop, where that coupling is weaker, combining
-devices with `--backend opencl` may be worth measuring.
-
 ## Building
 
 ```
@@ -422,9 +285,10 @@ cargo build --release   # CUDA + OpenCL + BC3Hash + CPU (all default)
 ```
 
 No GPU SDK is needed to build: neither runtime is linked, both are resolved at
-run time. To leave one out — `--no-default-features --features cuda,bc3hash` or
-`--no-default-features --features opencl,bc3hash`. Leave `bc3hash` in: without
-it the miner cannot mine after the fork.
+run time. To leave one out — `--no-default-features --features cuda` or
+`--no-default-features --features opencl`; either brings `bc3hash` with it,
+the one kernel both backends have. `--no-default-features --features bc3hash`
+builds a miner for the CPU alone. Without `bc3hash` there is nothing to mine.
 
 BC3Hash needs a C++20 compiler with `unsigned __int128`: GCC or Clang. The
 build prefers `clang` when it finds one (about 10 % more hashrate than GCC 14)
@@ -435,17 +299,32 @@ it. The node's sources are in `bc3hash/vendor` (commit in
 `BC3HASH_VENDOR` and `BC3HASH_VECTORS` point the build and the tests
 somewhere else.
 
+### Internal tools
+
+`--benchmark` (mining without a pool: every GPU, its table windows compared,
+every share checked against the CPU) and `--solve` (mining one fixed block
+template offline) are tools for development, compiled in only with a
+feature that no release enables:
+
+```
+cargo build --release --features internal-tools
+```
+
+With them come `--bc3-window`, `--bc3hash-mode` and the benchmark's own
+options. A release build has none of these, not even hidden. AGENTS.md
+describes them.
+
 ### Tests
 
-CPU tests (consensus vectors, the node's BC3Hash vectors through the miner's own path, and a Rust mirror of the SHA3-256t kernel, verified bit-exactly against the chain-verified reference):
+CPU tests (consensus vectors, the node's BC3Hash vectors through the miner's own path, the CPU and GPU worker pipelines, the pool protocol):
 
 ```
 cargo test
 ```
 
-`cargo test` inside `bc3hash/` runs the node's reference vectors against its C++ build as well.
+`cargo test` inside `bc3hash/` runs the node's reference vectors against its C++ build as well. `cargo test --features internal-tools` adds the tests of the internal tools.
 
-GPU tests (compare the full GPU hit set against the CPU reference on random headers) are `#[ignore]`d by default and require an NVIDIA GPU:
+GPU tests (the BC3Hash kernel's self-test, and its hit sets through the launch queue against the CPU reference) are `#[ignore]`d by default and require an NVIDIA GPU:
 
 ```
 docker build -t bc3-miner-cuda-dev -f docker/Dockerfile.cuda-dev .
@@ -453,9 +332,9 @@ docker run --rm --gpus all -v <repo>:/work -v bc3-cargo-registry:/root/.cargo/re
   -w /work bc3-miner-cuda-dev cargo test --release -- --ignored --nocapture
 ```
 
-The OpenCL test compares the full GPU hit set against the CPU reference the same
-way. It needs an OpenCL runtime but **not** a GPU — [pocl](https://portablecl.org/)
-provides a CPU one, so it runs in plain Docker:
+The OpenCL tests do the same through OpenCL. They need an OpenCL runtime but
+**not** a GPU — [pocl](https://portablecl.org/) provides a CPU one, so they run
+in plain Docker (building the kernel takes pocl minutes):
 
 ```
 docker run --rm -v <repo>:/work -v bc3-cargo-registry:/usr/local/cargo/registry \

@@ -23,48 +23,23 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Autotune limits for the batch size (nonces per kernel launch).
-///
-/// The ceiling has to sit high enough that the autotune actually reaches
-/// TARGET_LAUNCH even on a fast card. With the old ceiling of 1 << 24 a launch
-/// took only ~12 ms on an RTX 4090 - the autotune hit the ceiling and every
-/// launch paid the full sync overhead (two H2D, one D2H, cuCtxSynchronize) for
-/// far too little work. It showed up as ~96 % GPU usage instead of ~99 %.
-///
-/// 1 << 29 leaves room up to ~5 GH/s before the ceiling bites again. The
-/// autotune still settles around TARGET_LAUNCH, so slow cards are unaffected -
-/// and no launch gets long enough to approach the Windows TDR watchdog (2 s).
-const MIN_BATCH: u32 = 1 << 18;
-const MAX_BATCH: u32 = 1 << 29;
-const START_BATCH: u32 = 1 << 20;
-/// Target time per launch - short enough for fast job switching, long enough
-/// to keep launch overhead down.
-const TARGET_LAUNCH: Duration = Duration::from_millis(100);
-
-/// The same for BC3Hash, which is ~1000 times SHA3-256t's work per hash -
-/// about 110 kH/s on an RTX 3050 Ti. Launches start at the floor: 256 nonces
-/// are 2 ms there, and still far from the Windows TDR watchdog (2 s) on an
-/// integrated GPU through OpenCL that may manage a few hundred hashes a
-/// second - a 16k start would have been seconds there. From the floor the
-/// autotune doubles its way up, in whole waves of the card (`launch_granule`;
-/// on CUDA the floor is one wave). Short launches cost more than their launch
-/// overhead: the first waves of every launch run in lockstep and are slower.
-/// Interleaved in one process on an RTX 3050 Ti at window 16, the device time
-/// per hash was 8.42 us at 1 and 2 waves a launch, 8.18 at 4 and 7.95 at 8,
-/// no better at 16 - so 400 ms, which settles at 8 waves there (and on an RTX
-/// 4090), and not shorter for the sake of a faster switch to a new job.
+/// Autotune limits for the batch size (nonces per kernel launch) and the time
+/// a launch aims for. BC3Hash is about 110 kH/s on an RTX 3050 Ti. Launches
+/// start at the floor: 256 nonces are 2 ms there, and still far from the
+/// Windows TDR watchdog (2 s) on an integrated GPU through OpenCL that may
+/// manage a few hundred hashes a second - a 16k start would have been seconds
+/// there. From the floor the autotune doubles its way up, in whole waves of
+/// the card (`launch_granule`; on CUDA the floor is one wave). Short launches
+/// cost more than their launch overhead: the first waves of every launch run
+/// in lockstep and are slower. Interleaved in one process on an RTX 3050 Ti
+/// at window 16, the device time per hash was 8.42 us at 1 and 2 waves a
+/// launch, 8.18 at 4 and 7.95 at 8, no better at 16 - so 400 ms, which
+/// settles at 8 waves there (and on an RTX 4090), and not shorter for the
+/// sake of a faster switch to a new job.
 const BC3_MIN_BATCH: u32 = 1 << 8;
 const BC3_MAX_BATCH: u32 = 1 << 24;
 const BC3_START_BATCH: u32 = 1 << 8;
 const BC3_TARGET_LAUNCH: Duration = Duration::from_millis(400);
-
-/// Launch sizing per PoW: (min, max, start, target time per launch).
-fn tuning(algo: PowAlgo) -> (u32, u32, u32, Duration) {
-    match algo {
-        PowAlgo::Sha256d | PowAlgo::Sha3t => (MIN_BATCH, MAX_BATCH, START_BATCH, TARGET_LAUNCH),
-        PowAlgo::Bc3Hash => (BC3_MIN_BATCH, BC3_MAX_BATCH, BC3_START_BATCH, BC3_TARGET_LAUNCH),
-    }
-}
 
 /// How long to wait before trying to re-open a device that stopped answering.
 /// A driver reset (TDR) or a hung card usually clears in seconds.
@@ -127,7 +102,6 @@ pub fn run_gpu_worker(
     let mut bc3_failed: Option<u32> = None;
 
     let mut w = Worker::new(&shared, slot, worker_index, total_workers);
-    let mut compiled_ahead = false;
     let mut reopens: u32 = 0;
     let mut gate = AlgoGate::default();
     // Generation of a job this worker sat out; wait for the next one instead
@@ -140,12 +114,6 @@ pub fn run_gpu_worker(
         };
         if job.algo == PowAlgo::Bc3Hash && backend.has_kernel(PowAlgo::Bc3Hash) {
             prepare_bc3(&shared, &mut *backend, slot, &mut caps, &mut bc3_failed);
-        } else if !compiled_ahead && shared.plan.compile_ahead && backend.has_kernel(PowAlgo::Bc3Hash) {
-            // Before the fork the card mines SHA3-256t. Its BC3Hash kernel
-            // is compiled meanwhile, so that the switch at the fork loads it
-            // from the driver's cache instead of waiting 10-60 s for the JIT.
-            compiled_ahead = true;
-            backend.compile_bc3hash_ahead(shared.bc3_window());
         }
         // Decided per job, so the launch loop below carries no dispatch. A
         // kernel without a CPU reference to re-check its hits against does
@@ -155,8 +123,9 @@ pub fn run_gpu_worker(
             .check(job.algo, Some(backend.name().as_str()), supported)
             .and_then(|a| Some((a, a.hash_fn()?)))
         else {
-            // BC3Hash on a card whose kernel is not usable: in --backend
-            // auto the CPU threads take it over, and this worker sleeps
+            // A job without BC3Hash's version bit, which nothing mines, or
+            // BC3Hash on a card whose kernel is not usable, which in
+            // --backend auto the CPU threads take over: this worker sleeps
             // until a job it can do.
             sat_out = Some(generation);
             continue;
@@ -296,10 +265,10 @@ struct Worker<'a> {
     /// space continues there. See MinerJob::same_search_space.
     prev: Option<MinerJob>,
     cursor: Cursor,
-    /// Autotuned nonces per launch, per PoW.
-    batch: [u32; 3],
-    /// Hit-buffer guard per PoW - their hit rates differ by a factor of 1000.
-    budget: [HitBudget; 3],
+    /// Autotuned nonces per launch.
+    batch: u32,
+    /// Keeps the launches inside the kernel's hit buffer.
+    budget: HitBudget,
     errors: u32,
     /// Launches that came back since the caller last looked.
     collected: u64,
@@ -350,7 +319,6 @@ struct JobRun<'j> {
     granule: u32,
     min_batch: u32,
     max_batch: u32,
-    target_launch: Duration,
     inflight: VecDeque<InFlight>,
     /// Set once no more launches may be queued for the job.
     ending: Option<JobEnd>,
@@ -366,8 +334,8 @@ impl<'a> Worker<'a> {
             stride: total_workers.max(1) as u64,
             prev: None,
             cursor: Cursor { en2: worker_index as u64, nonce: 0 },
-            batch: PowAlgo::ALL.map(|a| tuning(a).2),
-            budget: Default::default(),
+            batch: BC3_START_BATCH,
+            budget: HitBudget::default(),
             errors: 0,
             collected: 0,
             last_collect: None,
@@ -389,14 +357,12 @@ impl<'a> Worker<'a> {
         if self.prev.as_ref().is_none_or(|p| !p.same_search_space(job)) {
             self.cursor = Cursor { en2: self.worker_index as u64, nonce: 0 };
         }
-        let (min_batch, max_batch, _, target_launch) = tuning(algo);
         // Whole waves of the card only (see `launch_granule`); the autotune
         // below keeps doubling and halving within them.
         let granule = backend.launch_granule(algo).max(1);
-        let min_batch = (min_batch.max(granule) / granule) * granule;
-        let max_batch = max_batch.max(min_batch);
-        let b = &mut self.batch[algo.index()];
-        *b = ((*b).clamp(min_batch, max_batch) / granule).max(1) * granule;
+        let min_batch = (BC3_MIN_BATCH.max(granule) / granule) * granule;
+        let max_batch = BC3_MAX_BATCH.max(min_batch);
+        self.batch = (self.batch.clamp(min_batch, max_batch) / granule).max(1) * granule;
         let mut run = JobRun {
             job,
             generation,
@@ -407,7 +373,6 @@ impl<'a> Worker<'a> {
             granule,
             min_batch,
             max_batch,
-            target_launch,
             inflight: VecDeque::new(),
             ending: None,
             header: None,
@@ -463,7 +428,7 @@ impl<'a> Worker<'a> {
                 run.ending = Some(JobEnd::Exhausted);
                 break;
             }
-            let max = self.budget[run.algo.index()].chunk(self.batch[run.algo.index()]).max(1);
+            let max = self.budget.chunk(self.batch).max(1);
             let restart = self.cursor;
             let (en2, start, count) = self.cursor.take(max, self.stride);
             if run.header.as_ref().is_none_or(|h| h.en2 != en2) {
@@ -542,7 +507,7 @@ impl<'a> Worker<'a> {
         self.last_collect = Some(now);
         self.collected += 1;
 
-        if let Some(warning) = self.budget[run.algo.index()].overflowed(done.count, scan.reported) {
+        if let Some(warning) = self.budget.overflowed(done.count, scan.reported) {
             eprintln!("{warning}");
         }
         // Verify every hit on the CPU before submit - guards against kernel
@@ -593,12 +558,12 @@ impl<'a> Worker<'a> {
             hashes.fetch_add(u64::from(done.count), Ordering::Release);
         }
 
-        // Autotune toward the PoW's target time per launch, in whole waves.
-        // Judged by what a full-size launch would take, so the short launch at
-        // the end of an extranonce2 does not look like a fast card.
-        let batch = &mut self.batch[run.algo.index()];
-        let projected = elapsed.mul_f64(f64::from(*batch) / f64::from(done.count.max(1)));
-        *batch = autotune(*batch, projected, run.target_launch, run.granule, run.min_batch, run.max_batch);
+        // Autotune toward the target time per launch, in whole waves. Judged
+        // by what a full-size launch would take, so the short launch at the
+        // end of an extranonce2 does not look like a fast card.
+        let projected = elapsed.mul_f64(f64::from(self.batch) / f64::from(done.count.max(1)));
+        self.batch =
+            autotune(self.batch, projected, BC3_TARGET_LAUNCH, run.granule, run.min_batch, run.max_batch);
         elapsed
     }
 }
@@ -797,9 +762,10 @@ mod tests {
     }
 
     /// A scripted backend: every launch "finds" the nonces at `hits_at`
-    /// (offsets into the launch) and took 50 ms of device time. It records
-    /// what was queued, can fail one collect, and moves the job on (bumps
-    /// the generation, as a new job from the pool would) after `bump_after`
+    /// (offsets into the launch) and took `BC3_TARGET_LAUNCH` of device time,
+    /// so the autotune leaves the launch size alone. It records what was
+    /// queued, can fail one collect, and moves the job on (bumps the
+    /// generation, as a new job from the pool would) after `bump_after`
     /// collects.
     struct Scripted<'a> {
         queue: VecDeque<(u32, u32)>,
@@ -828,7 +794,7 @@ mod tests {
             "scripted".into()
         }
         fn supports(&self, algo: PowAlgo) -> bool {
-            algo == PowAlgo::Sha3t
+            algo == PowAlgo::Bc3Hash
         }
         fn enqueue(&mut self, l: &Launch) -> Result<(), String> {
             assert!(self.queue.len() < QUEUE_DEPTH, "more than QUEUE_DEPTH in flight");
@@ -846,7 +812,7 @@ mod tests {
                 return Err("scripted failure".into());
             }
             let hits: Vec<u32> = self.hits_at.iter().filter(|&&o| o < count).map(|o| start + o).collect();
-            Ok(Scan { reported: hits.len(), hits, busy: Some(Duration::from_millis(50)) })
+            Ok(Scan { reported: hits.len(), hits, busy: Some(BC3_TARGET_LAUNCH) })
         }
         fn in_flight(&self) -> usize {
             self.queue.len()
@@ -864,14 +830,22 @@ mod tests {
             coinb1: vec![9; 50],
             coinb2: vec![8; 20],
             merkle_steps: vec![],
-            version: 0x2000_1000,
+            version: 0x2000_1800,
             prev_hash: [6u8; 32],
             bits: 0x1d00_ffff,
             ntime: 1_700_000_000,
             share_target: target,
             height: None,
-            algo: PowAlgo::Sha3t,
+            algo: PowAlgo::Bc3Hash,
         }
+    }
+
+    /// The CPU re-check these tests run hits through. Not BC3Hash's own: the
+    /// pipeline does the same with any PoW, the tests only ask whether a hash
+    /// meets an all-ones target (every hash does) or an all-zero one (none
+    /// does), and SHA256d needs no tables and no `bc3hash` feature.
+    fn check_fn() -> PowFn {
+        |h: &[u8; 80]| sha256d(h)
     }
 
     fn shared_with_job(j: &MinerJob) -> (Shared, std::sync::mpsc::Receiver<FoundShare>, u64) {
@@ -893,8 +867,8 @@ mod tests {
         let (shared, rx, generation) = shared_with_job(&j);
         let mut backend = Scripted::new(&shared, vec![0, 3], None, 5);
         let mut w = Worker::new(&shared, 0, 0, 1);
-        let verify = PowAlgo::Sha3t.hash_fn().unwrap();
-        assert_eq!(w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, verify), JobEnd::Changed);
+        let verify = check_fn();
+        assert_eq!(w.mine_job(&mut backend, &j, generation, PowAlgo::Bc3Hash, verify), JobEnd::Changed);
         assert_eq!(backend.queue.len(), 0, "everything in flight was collected");
         // Five collects, then the job changed: the sixth launch was already
         // queued behind the fifth and is the last.
@@ -911,7 +885,10 @@ mod tests {
         assert_eq!(unique.len(), shares.len(), "a nonce submitted twice");
         assert!(shares.iter().all(|s| s.job_id == "j" && s.extranonce2 == vec![0, 0, 0, 0]));
         assert_eq!(shared.stats.gpu_hashes.load(Ordering::Relaxed), u64::from(next));
-        assert_eq!(shared.gpu_slot_busy_us[0].load(Ordering::Relaxed), 6 * 50_000);
+        assert_eq!(
+            shared.gpu_slot_busy_us[0].load(Ordering::Relaxed),
+            6 * BC3_TARGET_LAUNCH.as_micros() as u64
+        );
         assert_eq!(std::mem::take(&mut w.collected), 6);
 
         // The same space again (a retarget): the next launch starts right
@@ -921,7 +898,7 @@ mod tests {
         shared.publish_job(retarget.clone());
         let (generation, _) = shared.wait_for_job();
         let mut backend = Scripted::new(&shared, vec![], None, 1);
-        w.mine_job(&mut backend, &retarget, generation, PowAlgo::Sha3t, verify);
+        w.mine_job(&mut backend, &retarget, generation, PowAlgo::Bc3Hash, verify);
         assert_eq!(backend.log[0].0, next);
     }
 
@@ -933,7 +910,7 @@ mod tests {
         let (shared, rx, generation) = shared_with_job(&j);
         let mut backend = Scripted::new(&shared, vec![0, 1, 2], None, 3);
         let mut w = Worker::new(&shared, 0, 0, 1);
-        w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        w.mine_job(&mut backend, &j, generation, PowAlgo::Bc3Hash, check_fn());
         assert_eq!(rx.try_iter().count(), 0, "a false hit was submitted");
     }
 
@@ -944,7 +921,7 @@ mod tests {
         let (shared, rx, generation) = shared_with_job(&j);
         let mut backend = Scripted::new(&shared, vec![5, 5, 9], None, 1);
         let mut w = Worker::new(&shared, 0, 0, 1);
-        w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        w.mine_job(&mut backend, &j, generation, PowAlgo::Bc3Hash, check_fn());
         let nonces: Vec<u32> = rx.try_iter().map(|s| s.nonce).collect();
         // Two launches (one queued behind the first): 5 and 9 from each.
         let (a, b) = (backend.log[0].0, backend.log[1].0);
@@ -960,8 +937,8 @@ mod tests {
         let (shared, rx, generation) = shared_with_job(&j);
         let mut backend = Scripted::new(&shared, vec![1], Some(3), 6);
         let mut w = Worker::new(&shared, 0, 0, 1);
-        let verify = PowAlgo::Sha3t.hash_fn().unwrap();
-        assert_eq!(w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, verify), JobEnd::Changed);
+        let verify = check_fn();
+        assert_eq!(w.mine_job(&mut backend, &j, generation, PowAlgo::Bc3Hash, verify), JobEnd::Changed);
         // Launches 1 and 2 came back; 3 failed with 4 queued behind it, and
         // both were queued again from 3's start.
         let starts: Vec<u32> = backend.log.iter().map(|l| l.0).collect();
@@ -999,7 +976,7 @@ mod tests {
         let (shared, _rx, generation) = shared_with_job(&j);
         let mut w = Worker::new(&shared, 0, 0, 1);
         let t0 = Instant::now();
-        let end = w.mine_job(&mut Broken, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        let end = w.mine_job(&mut Broken, &j, generation, PowAlgo::Bc3Hash, check_fn());
         assert_eq!(end, JobEnd::DeviceGone);
         assert!(t0.elapsed() >= Duration::from_secs(4), "it must retry, with a pause, before giving up");
         assert_eq!(w.cursor, Cursor { en2: 0, nonce: 0 }, "nothing was done, nothing skipped");
@@ -1018,7 +995,7 @@ mod tests {
         let mut w = Worker::new(&shared, 0, 0, 1);
         w.prev = Some(j.clone());
         w.cursor = Cursor { en2: 255, nonce: u32::MAX - 10 };
-        let end = w.mine_job(&mut backend, &j, generation, PowAlgo::Sha3t, PowAlgo::Sha3t.hash_fn().unwrap());
+        let end = w.mine_job(&mut backend, &j, generation, PowAlgo::Bc3Hash, check_fn());
         assert_eq!(end, JobEnd::Exhausted);
         assert_eq!(backend.log, vec![(u32::MAX - 10, 11)]);
     }
@@ -1039,17 +1016,17 @@ mod tests {
         let mut c = Closed;
         let t = [0u8; 32];
         let h = [0u8; 76];
-        assert!(c.enqueue(&Launch { algo: PowAlgo::Sha3t, header76: &h, start: 0, count: 1, target: &t }).is_err());
+        assert!(c.enqueue(&Launch { algo: PowAlgo::Bc3Hash, header76: &h, start: 0, count: 1, target: &t }).is_err());
         assert!(c.collect().is_err());
-        assert!(!c.supports(PowAlgo::Sha3t));
+        assert!(!c.supports(PowAlgo::Bc3Hash));
     }
 
     /// A card whose BC3Hash kernel will not load or fails its self-test, the
-    /// way `run_gpu_worker` meets it at the fork: the card claimed BC3Hash
-    /// when it opened (so the stand-ins keep out of its table build and
-    /// self-test), and a failure has to give that claim up - or the stand-in
-    /// CPU threads of --backend auto never take over, nothing mines the
-    /// fork's PoW at all, and the status line says the CPU does.
+    /// way `run_gpu_worker` meets it at its first job: the card claimed
+    /// BC3Hash when it opened (so the stand-ins keep out of its table build
+    /// and self-test), and a failure has to give that claim up - or the
+    /// stand-in CPU threads of --backend auto never take over, nothing mines
+    /// at all, and the status line says the CPU does.
     #[cfg(feature = "bc3hash")]
     #[test]
     fn a_failed_bc3hash_kernel_hands_the_pow_to_the_cpu() {
@@ -1061,8 +1038,8 @@ mod tests {
             fn has_kernel(&self, _: PowAlgo) -> bool {
                 true
             }
-            fn supports(&self, algo: PowAlgo) -> bool {
-                algo == PowAlgo::Sha3t
+            fn supports(&self, _: PowAlgo) -> bool {
+                false
             }
             fn prepare_bc3hash(&mut self, _: u32) -> Result<Duration, String> {
                 Err("self-test failed: scripted".into())
@@ -1083,23 +1060,21 @@ mod tests {
             gpus: 1,
             cpu_threads: 0,
             cpu_fallback_threads: 1,
-            gpu_kernel: [false, true, true],
-            compile_ahead: true,
+            gpu_kernel: [false, false, true],
         };
         let shared = Arc::new(Shared::new(tx, plan));
         // What run_gpu_worker claims when the card opens.
         let mut caps = GpuCapability::new(&shared);
-        caps.set(PowAlgo::Sha3t, true);
         caps.set(PowAlgo::Bc3Hash, true);
         shared.gpu_opened();
         let s = shared.clone();
         std::thread::spawn(move || {
             crate::worker::run_worker(s, 1, 2, crate::worker::CpuRole::GpuFallback)
         });
-        // The fork's first job, with a target every hash meets.
+        // A BC3Hash job with bit 11 alone, as at the fork, and a target every
+        // hash meets.
         let mut fork = job([0xff; 32]);
         fork.version = 0x2000_0800;
-        fork.algo = PowAlgo::Bc3Hash;
         shared.publish_job(fork);
         std::thread::sleep(Duration::from_millis(300));
         assert!(rx.try_recv().is_err(), "the stand-in mined what the card had claimed");

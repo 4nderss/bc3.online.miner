@@ -2,12 +2,14 @@
 //! fallback).
 //!
 //! A backend grinds a nonce range for a fixed 76-byte header prefix and
-//! returns the nonces whose PoW hash is <= the share target: SHA3-256t with
-//! `sha3t.cl` (see `kernel_supports`), BC3Hash with `bc3hash.cl` (see bc3.rs).
+//! returns the nonces whose BC3Hash is <= the share target, with
+//! `bc3hash.cl` (see bc3.rs) - the one GPU kernel, see `kernel_supports`.
 //! Every hit is re-checked on the CPU in gpu_worker before submit - a kernel
 //! bug can never produce a bad share, only a missed one.
 
-#[cfg(all(feature = "bc3hash", any(feature = "cuda", feature = "opencl")))]
+// The `cuda` and `opencl` features bring `bc3hash` with them: BC3Hash is the
+// only kernel either backend has.
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod bc3;
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -18,24 +20,18 @@ pub mod opencl;
 
 use crate::consensus::{PowAlgo, Target};
 
-/// Shared kernel source (CUDA via NVRTC + OpenCL). See that file for the
-/// lane layout.
-#[allow(dead_code)]
-pub const KERNEL_SOURCE: &str = include_str!("../kernels/sha3t.cl");
-
 /// Max number of hits per launch that the kernel reports (more than this in
 /// a single batch never happens in practice at sane share difficulties).
 pub const MAX_HITS: usize = 64;
 
 /// Keeps a GPU's launches inside what the kernel's hit buffer can hold - for
-/// every backend and PoW, in the GPU worker.
+/// every backend, in the GPU worker.
 ///
 /// The kernel writes at most `MAX_HITS` nonces plus a count. Anything past
 /// that is already gone by the time the buffer is read, and it used to be
 /// dropped with no log and no change of behaviour - so a pool that set the
 /// share difficulty low enough made the miner lose shares on every launch,
-/// with nothing anywhere to say so. Only OpenCL's SHA3-256t path had this
-/// guard; CUDA and both BC3Hash paths dropped the excess silently.
+/// with nothing anywhere to say so.
 ///
 /// "Never happens in practice" is not a bound: the pool picks the difficulty,
 /// and the batch size grows with the card.
@@ -321,22 +317,20 @@ impl HitBudget {
     }
 }
 
-/// Which PoW algorithms the shared `sha3t.cl` implements - the one kernel
-/// both backends compile, so they answer the same.
+/// Which PoW algorithms the GPU backends have a kernel for: BC3Hash, with
+/// `bc3hash.cl`, which both load on demand - see their `prepare_bc3hash` and
+/// bc3.rs. Whether a card's kernel actually loaded and passed its self-test
+/// is its backend's `supports`.
 ///
 /// The match is exhaustive on purpose: a new `PowAlgo` variant does not
 /// compile until someone decides here whether a kernel exists for it. Without
 /// one the GPU worker idles on those jobs and, in `--backend auto`, the CPU
-/// threads mine them - see `worker::CpuRole::GpuFallback`.
+/// threads mine them if they can - see `worker::CpuRole::GpuFallback`.
 pub fn kernel_supports(algo: PowAlgo) -> bool {
     match algo {
-        PowAlgo::Sha3t => true,
-        // The kernel always runs SHA3-256t; every hit would fail the CPU
-        // re-check.
-        PowAlgo::Sha256d => false,
-        // Not this kernel's: BC3Hash has its own, bc3hash.cl, which both
-        // backends load on demand - see their `has_kernel` and bc3.rs.
-        PowAlgo::Bc3Hash => false,
+        PowAlgo::Bc3Hash => cfg!(feature = "bc3hash"),
+        // The PoWs before the second fork: not mined at all any more.
+        PowAlgo::Sha256d | PowAlgo::Sha3t => false,
     }
 }
 
@@ -402,11 +396,6 @@ pub trait MiningBackend {
     fn bc3hash_window(&self) -> Option<u32> {
         None
     }
-
-    /// Start compiling the BC3Hash kernel for `window` ahead of its first
-    /// use, on a thread of its own, where the platform can do that without
-    /// holding up this card's mining. Returns at once.
-    fn compile_bc3hash_ahead(&self, _window: u32) {}
 
     /// Launches of `algo` should be a whole number of this many nonces - the
     /// card's wave - so that the last wave does not run on a mostly idle card.
@@ -487,13 +476,10 @@ impl GpuDevice {
 }
 
 /// Will a device have a kernel for `algo` once it is opened? The same answer
-/// its backend's `has_kernel` gives - both backends have both kernels -
+/// its backend's `has_kernel` gives - both backends have the same kernel -
 /// known before opening it.
 pub fn device_has_kernel(_dev: &GpuDevice, algo: PowAlgo) -> bool {
-    match algo {
-        PowAlgo::Bc3Hash => cfg!(feature = "bc3hash"),
-        PowAlgo::Sha256d | PowAlgo::Sha3t => kernel_supports(algo),
-    }
+    kernel_supports(algo)
 }
 
 /// Which backends the user asked for.
@@ -636,15 +622,16 @@ pub fn open_backend(dev: &GpuDevice) -> Result<Box<dyn MiningBackend>, String> {
 /// Open a backend for `dev`, and if a CUDA device refuses to open, try the
 /// same card again through OpenCL.
 ///
-/// The failure this exists for is the driver refusing our PTX. The kernel is
+/// The failure this exists for is a driver too old for our PTX. The kernel is
 /// precompiled to a fixed PTX ISA version, and a driver can only JIT versions
 /// it knows - build the PTX with a newer toolkit than the user's driver and
-/// `cuModuleLoadData` fails with CUDA_ERROR_UNSUPPORTED_PTX_VERSION. Detection
-/// has already succeeded at that point (libcuda is there, the card is there),
-/// so `detect_gpus` never looked at OpenCL, and without this fallback the
-/// miner sat connected to the pool with no worker at all: no hashrate, no
-/// error the user could act on, and `--require-gpu` blind to it because a GPU
-/// *was* found.
+/// `cuModuleLoadData` fails with CUDA_ERROR_UNSUPPORTED_PTX_VERSION; the CUDA
+/// backend refuses such a driver when it opens (see `cuda::check_driver`).
+/// Detection has already succeeded at that point (libcuda is there, the card
+/// is there), so `detect_gpus` never looked at OpenCL, and without this
+/// fallback the miner sat connected to the pool with no worker at all: no
+/// hashrate, no error the user could act on, and `--require-gpu` blind to it
+/// because a GPU *was* found.
 ///
 /// NVIDIA's own OpenCL runtime ships with the same driver, so the card is
 /// almost always reachable that way instead.
@@ -771,541 +758,9 @@ fn pick_opencl_for_cuda(
     None
 }
 
-/// Pack the 80-byte header (nonce = 0) as ten LE u64 lanes for the kernel.
-#[allow(dead_code)]
-pub fn header_lanes(header76: &[u8; 76]) -> [u64; 10] {
-    let mut buf = [0u8; 80];
-    buf[..76].copy_from_slice(header76);
-    let mut lanes = [0u64; 10];
-    for (i, lane) in lanes.iter_mut().enumerate() {
-        *lane = u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
-    }
-    lanes
-}
-
-/// Target ([u8;32] big-endian) -> four u64 limbs [t0..t3], t3 most significant.
-/// Hash limb k = LE u64 of bytes 8k..8k+7, cf. consensus::hash_meets_target.
-#[allow(dead_code)]
-pub fn target_limbs(target: &Target) -> [u64; 4] {
-    let mut t = [0u64; 4];
-    for (k, limb) in t.iter_mut().enumerate() {
-        let off = (3 - k) * 8;
-        *limb = u64::from_be_bytes(target[off..off + 8].try_into().unwrap());
-    }
-    t
-}
-
-/// The even bits of a 32-bit word gathered into its low 16 bits. The same
-/// function as `compress_even` in the kernel, which uses it on the nonce.
-fn compress_even(mut x: u32) -> u32 {
-    x &= 0x5555_5555;
-    x = (x | (x >> 1)) & 0x3333_3333;
-    x = (x | (x >> 2)) & 0x0f0f_0f0f;
-    x = (x | (x >> 4)) & 0x00ff_00ff;
-    x = (x | (x >> 8)) & 0x0000_ffff;
-    x
-}
-
-/// A 64-bit lane in the kernel's representation: the even bits of `l`
-/// packed into the low word, the odd bits into the high word. See the LANE
-/// REPRESENTATION note at the top of src/kernels/sha3t.cl - a rotate by 1 of
-/// such a lane is a single 32-bit rotate, which is what the kernel is built
-/// around.
-#[allow(dead_code)]
-pub fn interleave_u64(l: u64) -> u64 {
-    let lo = l as u32;
-    let hi = (l >> 32) as u32;
-    let e = compress_even(lo) | (compress_even(hi) << 16);
-    let o = compress_even(lo >> 1) | (compress_even(hi >> 1) << 16);
-    ((o as u64) << 32) | e as u64
-}
-
-/// The header as the kernel takes it: ten interleaved lanes, nonce zero.
-#[allow(dead_code)]
-pub fn kernel_lanes(header76: &[u8; 76]) -> [u64; 10] {
-    header_lanes(header76).map(interleave_u64)
-}
-
-/// The target as the kernel takes it: its most significant limb, interleaved.
-/// The kernel decides on that limb alone (see the note in sha3t.cl on why
-/// that is exact up to a 2^-64 tie the CPU re-verification settles).
-#[allow(dead_code)]
-pub fn kernel_target(target: &Target) -> u64 {
-    interleave_u64(target_limbs(target)[3])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::consensus::{
-        compact_to_target, hash_meets_target, sha3t, target_for_difficulty, BlockHeader, SHA3_VBIT,
-    };
-
-    // ------------------------------------------------------------------
-    // Two Rust mirrors of the kernel algorithm, verified against the CPU
-    // reference without a GPU - bit-exactness on a real GPU is then pinned
-    // down by the #[ignore]d tests in the cuda and opencl backends.
-    //
-    // The first is plain u64 keccak with the kernel's lane layout and
-    // padding. The second is the kernel as written: interleaved lanes, its
-    // rotates, the partial last round and the comparison. If the kernel
-    // changes, the second one changes with it.
-    // ------------------------------------------------------------------
-
-    const RC: [u64; 24] = [
-        0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
-        0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
-        0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
-        0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
-        0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
-        0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
-    ];
-    const ROTC: [u32; 24] = [
-        1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
-    ];
-    const PILN: [usize; 24] = [
-        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
-    ];
-
-    fn keccakf(st: &mut [u64; 25]) {
-        for round in 0..24 {
-            let mut bc = [0u64; 5];
-            for i in 0..5 {
-                bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
-            }
-            for i in 0..5 {
-                let t = bc[(i + 4) % 5] ^ bc[(i + 1) % 5].rotate_left(1);
-                for j in (0..25).step_by(5) {
-                    st[j + i] ^= t;
-                }
-            }
-            let mut t = st[1];
-            for i in 0..24 {
-                let j = PILN[i];
-                let tmp = st[j];
-                st[j] = t.rotate_left(ROTC[i]);
-                t = tmp;
-            }
-            for j in (0..25).step_by(5) {
-                let mut bc = [0u64; 5];
-                bc.copy_from_slice(&st[j..j + 5]);
-                for i in 0..5 {
-                    st[j + i] ^= (!bc[(i + 1) % 5]) & bc[(i + 2) % 5];
-                }
-            }
-            st[0] ^= RC[round];
-        }
-    }
-
-    fn sha3_256_32(input: [u64; 4]) -> [u64; 4] {
-        let mut st = [0u64; 25];
-        st[..4].copy_from_slice(&input);
-        st[4] = 0x06;
-        st[16] = 0x8000_0000_0000_0000;
-        keccakf(&mut st);
-        [st[0], st[1], st[2], st[3]]
-    }
-
-    /// Exactly what the kernel does per nonce, in Rust.
-    fn kernel_mirror_hash(header76: &[u8; 76], nonce: u32) -> [u64; 4] {
-        let lanes = header_lanes(header76);
-        let mut st = [0u64; 25];
-        st[..10].copy_from_slice(&lanes);
-        st[9] |= (nonce as u64) << 32;
-        st[10] = 0x06;
-        st[16] = 0x8000_0000_0000_0000;
-        keccakf(&mut st);
-        let h = [st[0], st[1], st[2], st[3]];
-        sha3_256_32(sha3_256_32(h))
-    }
-
-    fn limbs_of_hash(hash: &[u8; 32]) -> [u64; 4] {
-        let mut l = [0u64; 4];
-        for (k, limb) in l.iter_mut().enumerate() {
-            *limb = u64::from_le_bytes(hash[k * 8..k * 8 + 8].try_into().unwrap());
-        }
-        l
-    }
-
-    fn genesis_header() -> BlockHeader {
-        let mut merkle: [u8; 32] =
-            hex::decode("8e1df52fddd25c460304ff8ea7bcb570850bf0b0c027eecf8ebf8ab17d3e93b1")
-                .unwrap()
-                .try_into()
-                .unwrap();
-        merkle.reverse();
-        BlockHeader {
-            version: 1,
-            prev_hash: [0u8; 32],
-            merkle_root: merkle,
-            time: 1_777_245_555,
-            bits: 0x1d00ffff,
-            nonce: 2_442_659_435,
-        }
-    }
-
-    /// Simple deterministic PRNG for test headers (no rand dependency).
-    fn xorshift(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
-    }
-
-    #[test]
-    fn kernel_mirror_matches_cpu_reference_genesis() {
-        let g = genesis_header();
-        let ser = g.serialize();
-        let header76: [u8; 76] = ser[..76].try_into().unwrap();
-        let expected = limbs_of_hash(&sha3t(&ser));
-        assert_eq!(kernel_mirror_hash(&header76, g.nonce), expected);
-    }
-
-    #[test]
-    fn kernel_mirror_matches_cpu_reference_random() {
-        let mut seed = 0xbc3_0001u64;
-        for _ in 0..50 {
-            let mut header80 = [0u8; 80];
-            for b in header80.iter_mut() {
-                *b = xorshift(&mut seed) as u8;
-            }
-            let header76: [u8; 76] = header80[..76].try_into().unwrap();
-            let nonce = u32::from_le_bytes(header80[76..80].try_into().unwrap());
-            let expected = limbs_of_hash(&sha3t(&header80));
-            assert_eq!(kernel_mirror_hash(&header76, nonce), expected, "header {header80:02x?}");
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // The interleaved mirror: src/kernels/sha3t.cl statement by statement.
-    // ------------------------------------------------------------------
-
-    /// Inverse of `compress_even`: 16 bits spread to the even positions.
-    fn spread_even(mut x: u32) -> u32 {
-        x &= 0x0000_ffff;
-        x = (x | (x << 8)) & 0x00ff_00ff;
-        x = (x | (x << 4)) & 0x0f0f_0f0f;
-        x = (x | (x << 2)) & 0x3333_3333;
-        x = (x | (x << 1)) & 0x5555_5555;
-        x
-    }
-
-    /// Inverse of `interleave_u64`.
-    fn deinterleave_u64(v: u64) -> u64 {
-        let e = v as u32;
-        let o = (v >> 32) as u32;
-        let lo = spread_even(e) | (spread_even(o) << 1);
-        let hi = spread_even(e >> 16) | (spread_even(o >> 16) << 1);
-        ((hi as u64) << 32) | lo as u64
-    }
-
-    /// rotl64 of an interleaved lane, exactly the kernel's RE/RO macros.
-    fn il_rotl(e: u32, o: u32, n: u32) -> (u32, u32) {
-        let k = n / 2;
-        if n % 2 == 0 {
-            (e.rotate_left(k), o.rotate_left(k))
-        } else {
-            (o.rotate_left(k + 1), e.rotate_left(k))
-        }
-    }
-
-    fn il_parities(e: &[u32; 25], o: &[u32; 25]) -> ([u32; 5], [u32; 5]) {
-        let mut ce = [0u32; 5];
-        let mut co = [0u32; 5];
-        for x in 0..5 {
-            ce[x] = e[x] ^ e[x + 5] ^ e[x + 10] ^ e[x + 15] ^ e[x + 20];
-            co[x] = o[x] ^ o[x + 5] ^ o[x + 10] ^ o[x + 15] ^ o[x + 20];
-        }
-        (ce, co)
-    }
-
-    /// One round as the kernel's `keccak_round`: theta with the rotate by 1
-    /// on the odd word only, rho through `il_rotl`, chi, iota.
-    fn il_round(e: &mut [u32; 25], o: &mut [u32; 25], round: usize) {
-        let (ce, co) = il_parities(e, o);
-        for x in 0..5 {
-            let de = ce[(x + 4) % 5] ^ co[(x + 1) % 5].rotate_left(1);
-            let d_o = co[(x + 4) % 5] ^ ce[(x + 1) % 5];
-            for y in (0..25).step_by(5) {
-                e[y + x] ^= de;
-                o[y + x] ^= d_o;
-            }
-        }
-        let (mut te, mut to) = (e[1], o[1]);
-        for i in 0..24 {
-            let j = PILN[i];
-            let (ne, no) = il_rotl(te, to, ROTC[i]);
-            let (tme, tmo) = (e[j], o[j]);
-            e[j] = ne;
-            o[j] = no;
-            te = tme;
-            to = tmo;
-        }
-        for row in (0..25).step_by(5) {
-            let re: [u32; 5] = e[row..row + 5].try_into().unwrap();
-            let ro: [u32; 5] = o[row..row + 5].try_into().unwrap();
-            for x in 0..5 {
-                e[row + x] = re[x] ^ (!re[(x + 1) % 5] & re[(x + 2) % 5]);
-                o[row + x] = ro[x] ^ (!ro[(x + 1) % 5] & ro[(x + 2) % 5]);
-            }
-        }
-        let rc = interleave_u64(RC[round]);
-        e[0] ^= rc as u32;
-        o[0] ^= (rc >> 32) as u32;
-    }
-
-    // The padding bytes as the kernel writes them (PAD_START_E/O, PAD_END_O).
-    const IL_PAD_START_E: u32 = 0x2;
-    const IL_PAD_START_O: u32 = 0x1;
-    const IL_PAD_END_O: u32 = 0x8000_0000;
-
-    /// SHA3-256 of lanes 0..3, in place, all four output lanes.
-    fn il_sha3_256_32(e: &mut [u32; 25], o: &mut [u32; 25]) {
-        let mut e2 = [0u32; 25];
-        let mut o2 = [0u32; 25];
-        e2[..4].copy_from_slice(&e[..4]);
-        o2[..4].copy_from_slice(&o[..4]);
-        e2[4] = IL_PAD_START_E;
-        o2[4] = IL_PAD_START_O;
-        o2[16] = IL_PAD_END_O;
-        for round in 0..24 {
-            il_round(&mut e2, &mut o2, round);
-        }
-        *e = e2;
-        *o = o2;
-    }
-
-    /// The kernel's `sha3_256_32_lane3`: 23 rounds, then only what lane
-    /// (3,0) of round 24 depends on.
-    fn il_sha3_256_32_lane3(e: &[u32; 25], o: &[u32; 25]) -> (u32, u32) {
-        let mut e2 = [0u32; 25];
-        let mut o2 = [0u32; 25];
-        e2[..4].copy_from_slice(&e[..4]);
-        o2[..4].copy_from_slice(&o[..4]);
-        e2[4] = IL_PAD_START_E;
-        o2[4] = IL_PAD_START_O;
-        o2[16] = IL_PAD_END_O;
-        for round in 0..23 {
-            il_round(&mut e2, &mut o2, round);
-        }
-        let (ce, co) = il_parities(&e2, &o2);
-        let s0e = e2[0] ^ ce[4] ^ co[1].rotate_left(1);
-        let s0o = o2[0] ^ co[4] ^ ce[1];
-        let s18e = e2[18] ^ ce[2] ^ co[4].rotate_left(1);
-        let s18o = o2[18] ^ co[2] ^ ce[4];
-        let s24e = e2[24] ^ ce[3] ^ co[0].rotate_left(1);
-        let s24o = o2[24] ^ co[3] ^ ce[0];
-        let (b3e, b3o) = il_rotl(s18e, s18o, 21);
-        let (b4e, b4o) = il_rotl(s24e, s24o, 14);
-        (b3e ^ (!b4e & s0e), b3o ^ (!b4o & s0o))
-    }
-
-    /// The header hash as the kernel sets it up, in interleaved form.
-    fn il_header_hash(header76: &[u8; 76], nonce: u32) -> ([u32; 25], [u32; 25]) {
-        let lanes = kernel_lanes(header76);
-        let mut e = [0u32; 25];
-        let mut o = [0u32; 25];
-        for i in 0..10 {
-            e[i] = lanes[i] as u32;
-            o[i] = (lanes[i] >> 32) as u32;
-        }
-        e[9] |= compress_even(nonce) << 16;
-        o[9] |= compress_even(nonce >> 1) << 16;
-        e[10] = IL_PAD_START_E;
-        o[10] = IL_PAD_START_O;
-        o[16] = IL_PAD_END_O;
-        for round in 0..24 {
-            il_round(&mut e, &mut o, round);
-        }
-        (e, o)
-    }
-
-    /// All four limbs of the final digest through the interleaved
-    /// permutation - checks the whole representation, not just lane 3.
-    fn il_mirror_full(header76: &[u8; 76], nonce: u32) -> [u64; 4] {
-        let (mut e, mut o) = il_header_hash(header76, nonce);
-        il_sha3_256_32(&mut e, &mut o);
-        il_sha3_256_32(&mut e, &mut o);
-        let mut out = [0u64; 4];
-        for i in 0..4 {
-            out[i] = deinterleave_u64(((o[i] as u64) << 32) | e[i] as u64);
-        }
-        out
-    }
-
-    /// Exactly what the kernel computes per nonce: limb 3, interleaved.
-    fn il_mirror_lane3(header76: &[u8; 76], nonce: u32) -> u64 {
-        let (mut e, mut o) = il_header_hash(header76, nonce);
-        il_sha3_256_32(&mut e, &mut o);
-        let (h3e, h3o) = il_sha3_256_32_lane3(&e, &o);
-        ((h3o as u64) << 32) | h3e as u64
-    }
-
-    /// The kernel's decision, on interleaved inputs: h3 <= t3.
-    fn il_compare(h3: u64, t3: u64) -> bool {
-        let (he, ho) = (h3 as u32, (h3 >> 32) as u32);
-        let (te, to) = (t3 as u32, (t3 >> 32) as u32);
-        let xe = he ^ te;
-        let xo = ho ^ to;
-        if xe | xo == 0 {
-            return true;
-        }
-        let pe = 31 - xe.leading_zeros() as i32;
-        let po = 31 - xo.leading_zeros() as i32;
-        if po >= pe {
-            (to >> po) & 1 != 0
-        } else {
-            (te >> pe) & 1 != 0
-        }
-    }
-
-    #[test]
-    fn interleave_is_a_bijection_with_the_documented_bit_order() {
-        // Bit 0 is even -> e bit 0; bit 1 is odd -> o bit 0; bit 63 -> o bit 31.
-        assert_eq!(interleave_u64(1), 1);
-        assert_eq!(interleave_u64(2), 1 << 32);
-        assert_eq!(interleave_u64(0x8000_0000_0000_0000), 0x8000_0000 << 32);
-        // The padding constants the kernel hard-codes.
-        assert_eq!(interleave_u64(0x06), ((IL_PAD_START_O as u64) << 32) | IL_PAD_START_E as u64);
-        assert_eq!(interleave_u64(0x8000_0000_0000_0000), (IL_PAD_END_O as u64) << 32);
-        let mut seed = 0xbc3_0003u64;
-        for _ in 0..1000 {
-            let v = xorshift(&mut seed);
-            assert_eq!(deinterleave_u64(interleave_u64(v)), v);
-        }
-    }
-
-    /// The tables in the kernel source must be the interleaved form of the
-    /// standard constants - a typo there would hash wrong on every GPU while
-    /// every CPU test still passed.
-    #[test]
-    fn interleaved_round_constants_match_the_64_bit_table() {
-        fn table(name: &str) -> Vec<u32> {
-            let at = KERNEL_SOURCE.find(name).unwrap_or_else(|| panic!("{name} not in the kernel"));
-            let rest = &KERNEL_SOURCE[at..];
-            let open = rest.find('{').unwrap();
-            let close = rest.find('}').unwrap();
-            rest[open + 1..close]
-                .split(',')
-                .map(|s| {
-                    let s = s.trim().trim_end_matches('u');
-                    u32::from_str_radix(s.trim_start_matches("0x"), 16)
-                        .unwrap_or_else(|e| panic!("{name}: bad entry {s:?}: {e}"))
-                })
-                .collect()
-        }
-        let rce = table("RC_E[24]");
-        let rco = table("RC_O[24]");
-        assert_eq!(rce.len(), 24);
-        assert_eq!(rco.len(), 24);
-        for r in 0..24 {
-            let v = interleave_u64(RC[r]);
-            assert_eq!(rce[r], v as u32, "RC_E[{r}]");
-            assert_eq!(rco[r], (v >> 32) as u32, "RC_O[{r}]");
-        }
-    }
-
-    #[test]
-    fn interleaved_mirror_matches_cpu_reference_genesis() {
-        let g = genesis_header();
-        let ser = g.serialize();
-        let header76: [u8; 76] = ser[..76].try_into().unwrap();
-        let expected = limbs_of_hash(&sha3t(&ser));
-        assert_eq!(il_mirror_full(&header76, g.nonce), expected);
-        assert_eq!(deinterleave_u64(il_mirror_lane3(&header76, g.nonce)), expected[3]);
-    }
-
-    #[test]
-    fn interleaved_mirror_matches_cpu_reference_random() {
-        let mut seed = 0xbc3_0004u64;
-        for _ in 0..50 {
-            let mut header80 = [0u8; 80];
-            for b in header80.iter_mut() {
-                *b = xorshift(&mut seed) as u8;
-            }
-            let header76: [u8; 76] = header80[..76].try_into().unwrap();
-            let nonce = u32::from_le_bytes(header80[76..80].try_into().unwrap());
-            let expected = limbs_of_hash(&sha3t(&header80));
-            assert_eq!(il_mirror_full(&header76, nonce), expected, "header {header80:02x?}");
-            assert_eq!(
-                deinterleave_u64(il_mirror_lane3(&header76, nonce)),
-                expected[3],
-                "lane-3 path, header {header80:02x?}"
-            );
-        }
-    }
-
-    /// The comparison the kernel does on interleaved words must be h3 <= t3
-    /// on the real numbers. Every bit position gets a single-bit difference
-    /// in both directions, which is where the odd-beats-even-on-equal-index
-    /// rule is decided.
-    #[test]
-    fn interleaved_comparison_is_h3_at_most_t3() {
-        let mut seed = 0xbc3_0005u64;
-        for _ in 0..200 {
-            let t3 = xorshift(&mut seed);
-            assert!(il_compare(interleave_u64(t3), interleave_u64(t3)), "a tie is a hit");
-            for p in 0..64 {
-                let h3 = t3 ^ (1u64 << p);
-                assert_eq!(
-                    il_compare(interleave_u64(h3), interleave_u64(t3)),
-                    h3 <= t3,
-                    "t3 {t3:016x} bit {p}"
-                );
-            }
-            let h3 = xorshift(&mut seed);
-            assert_eq!(il_compare(interleave_u64(h3), interleave_u64(t3)), h3 <= t3);
-        }
-    }
-
-    /// And against the consensus rule: whenever the CPU says a hash meets the
-    /// target, the kernel must report it (it may only ever report MORE, on the
-    /// 2^-64 tie, never less).
-    #[test]
-    fn kernel_target_never_misses_a_share() {
-        let mut seed = 0xbc3_0002u64;
-        let targets = [
-            compact_to_target(0x1d00ffff).unwrap(),
-            target_for_difficulty(16.0),
-            target_for_difficulty(0.001), // high target - many hits
-        ];
-        for target in targets {
-            let t3 = kernel_target(&target);
-            let mut hits = 0;
-            for _ in 0..2000 {
-                let mut hash = [0u8; 32];
-                for b in hash.iter_mut() {
-                    *b = xorshift(&mut seed) as u8;
-                }
-                // Make some hashes small so both outcomes get exercised.
-                if seed % 3 == 0 {
-                    for b in hash[4..].iter_mut() {
-                        *b = 0;
-                    }
-                }
-                let h = limbs_of_hash(&hash);
-                let kernel_ok = il_compare(interleave_u64(h[3]), t3);
-                assert_eq!(kernel_ok, h[3] <= target_limbs(&target)[3]);
-                if hash_meets_target(&hash, &target) {
-                    assert!(kernel_ok, "the kernel would have missed a share");
-                    hits += 1;
-                }
-            }
-            let _ = hits;
-        }
-    }
-
-    #[test]
-    fn header_lanes_roundtrip() {
-        let mut header76 = [0u8; 76];
-        for (i, b) in header76.iter_mut().enumerate() {
-            *b = i as u8;
-        }
-        let lanes = header_lanes(&header76);
-        // lane 9 = bytes 72..75 + a zeroed nonce.
-        assert_eq!(lanes[9], u64::from_le_bytes([72, 73, 74, 75, 0, 0, 0, 0]));
-        assert_eq!(lanes[0], u64::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7]));
-    }
 
     // ------------------------------------------------------------------
     // Device selection.
@@ -1467,15 +922,5 @@ mod tests {
             assert!(b.chunk(4096) >= 1);
         }
         assert_eq!(b.chunk(4096), 1);
-    }
-
-    #[test]
-    fn sha3_vbit_headers_use_sha3t() {
-        // Sanity: jobs from the pool always have the version bit set, so
-        // the GPU path (which always runs sha3t) matches BlockHeader::hash.
-        let mut h = genesis_header();
-        h.version |= SHA3_VBIT;
-        let ser = h.serialize();
-        assert_eq!(h.hash(), sha3t(&ser));
     }
 }
