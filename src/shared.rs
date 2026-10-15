@@ -88,6 +88,10 @@ pub struct Stats {
     pub cpu_hashes: AtomicU64,
     pub accepted: AtomicU64,
     pub rejected: AtomicU64,
+    /// The rejected shares the pool called stale (code 21): found on work
+    /// that was over before the share reached the pool. Counted in
+    /// `rejected` too.
+    pub stale: AtomicU64,
     pub blocks: AtomicU64,
     /// nBits of the latest job: the block the miner is working on, for its
     /// difficulty and the ETA.

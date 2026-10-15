@@ -172,28 +172,56 @@ function log(text, cls) {
   box.scrollTop = box.scrollHeight;
 }
 
-// ---------- Share answers ----------
-// Logged one line a second at most, not one each. Right after the fork the
-// pool starts every connection at a difficulty a fast card beats ~145 times
-// a second, and rate-limits all but a few of those shares until vardiff has
-// caught up: a line per share replaced the whole 300-line log within a
-// second, the PoW and kernel lines of the fork with it.
-const shareTally = { accepted: 0, rejected: 0 };
-let shareFlush = null;
-function noteShare(accepted) {
-  if (!shareFlush) {
-    log(accepted ? "share accepted" : "share rejected", accepted ? "l-ok" : "l-bad");
-    shareFlush = setTimeout(flushShares, 1000);
+// ---------- Shares ----------
+// Accepted shares a minute, with the run's counts under it, in place of a
+// log line per share: vardiff aims at a share every 3 s per connection, and
+// a line each buried everything else in the log. Stale shares - the work
+// was over before the share reached the pool, a new block mostly - apart
+// from the other rejects; the miner's `rejected` counts both.
+function renderShares(ev) {
+  setStat("share-rate", num1.format(ev.accepted_per_min) + "/min");
+  // The pool's answer time: the last submit, or the handshake before the
+  // first share. Absent until the pool has answered anything.
+  const rtt = ev.pool_rtt_ms != null ? ` · pool ${numInt.format(Math.round(ev.pool_rtt_ms))} ms` : "";
+  setSub("shares-sub", "", numInt.format(ev.accepted), " accepted" + rtt);
+  // On a line of their own: all on one, a few days' counts no longer fit
+  // the card in four columns.
+  const stale = ev.stale;
+  const rejected = Math.max(0, ev.rejected - stale);
+  const lost = el("shares-lost");
+  if (lost.textContent !== `${numInt.format(stale)} stale · ${numInt.format(rejected)} rejected`) {
+    const figure = (n, cls) => {
+      const e = document.createElement(n > 0 ? "span" : "b");
+      if (n > 0) e.className = cls;
+      e.textContent = numInt.format(n);
+      return e;
+    };
+    lost.replaceChildren(figure(stale, "warm"), " stale · ", figure(rejected, "bad"), " rejected");
+  }
+}
+
+// Stale and rejected shares get a line - the miner's own line beside it
+// says the pool's reason - but one a second at most, not one each. Right
+// after the fork the pool started every connection at a difficulty a fast
+// card beat ~145 times a second, and rate-limited all but a few of those
+// shares until vardiff had caught up: a line per share replaced the whole
+// 300-line log within a second, the PoW and kernel lines of the fork with it.
+const rejectTally = { stale: 0, rejected: 0 };
+let rejectFlush = null;
+function noteReject(stale) {
+  if (!rejectFlush) {
+    log(stale ? "stale share" : "share rejected", "l-bad");
+    rejectFlush = setTimeout(flushRejects, 1000);
     return;
   }
-  shareTally[accepted ? "accepted" : "rejected"]++;
+  rejectTally[stale ? "stale" : "rejected"]++;
 }
-function flushShares() {
-  const { accepted: a, rejected: r } = shareTally;
-  shareTally.accepted = 0;
-  shareTally.rejected = 0;
-  shareFlush = a || r ? setTimeout(flushShares, 1000) : null;
-  if (a) log(`${numInt.format(a)} more share${a === 1 ? "" : "s"} accepted`, "l-ok");
+function flushRejects() {
+  const { stale: s, rejected: r } = rejectTally;
+  rejectTally.stale = 0;
+  rejectTally.rejected = 0;
+  rejectFlush = s || r ? setTimeout(flushRejects, 1000) : null;
+  if (s) log(`${numInt.format(s)} more stale share${s === 1 ? "" : "s"}`, "l-bad");
   if (r) log(`${numInt.format(r)} more share${r === 1 ? "" : "s"} rejected`, "l-bad");
 }
 
@@ -507,13 +535,7 @@ listen("miner-event", ({ payload: ev }) => {
       el("hashrate-sub").textContent = rate && ev.hashrate_gpu > 0 && ev.hashrate_cpu > 0
         ? `GPU ${fmtHashrate(rate.gpu)} · CPU ${fmtHashrate(rate.cpu)}`
         : "";
-      setStat("accepted", numInt.format(ev.accepted));
-      setStat("rejected", numInt.format(ev.rejected));
-      // The pool's answer time: the last submit, or the handshake before
-      // the first share. Absent until the pool has answered anything.
-      setStat("shares-sub", ev.pool_rtt_ms != null
-        ? `accepted / rejected · pool ${numInt.format(Math.round(ev.pool_rtt_ms))} ms`
-        : "accepted / rejected");
+      renderShares(ev);
       // A block takes difficulty x 2^32 hashes on average - at the rate
       // shown, not the last sample's, or the time to block jumped with it.
       setStat("eta", rate && rate.total > 0 && ev.network_difficulty > 0
@@ -531,7 +553,7 @@ listen("miner-event", ({ payload: ev }) => {
       break;
     }
     case "share":
-      noteShare(ev.accepted);
+      if (!ev.accepted) noteReject(ev.stale);
       break;
     case "tables": {
       const was = gpuTables[ev.gpu];
@@ -573,6 +595,7 @@ listen("miner-stopped", ({ payload: code }) => {
   rates.length = 0;
   setStat("hashrate", "—");
   el("hashrate-sub").textContent = "";
+  setStat("share-rate", "—");
   setStat("job-height", "—");
   el("job-height-sub").textContent = "waiting for a job";
   el("job-height-card").classList.remove("live");

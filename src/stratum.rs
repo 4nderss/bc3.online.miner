@@ -141,6 +141,15 @@ impl Outstanding {
     }
 }
 
+/// A reject with code 21, stratum's "job not found": the pool calls a share
+/// stale when the work it was found on was over before it arrived - a new
+/// block, mostly ("job not found (stale)", "stale: the proof of work has
+/// changed", "job is on a stale chain tip"). Lost like any reject, but no
+/// fault of the rig, so the GUI and the stats count it apart.
+fn is_stale(error: &Value) -> bool {
+    error[0] == json!(21)
+}
+
 /// How long repeats of one reject reason are held back before they are
 /// counted in one line.
 const REJECT_SUMMARY_EVERY: Duration = Duration::from_secs(10);
@@ -428,7 +437,11 @@ fn session(
                         eprintln!("{line}");
                     }
                 }
-                crate::ipc::emit(&crate::ipc::Event::Share { accepted });
+                let stale = !accepted && is_stale(&msg["error"]);
+                if stale {
+                    shared.stats.stale.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::ipc::emit(&crate::ipc::Event::Share { accepted, stale });
                 continue;
             }
         }
@@ -751,6 +764,20 @@ mod tests {
         // The rate limit went quiet for a whole window: forgotten too.
         assert!(log.due(at(20_000)).is_empty());
         assert!(log.reject(limited, at(21_000)).is_some());
+    }
+
+    /// The pool's three stale answers are stale; its other rejects are not.
+    #[test]
+    fn stale_is_code_21() {
+        for why in
+            ["job not found (stale)", "stale: the proof of work has changed", "job is on a stale chain tip"]
+        {
+            assert!(is_stale(&json!([21, why, null])), "{why}");
+        }
+        assert!(!is_stale(&json!([20, "too many shares per second - difficulty will be raised", null])));
+        assert!(!is_stale(&json!([23, "share above target (difficulty too low)", null])));
+        assert!(!is_stale(&json!([22, "duplicate share", null])));
+        assert!(!is_stale(&Value::Null));
     }
 
     /// The pool's end of a test connection.

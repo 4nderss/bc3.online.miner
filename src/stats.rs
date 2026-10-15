@@ -13,11 +13,46 @@ use std::time::{Duration, Instant};
 const GPU_REPORT_FIRST: Duration = Duration::from_secs(60);
 const GPU_REPORT_EVERY: Duration = Duration::from_secs(600);
 
+/// How far back the shares a minute are counted.
+const SHARE_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Accepted shares a minute, from the running count at each report.
+///
+/// This is what says shares are coming in, instead of a log line per
+/// share: vardiff aims at a share every 3 s per connection, twenty a minute,
+/// and a line each in the GUI's 300-line log buried everything else.
+struct ShareRate {
+    /// (when, accepted by then). The first is the newest report at least a
+    /// window old - so the rate spans a whole minute once there is one -
+    /// or the start.
+    samples: std::collections::VecDeque<(Instant, u64)>,
+}
+
+impl ShareRate {
+    fn new(start: Instant, accepted: u64) -> Self {
+        Self { samples: [(start, accepted)].into() }
+    }
+
+    fn per_minute(&mut self, now: Instant, accepted: u64) -> f64 {
+        self.samples.push_back((now, accepted));
+        while self.samples.len() > 1 && now.duration_since(self.samples[1].0) >= SHARE_RATE_WINDOW {
+            self.samples.pop_front();
+        }
+        let (t0, a0) = self.samples[0];
+        let span = now.duration_since(t0).as_secs_f64();
+        if span <= 0.0 {
+            return 0.0;
+        }
+        accepted.saturating_sub(a0) as f64 * 60.0 / span
+    }
+}
+
 pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
     let mut last_hashes = 0u64;
     let mut last_gpu = 0u64;
     let mut last_cpu = 0u64;
     let mut last_t = Instant::now();
+    let mut share_rate = ShareRate::new(last_t, shared.stats.accepted.load(Ordering::Relaxed));
     let telemetry = crate::telemetry::Telemetry::open();
     let mut next_gpu_report = Instant::now() + GPU_REPORT_FIRST;
     loop {
@@ -45,6 +80,8 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
 
         let accepted = shared.stats.accepted.load(Ordering::Relaxed);
         let rejected = shared.stats.rejected.load(Ordering::Relaxed);
+        let stale = shared.stats.stale.load(Ordering::Relaxed);
+        let accepted_per_min = share_rate.per_minute(now, accepted);
         // Read together: the GUI shows them as a pair, the block and its
         // difficulty.
         let bits = shared.stats.network_bits.load(Ordering::Relaxed);
@@ -64,6 +101,8 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
             hashrate_cpu: cpu_rate,
             accepted,
             rejected,
+            stale,
+            accepted_per_min,
             best_share,
             best_share_network_difficulty: best_needed,
             best_share_age_secs: best.map(|b| b.found.elapsed().as_secs_f64()),
@@ -82,8 +121,9 @@ pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
         };
         let blocks = shared.stats.blocks.load(Ordering::Relaxed);
         crate::human!(
-            "[miner] {} | shares {accepted} ok, {rejected} rejected | {} | best {} | blocks {blocks} | est. block: {}{}",
+            "[miner] {} | shares {} | {} | best {} | blocks {blocks} | est. block: {}{}",
             format_hashrate(rate),
+            format_shares(accepted, accepted_per_min, stale, rejected),
             format_pool_rtt(pool_rtt_ms),
             format_best_share(best_share, best_needed),
             eta_secs.map(format_duration).unwrap_or_else(|| "unknown".into()),
@@ -143,6 +183,13 @@ pub fn format_best_share(best: f64, needed: f64) -> String {
     // BC3Hash share at the pool's start difficulty sits.
     let pct = if pct >= 0.01 { format!("{pct:.2}%") } else { format!("{pct:.1e}%") };
     format!("{} of {} ({pct})", format_difficulty(best), format_difficulty(needed))
+}
+
+/// "1234 ok (19.6/min), 1 stale, 2 rejected": the stale shares apart from
+/// the other rejects (`rejected` counts both) - one now and then is a block
+/// that changed while the share was on its way, not a fault of the rig.
+pub fn format_shares(accepted: u64, per_min: f64, stale: u64, rejected: u64) -> String {
+    format!("{accepted} ok ({per_min:.1}/min), {stale} stale, {} rejected", rejected.saturating_sub(stale))
 }
 
 /// "pool 34 ms": the latest round trip to the pool, "pool -" before one.
@@ -224,6 +271,7 @@ mod tests {
         for (best, needed) in [(0.0, 0.0), (2e-6, 11.28), (1.46, 11.28), (5e3, 0.0)] {
             samples.push(format_best_share(best, needed));
         }
+        samples.push(format_shares(1234, 19.64, 1, 3));
         for s in samples {
             assert!(s.is_ascii(), "non-ASCII in log output: {s:?}");
         }
@@ -247,6 +295,46 @@ mod tests {
         assert_eq!(format_pool_rtt(None), "pool -");
         assert_eq!(format_pool_rtt(Some(2.34)), "pool 2.3 ms");
         assert_eq!(format_pool_rtt(Some(34.4)), "pool 34 ms");
+        assert_eq!(format_shares(1234, 19.64, 1, 3), "1234 ok (19.6/min), 1 stale, 2 rejected");
+        assert_eq!(format_shares(0, 0.0, 0, 0), "0 ok (0.0/min), 0 stale, 0 rejected");
+        // The two counters are read one after the other.
+        assert_eq!(format_shares(5, 3.0, 2, 1), "5 ok (3.0/min), 2 stale, 0 rejected");
+    }
+
+    /// Shares a minute over the last minute of reports - whichever report
+    /// interval - and over the time since the start before there is one.
+    #[test]
+    fn shares_a_minute_over_the_last_minute() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = ShareRate::new(t0, 0);
+        assert_eq!(r.per_minute(t0, 0), 0.0);
+        // 5 shares in the first 15 s: 20 a minute.
+        assert!((r.per_minute(at(15), 5) - 20.0).abs() < 1e-9);
+        // Reports every 3 s; a share every 3 s from here on, then none.
+        let mut accepted = 5;
+        for s in (18..=120).step_by(3) {
+            accepted += 1;
+            r.per_minute(at(s), accepted);
+        }
+        // From 60 s to 120 s: 20 shares, and the window is exactly a minute.
+        assert!((r.per_minute(at(120), accepted) - 20.0).abs() < 1e-9);
+        assert!(r.samples.len() <= 22, "{} samples kept", r.samples.len());
+        // Half a minute with none: half the rate.
+        let rate = r.per_minute(at(150), accepted);
+        assert!((rate - 10.0).abs() < 1e-9, "{rate}");
+        // A minute with none: none.
+        assert_eq!(r.per_minute(at(180), accepted), 0.0);
+
+        // Started on a count that was not zero, and reported every 5 s.
+        let mut r = ShareRate::new(t0, 100);
+        for s in (5..=55).step_by(5) {
+            r.per_minute(at(s), 100 + s / 5);
+        }
+        let rate = r.per_minute(at(62), 112);
+        assert!((rate - 12.0 * 60.0 / 62.0).abs() < 1e-9, "{rate}");
+        let rate = r.per_minute(at(67), 114);
+        assert!((rate - 13.0 * 60.0 / 62.0).abs() < 1e-9, "the window starts at 5 s: {rate}");
     }
 
     /// The best share is shown against the difficulty its block needed, as

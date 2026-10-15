@@ -72,7 +72,8 @@ the card's OpenCL runtime.
 
 Run **bc3-miner-gui.exe**. Paste your BC3 address, name your rig, pick PPLNS or
 Solo, press *Start mining*. The window shows live hashrate with a sparkline,
-accepted/rejected shares, estimated time to block, which backend is running,
+accepted shares a minute (with stale and rejected ones counted beside them),
+estimated time to block, which backend is running,
 and a full-screen celebration when you find a block. Settings are remembered
 between runs.
 

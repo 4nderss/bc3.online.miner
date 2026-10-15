@@ -45,7 +45,13 @@ pub enum Event {
         hashrate_gpu: f64,
         hashrate_cpu: f64,
         accepted: u64,
+        /// Every share the pool did not accept, stale ones included.
         rejected: u64,
+        /// The rejected shares the pool called stale (counted in `rejected`).
+        stale: u64,
+        /// Accepted shares a minute, over the last minute (or the time since
+        /// the start, before a minute has passed).
+        accepted_per_min: f64,
         /// Highest share difficulty reached during this run, with the
         /// current PoW. 0 before the first share.
         best_share: f64,
@@ -75,8 +81,9 @@ pub enum Event {
         #[serde(flatten)]
         telemetry: crate::telemetry::Reading,
     },
-    /// A share was submitted and the pool answered.
-    Share { accepted: bool },
+    /// A share was submitted and the pool answered; `stale` when it rejected
+    /// it as stale (code 21).
+    Share { accepted: bool, stale: bool },
     /// We found a block (hash in display order).
     Block { hash: String },
     /// The pool moved on to a new block (height from the job's coinbase), and
@@ -131,8 +138,8 @@ mod tests {
 
     #[test]
     fn events_serialize_with_type_tag() {
-        let s = serde_json::to_string(&Event::Share { accepted: true }).unwrap();
-        assert_eq!(s, r#"{"type":"share","accepted":true}"#);
+        let s = serde_json::to_string(&Event::Share { accepted: true, stale: false }).unwrap();
+        assert_eq!(s, r#"{"type":"share","accepted":true,"stale":false}"#);
 
         let s = serde_json::to_string(&Event::Status {
             state: StatusState::Authorized,
@@ -146,7 +153,9 @@ mod tests {
             hashrate_gpu: 1.5,
             hashrate_cpu: 0.0,
             accepted: 3,
-            rejected: 0,
+            rejected: 1,
+            stale: 1,
+            accepted_per_min: 19.5,
             best_share: 1.46,
             best_share_network_difficulty: 11.28,
             best_share_age_secs: Some(720.0),
@@ -162,6 +171,7 @@ mod tests {
         })
         .unwrap();
         assert!(s.starts_with(r#"{"type":"stats","hashrate":1.5"#));
+        assert!(s.contains(r#""accepted":3,"rejected":1,"stale":1,"accepted_per_min":19.5"#));
         assert!(s.contains(r#""eta_secs":null"#));
         assert!(s.contains(r#""pool_rtt_ms":34.5"#));
         assert!(s.contains(
