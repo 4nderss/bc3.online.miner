@@ -220,6 +220,77 @@ impl RejectLog {
     }
 }
 
+/// How often the miner tells the pool what it measures itself.
+const HASHRATE_REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// The id of every `mining.hashrate` request: below the submits (100 and
+/// up), so its answer is never counted as an accepted or rejected share.
+const HASHRATE_ID: u64 = 3;
+const _: () = assert!(HASHRATE_ID > 2 && HASHRATE_ID < 100);
+
+/// The miner's own hashrate, sent to the pool once a minute so the pool can
+/// show it next to the hashrate it derives from accepted shares.
+///
+/// Those two never agree to the digit: vardiff aims at one share per 15 s,
+/// so even the pool's 15-minute average holds only ~60 shares and swings
+/// some 13 % on luck alone. With the miner's own count beside it, a user can
+/// tell luck (the two cross back and forth) from a real loss (effective
+/// stays below - rejects, stale work, a rig the pool never sees).
+///
+/// `mining.hashrate` with the rate in H/s first is the stratum extension
+/// some pools already take (e.g. Xelis pools; it is `eth_submitHashrate` in
+/// Ethereum stratum). Pools that do not know it answer "unknown method" or
+/// nothing at all; an error stops the reports for the rest of the session,
+/// so such a pool hears it once per connection, not once a minute.
+struct HashrateReport {
+    /// When the current interval started and the hash count then. None
+    /// until the pool has accepted the address, and after it refused one.
+    since: Option<(Instant, u64)>,
+    refused: bool,
+}
+
+impl HashrateReport {
+    fn new() -> Self {
+        Self { since: None, refused: false }
+    }
+
+    /// The pool accepted the address: start measuring.
+    fn start(&mut self, now: Instant, hashes: u64) {
+        if !self.refused {
+            self.since = Some((now, hashes));
+        }
+    }
+
+    /// The rate to report now, if an interval is over.
+    fn due(&mut self, now: Instant, hashes: u64) -> Option<f64> {
+        let (t0, h0) = self.since?;
+        let dt = now.duration_since(t0);
+        if dt < HASHRATE_REPORT_EVERY {
+            return None;
+        }
+        self.since = Some((now, hashes));
+        Some(hashes.saturating_sub(h0) as f64 / dt.as_secs_f64())
+    }
+
+    /// The pool answered a report with an error (or `false`). True the first
+    /// time, so the caller can say it once.
+    fn answer(&mut self, msg: &Value) -> bool {
+        let refused = !msg["error"].is_null() || msg["result"] == json!(false);
+        if !refused || self.refused {
+            return false;
+        }
+        self.refused = true;
+        self.since = None;
+        true
+    }
+}
+
+/// `mining.hashrate` [whole hashes per second, user]. An integer, because
+/// that is what the pools that take this method parse.
+fn hashrate_message(rate: f64, user: &str) -> Value {
+    json!({"id": HASHRATE_ID, "method": "mining.hashrate", "params": [rate.round() as u64, user]})
+}
+
 /// How long a session must have been authorized to count as healthy: the
 /// next failure after one starts the reconnect backoff from the bottom.
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
@@ -339,10 +410,15 @@ fn session(
     let mut rx_buf: Vec<u8> = Vec::with_capacity(8192);
     let mut last_rx = Instant::now();
     let mut rejects = RejectLog::default();
+    let mut report = HashrateReport::new();
 
     loop {
+        use std::sync::atomic::Ordering;
         for line in rejects.due(Instant::now()) {
             eprintln!("{line}");
+        }
+        if let Some(rate) = report.due(Instant::now(), shared.stats.hashes.load(Ordering::Relaxed)) {
+            send(&mut writer, hashrate_message(rate, &cfg.user))?;
         }
         // 1) Submit pending shares.
         while let Ok(share) = submit_rx.try_recv() {
@@ -432,6 +508,7 @@ fn session(
                 return Err(std::io::Error::new(ErrorKind::PermissionDenied, "authorize"));
             }
             *authorized_at = Some(Instant::now());
+            report.start(Instant::now(), shared.stats.hashes.load(Ordering::Relaxed));
             crate::human!("[pool] authorized");
             crate::ipc::emit(&crate::ipc::Event::Status {
                 state: crate::ipc::StatusState::Mining,
@@ -439,10 +516,15 @@ fn session(
             });
             continue;
         }
+        if msg["id"] == json!(HASHRATE_ID) {
+            if report.answer(&msg) {
+                crate::human!("[pool] the pool does not take reported hashrate ({}) - not sending it", msg["error"]);
+            }
+            continue;
+        }
         // Submit responses.
         if let Some(id) = msg["id"].as_u64() {
             if id >= 100 {
-                use std::sync::atomic::Ordering;
                 let accepted = msg["result"] == json!(true);
                 if accepted {
                     shared.stats.accepted.fetch_add(1, Ordering::Relaxed);
@@ -752,6 +834,54 @@ mod tests {
         assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60]);
         assert_eq!(b.after(true), 1, "a healthy session must reset the ladder");
         assert_eq!(b.after(false), 2);
+    }
+
+    /// Nothing before the pool accepts the address, then the rate over each
+    /// whole minute - measured from the hash counter, not from shares.
+    #[test]
+    fn the_hashrate_is_reported_once_a_minute_after_authorize() {
+        let t0 = Instant::now();
+        let mut r = HashrateReport::new();
+        assert_eq!(r.due(t0 + Duration::from_secs(600), 1_000), None, "reported before authorize");
+
+        r.start(t0, 1_000);
+        assert_eq!(r.due(t0 + Duration::from_secs(59), 60_000), None);
+        let first = r.due(t0 + Duration::from_secs(60), 181_000).unwrap();
+        assert!((first - 3_000.0).abs() < 1e-9, "{first}");
+        // The next interval starts where that one ended.
+        assert_eq!(r.due(t0 + Duration::from_secs(100), 999_999), None);
+        let second = r.due(t0 + Duration::from_secs(130), 251_000).unwrap();
+        assert!((second - 1_000.0).abs() < 1e-9, "{second}");
+
+        let m = hashrate_message(2_519_871.6, "bc1qtest.rig");
+        assert_eq!(m["method"], "mining.hashrate");
+        assert_eq!(m["id"], json!(HASHRATE_ID));
+        assert_eq!(m["params"], json!([2_519_872u64, "bc1qtest.rig"]));
+    }
+
+    /// A pool that does not know the method hears it once per connection:
+    /// its error stops the reports, and is said once. An answer of `true`,
+    /// or no answer, changes nothing.
+    #[test]
+    fn a_pool_that_refuses_reported_hashrate_is_not_asked_again() {
+        let t0 = Instant::now();
+        let mut r = HashrateReport::new();
+        r.start(t0, 0);
+        assert!(!r.answer(&json!({"id": 3, "error": null, "result": true})));
+        assert!(r.due(t0 + HASHRATE_REPORT_EVERY, 60).is_some());
+
+        let unknown = json!({"id": 3, "result": null, "error": [20, "unknown method", null]});
+        assert!(r.answer(&unknown), "the first refusal is said");
+        assert!(!r.answer(&unknown), "and only once");
+        assert_eq!(r.due(t0 + 10 * HASHRATE_REPORT_EVERY, 600), None);
+        // Not even after a second authorize on the same connection.
+        r.start(t0 + 10 * HASHRATE_REPORT_EVERY, 600);
+        assert_eq!(r.due(t0 + 20 * HASHRATE_REPORT_EVERY, 1_200), None);
+
+        let mut r = HashrateReport::new();
+        r.start(t0, 0);
+        assert!(r.answer(&json!({"id": 3, "error": null, "result": false})));
+        assert_eq!(r.due(t0 + HASHRATE_REPORT_EVERY, 60), None);
     }
 
     /// Rejects are said once per reason and then counted every ten seconds,
@@ -1095,6 +1225,10 @@ mod tests {
                 retargeted = true;
             }
             let Some(m) = pool.next() else { continue };
+            // A slow machine can run past the first minute.
+            if m["method"] == "mining.hashrate" {
+                continue;
+            }
             assert_eq!(m["method"], "mining.submit", "{m}");
             let p = &m["params"];
             // No version rolling, ever: the PoW bits stay the job's.
