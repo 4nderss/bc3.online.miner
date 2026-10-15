@@ -1004,18 +1004,23 @@ mod tests {
     }
 
     /// A scripted backend: every launch "finds" the nonces at `hits_at`
-    /// (offsets into the launch) and took `BC3_TARGET_LAUNCH` of device time,
-    /// so the autotune leaves the launch size alone. It records what was
-    /// queued, can fail one collect, and moves the job on (bumps the
+    /// (offsets into the launch) and took `busy` of device time -
+    /// `BC3_TARGET_LAUNCH` unless a test says otherwise, so the autotune
+    /// leaves the launch size alone. It records what was queued, and what
+    /// came back (`done`: the header, first nonce and count - what was
+    /// hashed), can fail one collect, and moves the job on (bumps the
     /// generation, as a new job from the pool would) after `bump_after`
-    /// collects.
+    /// collects. `window` is the BC3Hash window it claims to hash at.
     struct Scripted<'a> {
-        queue: VecDeque<(u32, u32)>,
+        queue: VecDeque<([u8; 76], u32, u32)>,
         log: Vec<(u32, u32)>,
+        done: Vec<([u8; 76], u32, u32)>,
         hits_at: Vec<u32>,
         fail_collect_at: Option<usize>,
         bump_after: (usize, &'a Shared),
         collects: usize,
+        busy: Duration,
+        window: Option<u32>,
     }
 
     impl<'a> Scripted<'a> {
@@ -1023,10 +1028,13 @@ mod tests {
             Self {
                 queue: VecDeque::new(),
                 log: vec![],
+                done: vec![],
                 hits_at,
                 fail_collect_at,
                 bump_after: (bump_after, shared),
                 collects: 0,
+                busy: BC3_TARGET_LAUNCH,
+                window: None,
             }
         }
     }
@@ -1038,23 +1046,28 @@ mod tests {
         fn supports(&self, algo: PowAlgo) -> bool {
             algo == PowAlgo::Bc3Hash
         }
+        fn bc3hash_window(&self) -> Option<u32> {
+            self.window
+        }
         fn enqueue(&mut self, l: &Launch) -> Result<(), String> {
             assert!(self.queue.len() < QUEUE_DEPTH, "more than QUEUE_DEPTH in flight");
-            self.queue.push_back((l.start, l.count));
+            self.queue.push_back((*l.header76, l.start, l.count));
             self.log.push((l.start, l.count));
             Ok(())
         }
         fn collect(&mut self) -> Result<Scan, String> {
             self.collects += 1;
+            assert!(self.collects < 100_000, "a run that never ends");
             if self.collects == self.bump_after.0 {
                 self.bump_after.1.generation.fetch_add(1, Ordering::Release);
             }
-            let (start, count) = self.queue.pop_front().ok_or("empty")?;
+            let (header76, start, count) = self.queue.pop_front().ok_or("empty")?;
             if self.fail_collect_at == Some(self.collects) {
                 return Err("scripted failure".into());
             }
+            self.done.push((header76, start, count));
             let hits: Vec<u32> = self.hits_at.iter().filter(|&&o| o < count).map(|o| start + o).collect();
-            Ok(Scan { reported: hits.len(), hits, busy: Some(BC3_TARGET_LAUNCH) })
+            Ok(Scan { reported: hits.len(), hits, busy: Some(self.busy) })
         }
         fn in_flight(&self) -> usize {
             self.queue.len()
@@ -1192,28 +1205,31 @@ mod tests {
         assert!(!nonces.is_empty());
     }
 
+    /// A device that fails every launch.
+    struct Broken;
+
+    impl MiningBackend for Broken {
+        fn name(&self) -> String {
+            "broken".into()
+        }
+        fn supports(&self, _: PowAlgo) -> bool {
+            true
+        }
+        fn enqueue(&mut self, _: &Launch) -> Result<(), String> {
+            Err("lost".into())
+        }
+        fn collect(&mut self) -> Result<Scan, String> {
+            Err("lost".into())
+        }
+        fn in_flight(&self) -> usize {
+            0
+        }
+        fn abandon(&mut self) {}
+    }
+
     /// Five failures in a row and the device counts as gone.
     #[test]
     fn a_device_that_keeps_failing_is_given_up() {
-        struct Broken;
-        impl MiningBackend for Broken {
-            fn name(&self) -> String {
-                "broken".into()
-            }
-            fn supports(&self, _: PowAlgo) -> bool {
-                true
-            }
-            fn enqueue(&mut self, _: &Launch) -> Result<(), String> {
-                Err("lost".into())
-            }
-            fn collect(&mut self) -> Result<Scan, String> {
-                Err("lost".into())
-            }
-            fn in_flight(&self) -> usize {
-                0
-            }
-            fn abandon(&mut self) {}
-        }
         let j = job([0xff; 32]);
         let (shared, _rx, generation) = shared_with_job(&j);
         let mut w = Worker::new(&shared, 0, 0, 1);
@@ -1224,6 +1240,187 @@ mod tests {
         assert_eq!(w.cursor, Cursor { en2: 0, nonce: 0 }, "nothing was done, nothing skipped");
         // Nothing came back, so nothing may reset the reopen budget.
         assert_eq!(w.collected, 0);
+    }
+
+    thread_local! {
+        /// A CPU thread's run in `a_rig_never_hashes_a_header_twice`: the
+        /// `Shared` whose job to move on, the hashes until then, and every
+        /// header hashed.
+        static CPU_RUN: std::cell::RefCell<Option<(Arc<Shared>, usize, Vec<[u8; 80]>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The CPU threads' PoW in that test: notes the header, and moves the
+    /// job on after as many hashes as the test asked for.
+    fn recording_pow(header: &[u8; 80]) -> [u8; 32] {
+        CPU_RUN.with(|run| {
+            let mut run = run.borrow_mut();
+            let (shared, left, seen) = run.as_mut().expect("a CPU run in progress");
+            seen.push(*header);
+            if *left == 1 {
+                shared.generation.fetch_add(1, Ordering::Release);
+            }
+            *left = left.saturating_sub(1);
+        });
+        sha256d(header)
+    }
+
+    /// A rig of ten cards on one pool connection, four CPU threads beside
+    /// them in the extranonce2 partition, through everything that ends a
+    /// card's launch run or starts it over: the window tuning switching each
+    /// card 16 -> 20 -> 16 -> 20 in the middle of a job, a vardiff retarget
+    /// (a new job over the same header space), a capability change that
+    /// wakes the workers with the job they have, the same job sent again, a
+    /// launch that fails and is done again, a new ntime and a new tip. Not
+    /// one (header, nonce) may be hashed twice - by a card, by two, or by a
+    /// card and a CPU thread - and not one share be submitted twice.
+    ///
+    /// Each card runs its real `Worker` on a scripted device, one card after
+    /// the other, each with a `Shared` of its own: what the cards of a rig
+    /// have in common is the job and the partition, and a job change reaches
+    /// each of them alike. Between two runs the test does what
+    /// `run_gpu_worker` does: switch to the window the tuning asked for, and
+    /// take the latest job. The CPU threads run the real `worker::mine_job`
+    /// with the worker loop's own rule for where to start.
+    #[test]
+    fn a_rig_never_hashes_a_header_twice() {
+        use std::collections::HashMap;
+        const GPUS: usize = 10;
+        const THREADS: usize = 4;
+        let total = THREADS + GPUS;
+
+        let j1 = job([0xff; 32]);
+        let j1r = MinerJob { job_id: "1r".into(), ..j1.clone() };
+        let j2 = MinerJob { job_id: "2".into(), ntime: j1.ntime + 1, ..j1.clone() };
+        let j3 = MinerJob { job_id: "3".into(), prev_hash: [7u8; 32], ntime: j1.ntime + 2, ..j1.clone() };
+        let j3r = MinerJob { job_id: "3r".into(), ..j3.clone() };
+        assert!(j1.same_search_space(&j1r) && j3.same_search_space(&j3r));
+        let jobs: HashMap<String, MinerJob> =
+            [&j1, &j1r, &j2, &j3, &j3r].into_iter().map(|j| (j.job_id.clone(), j.clone())).collect();
+        // A share as what it stands for: a header and a nonce.
+        let share_of = |s: FoundShare| {
+            let mut en2 = [0u8; 8];
+            en2[8 - s.extranonce2.len()..].copy_from_slice(&s.extranonce2);
+            (en2_header(&jobs[&s.job_id], u64::from_be_bytes(en2)).header76, s.nonce)
+        };
+        // Per 76-byte header, the nonce ranges hashed under it.
+        let mut hashed: HashMap<[u8; 76], Vec<(u64, u64)>> = HashMap::new();
+        let mut shares: Vec<([u8; 76], u32)> = Vec::new();
+
+        // Window 20 hashes 5 % faster than 16, and 16 measures 10 % slower
+        // the second time: the tuning keeps 20, and does not write it down.
+        let busy_at = |window: u32, second16: bool| match (window, second16) {
+            (START_WINDOW, false) => Duration::from_millis(400),
+            (START_WINDOW, true) => Duration::from_millis(440),
+            _ => Duration::from_millis(380),
+        };
+        // (job, published before the run, collects until the job moves on -
+        // None: the run ends when the tuning switches the window - and a
+        // collect that fails)
+        let steps: [(&MinerJob, bool, Option<usize>, Option<usize>); 9] = [
+            // At 16 until the tuning switches to 20 in the middle of the job.
+            (&j1, true, None, None),
+            // The same job at 20, until a retarget comes...
+            (&j1, false, Some(3), None),
+            // ...which is mined until a capability change wakes the workers...
+            (&j1r, true, Some(4), None),
+            // ...with the job they have: at 20 until the switch back to 16.
+            (&j1r, false, None, None),
+            // The same job sent again.
+            (&j1r, true, Some(2), None),
+            // A launch fails and is done again; at 16 until 20 for good.
+            (&j1r, false, None, Some(3)),
+            // A new ntime, a new tip with a failing first launch, a retarget.
+            (&j2, true, Some(3), None),
+            (&j3, true, Some(4), Some(1)),
+            (&j3r, true, Some(2), None),
+        ];
+        for g in 0..GPUS {
+            let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+            let shared = Shared::new(tx, MiningPlan { gpus: GPUS, ..Default::default() });
+            let mut w = Worker::new(&shared, g, THREADS + g, total);
+            w.tune.tuner = Some(Tuner::start(Some(20), None).expect("20 fits").0);
+            // Nothing to compile ahead: ready at the first launch.
+            w.tune.preparing = true;
+            let mut window = START_WINDOW;
+            let mut second16 = false;
+            for (i, &(job, publish, bump, fail)) in steps.iter().enumerate() {
+                if publish {
+                    shared.publish_job(job.clone());
+                }
+                let generation = shared.generation.load(Ordering::Acquire);
+                // The cards stop at different points; two of them have a
+                // launch fail (each failure costs the test a second).
+                let bump = bump.map(|n| n + g % 3);
+                let fail = fail.filter(|_| (i == 5 && g == 0) || (i == 7 && g == 1));
+                let mut backend = Scripted::new(&shared, vec![5], fail, bump.unwrap_or(0));
+                backend.window = Some(window);
+                backend.busy = busy_at(window, second16);
+                let end = w.mine_job(&mut backend, job, generation, PowAlgo::Bc3Hash, check_fn());
+                assert_eq!(end, JobEnd::Changed, "card {g}, step {i}");
+                let switched = w.tune.switch_to.is_some();
+                while let Some(to) = w.tune.switch_to.take() {
+                    second16 |= to == START_WINDOW;
+                    window = to;
+                    w.tune.switched(to, true);
+                }
+                assert_eq!(switched, bump.is_none(), "card {g}, step {i}: the run did not end as scripted");
+                for (header, start, count) in backend.done {
+                    hashed.entry(header).or_default().push((u64::from(start), u64::from(start) + u64::from(count)));
+                }
+                shares.extend(rx.try_iter().map(&share_of));
+            }
+            assert!(w.tune.tuner.is_none() && window == 20, "card {g}: the tuning did not end at 20");
+        }
+
+        for t in 0..THREADS {
+            let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+            let shared = Arc::new(Shared::new(tx, MiningPlan::default()));
+            let (mut prev, mut en2, mut nonce) = (None::<MinerJob>, 0u64, 0u32);
+            for (job, hashes) in [(&j1, 9), (&j1r, 6), (&j1r, 5), (&j2, 7), (&j3, 6), (&j3r, 5)] {
+                shared.publish_job(job.clone());
+                let generation = shared.generation.load(Ordering::Acquire);
+                crate::worker::start_on(prev.as_ref(), job, t, &mut en2, &mut nonce);
+                CPU_RUN.with(|run| *run.borrow_mut() = Some((shared.clone(), hashes, Vec::new())));
+                let exhausted =
+                    crate::worker::mine_job(&shared, job, recording_pow, 4, generation, total, &mut en2, &mut nonce);
+                assert!(!exhausted);
+                let (_, _, seen) = CPU_RUN.with(|run| run.borrow_mut().take()).expect("the run");
+                for header in seen {
+                    let nonce = u64::from(u32::from_le_bytes(header[76..80].try_into().unwrap()));
+                    hashed.entry(header[..76].try_into().unwrap()).or_default().push((nonce, nonce + 1));
+                }
+                shares.extend(rx.try_iter().map(&share_of));
+                prev = Some(job.clone());
+            }
+        }
+
+        let (mut ranges, mut nonces) = (0usize, 0u64);
+        for (header, list) in &mut hashed {
+            list.sort_unstable();
+            for pair in list.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].0,
+                    "hashed twice under merkle root {}: nonces {:?} and {:?}",
+                    hex::encode(&header[36..68]),
+                    pair[0],
+                    pair[1]
+                );
+            }
+            ranges += list.len();
+            nonces += list.iter().map(|(a, b)| b - a).sum::<u64>();
+        }
+        // Each card and thread searched one extranonce2 of each of the
+        // three header spaces (j1, j2, j3): one header each.
+        assert_eq!(hashed.len(), 3 * total, "a worker strayed out of its extranonce2");
+        assert!(ranges > GPUS * 500, "too little was hashed to mean anything: {ranges} ranges");
+        let unique: std::collections::HashSet<&([u8; 76], u32)> = shares.iter().collect();
+        assert_eq!(unique.len(), shares.len(), "a share was submitted twice");
+        println!(
+            "{ranges} launches and CPU hashes, {nonces} nonces under {} headers, none twice; {} shares, none twice",
+            hashed.len(),
+            shares.len()
+        );
     }
 
     /// A job whose extranonce2 space this worker has used up is not ground

@@ -110,10 +110,7 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize, rol
             sat_out = Some(generation);
             continue;
         };
-        if prev.as_ref().is_none_or(|p| !p.same_search_space(&job)) {
-            en2 = thread_id as u64;
-            nonce = 0;
-        }
+        start_on(prev.as_ref(), &job, thread_id, &mut en2, &mut nonce);
         let exhausted =
             mine_job(&shared, &job, pow, BATCH, generation, num_threads, &mut en2, &mut nonce);
         if exhausted {
@@ -130,10 +127,20 @@ pub fn run_worker(shared: Arc<Shared>, thread_id: usize, num_threads: usize, rol
     }
 }
 
+/// Where thread `thread_id` starts on `job`: where it stopped, when the job
+/// it mined before covers the same header space, else at nonce 0 of its own
+/// first extranonce2.
+pub(crate) fn start_on(prev: Option<&MinerJob>, job: &MinerJob, thread_id: usize, en2: &mut u64, nonce: &mut u32) {
+    if prev.is_none_or(|p| !p.same_search_space(job)) {
+        *en2 = thread_id as u64;
+        *nonce = 0;
+    }
+}
+
 /// Grind `job` until it changes; true when instead every extranonce2 this
 /// thread may use under the job's size has been searched.
 #[allow(clippy::too_many_arguments)]
-fn mine_job(
+pub(crate) fn mine_job(
     shared: &Shared,
     job: &MinerJob,
     // Resolved once per job, so the loop below calls a plain function with no
