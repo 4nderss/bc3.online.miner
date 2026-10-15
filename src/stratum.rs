@@ -28,6 +28,19 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// is not something a healthy link does.
 const POOL_SILENCE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// How long a read waits for the pool before the stratum thread looks at the
+/// queue of found shares again.
+///
+/// One thread reads the socket and sends the shares, so a share found while
+/// it waits for the pool waits with it. At 200 ms, every share - a block
+/// too - sat in the queue 100 ms on average before it was sent: a pool that
+/// talks only to answer a submit and to send a job every 20 s leaves almost
+/// every read to time out. That was a tenth of a second more for a block to
+/// lose a race, and not in the stats: the round trip is timed from the
+/// send. Ten milliseconds is 100 wakeups a second on one thread, which costs
+/// nothing measurable.
+const READ_POLL: Duration = Duration::from_millis(10);
+
 /// Read one complete line, keeping any partial one in `buf` between calls.
 /// `Ok(None)` means nothing complete has arrived yet.
 ///
@@ -291,7 +304,7 @@ fn session(
     });
     let stream = TcpStream::connect(&cfg.pool)?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    stream.set_read_timeout(Some(READ_POLL))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
@@ -345,8 +358,8 @@ fn session(
             next_submit_id += 1;
         }
 
-        // 2) Read any line from the pool (the 200 ms timeout keeps the loop
-        // running).
+        // 2) Read any line from the pool (the READ_POLL timeout keeps the
+        // loop running).
         let line = match next_line(&mut reader, &mut rx_buf)? {
             Some(line) => {
                 last_rx = Instant::now();
@@ -921,6 +934,57 @@ mod tests {
         assert!(result.is_err(), "the session ends when the pool goes away");
         assert!(authorized_at.is_some(), "the error to the suggestion must not stop the session");
         assert_eq!(shared.stats.rejected.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A share goes to the pool when it is found, not when the read that
+    /// waits for the pool times out. With a 200 ms read a share - a block as
+    /// much as any - waited 100 ms on average.
+    #[test]
+    fn a_found_share_is_sent_at_once() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let cfg = StratumConfig {
+            pool: listener.local_addr().unwrap().to_string(),
+            user: "bc1qtest.rig".into(),
+            suggest_difficulty: None,
+        };
+        let (tx, rx) = std::sync::mpsc::sync_channel(crate::shared::SUBMIT_QUEUE);
+        let shared = Arc::new(Shared::new(tx, Default::default()));
+        let s = shared.clone();
+        let miner = std::thread::spawn(move || session(&s, &rx, &cfg, &mut None));
+        let mut pool = FakePool::accept(&listener);
+        let mut asked = 0;
+        while asked < 2 {
+            asked += usize::from(pool.next().is_some());
+        }
+        pool.send(json!({"id": 1, "error": null, "result": [
+            [["mining.set_difficulty", "0a0b0c0d"], ["mining.notify", "0a0b0c0d"]], "0a0b0c0d", 4]}));
+        pool.send(json!({"id": 2, "error": null, "result": true}));
+        std::thread::sleep(Duration::from_millis(100));
+        let mut waits = Vec::new();
+        for i in 0..10u32 {
+            // Out of step with any read timeout.
+            std::thread::sleep(Duration::from_millis(37));
+            let found = Instant::now();
+            shared.submit(FoundShare {
+                job_id: "j".into(),
+                extranonce2: i.to_be_bytes().to_vec(),
+                ntime: NTIME,
+                nonce: i,
+                hash_display: String::new(),
+                is_block_candidate: false,
+            });
+            let m = loop {
+                if let Some(m) = pool.next() {
+                    break m;
+                }
+            };
+            assert_eq!((m["method"].as_str(), m["params"][4].as_str()), (Some("mining.submit"), Some(&*format!("{i:08x}"))));
+            waits.push(found.elapsed());
+        }
+        drop(pool);
+        assert!(miner.join().unwrap().is_err());
+        waits.sort_unstable();
+        assert!(waits[5] < Duration::from_millis(40), "a share waited {:?} (median) to be sent: {waits:?}", waits[5]);
     }
 
     /// The fork over a real connection, as the pool runs it: a SHA3-256t
