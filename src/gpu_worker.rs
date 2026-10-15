@@ -1457,6 +1457,211 @@ mod tests {
         );
     }
 
+    /// A real card under a test: moves the job on after `after` launches
+    /// came back (0: never), as a new job from the pool would, and notes
+    /// when launches were queued and came back, and the kernel's own hits.
+    #[cfg(feature = "cuda")]
+    struct OnCard<'a> {
+        card: &'a mut dyn MiningBackend,
+        shared: &'a Shared,
+        after: usize,
+        enqueued: Vec<Instant>,
+        collected: Vec<(Instant, Duration)>,
+        raw_hits: Vec<u32>,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl<'a> OnCard<'a> {
+        fn new(card: &'a mut dyn MiningBackend, shared: &'a Shared, after: usize) -> Self {
+            Self { card, shared, after, enqueued: vec![], collected: vec![], raw_hits: vec![] }
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    impl MiningBackend for OnCard<'_> {
+        fn name(&self) -> String {
+            self.card.name()
+        }
+        fn supports(&self, algo: PowAlgo) -> bool {
+            self.card.supports(algo)
+        }
+        fn bc3hash_window(&self) -> Option<u32> {
+            self.card.bc3hash_window()
+        }
+        fn launch_granule(&self, algo: PowAlgo) -> u32 {
+            self.card.launch_granule(algo)
+        }
+        fn enqueue(&mut self, l: &Launch) -> Result<(), String> {
+            self.enqueued.push(Instant::now());
+            self.card.enqueue(l)
+        }
+        fn collect(&mut self) -> Result<Scan, String> {
+            let scan = self.card.collect()?;
+            self.collected.push((Instant::now(), scan.busy.unwrap_or_default()));
+            self.raw_hits.extend(&scan.hits);
+            if self.collected.len() == self.after {
+                self.shared.generation.fetch_add(1, Ordering::Release);
+            }
+            Ok(scan)
+        }
+        fn in_flight(&self) -> usize {
+            self.card.in_flight()
+        }
+        fn abandon(&mut self) {
+            self.card.abandon()
+        }
+    }
+
+    /// The real worker loop on the card, at window 16, through the launch
+    /// queue and the autotune: its shares - and the kernel's own hits before
+    /// the CPU re-check - are exactly the CPU reference's hits over the
+    /// nonces the card covered. None missed, none extra, none twice, in the
+    /// worker's own extranonce2.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs an NVIDIA GPU (run inside a --gpus all container)"]
+    fn cuda_worker_shares_are_the_cpus_hits() {
+        let mut card = crate::backend::cuda::CudaBackend::new(0).expect("CUDA backend");
+        card.prepare_bc3hash(START_WINDOW).expect("window 16 passes the self-test");
+        // One hash in 4096 is a share.
+        let mut target = [0xffu8; 32];
+        target[0] = 0;
+        target[1] = 0x0f;
+        let j = job(target);
+        let (shared, rx, generation) = shared_with_job(&j);
+        // Worker 3 of 7: its extranonce2 is 3.
+        let mut w = Worker::new(&shared, 0, 3, 7);
+        let verify = PowAlgo::Bc3Hash.hash_fn().expect("BC3Hash");
+        let mut on_card = OnCard::new(&mut card, &shared, 6);
+        assert_eq!(w.mine_job(&mut on_card, &j, generation, PowAlgo::Bc3Hash, verify), JobEnd::Changed);
+        let mut raw = std::mem::take(&mut on_card.raw_hits);
+        let launches = on_card.collected.len();
+        assert_eq!(w.cursor.en2, 3, "the card left its extranonce2");
+        let end = w.cursor.nonce;
+        let en2 = crate::worker::encode_extranonce2(3, 4);
+        let mut gpu: Vec<u32> = rx
+            .try_iter()
+            .map(|s| {
+                assert_eq!((s.extranonce2.as_slice(), s.job_id.as_str()), (en2.as_slice(), "j"));
+                s.nonce
+            })
+            .collect();
+        gpu.sort_unstable();
+        raw.sort_unstable();
+
+        let header = en2_header(&j, 3).header.serialize();
+        let t0 = Instant::now();
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as u32;
+        let mut cpu: Vec<u32> = std::thread::scope(|s| {
+            let parts: Vec<_> = (0..threads)
+                .map(|t| {
+                    s.spawn(move || {
+                        let mut h = header;
+                        (t..end)
+                            .step_by(threads as usize)
+                            .filter(|&n| {
+                                h[76..80].copy_from_slice(&n.to_le_bytes());
+                                hash_meets_target(&::bc3hash::bc3hash(&h), &target)
+                            })
+                            .collect::<Vec<u32>>()
+                    })
+                })
+                .collect();
+            parts.into_iter().flat_map(|p| p.join().unwrap()).collect()
+        });
+        cpu.sort_unstable();
+        println!(
+            "{} launches, nonces 0..{end} of extranonce2 3: {} shares, {} kernel hits, {} CPU hits \
+             ({:.1} s on {threads} CPU threads)",
+            launches,
+            gpu.len(),
+            raw.len(),
+            cpu.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        assert!(cpu.len() >= 20, "too few hits to mean anything");
+        assert_eq!(raw, cpu, "the kernel's hits are not the CPU's");
+        assert_eq!(gpu, cpu, "the shares are not the CPU's hits");
+    }
+
+    /// How long a card goes on hashing a job after the pool has moved on -
+    /// the rest of the launch running at the change and all of the one
+    /// queued behind it - and how long it then waits for the new job's first
+    /// launch. When the change is a new block, the first is hashing for a
+    /// tip that is gone.
+    ///     cargo test --release -- --ignored cuda_job_change_latency --nocapture
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs an NVIDIA GPU - measurement, run with --nocapture"]
+    fn cuda_job_change_latency() {
+        const CHANGES: usize = 12;
+        let mut card = crate::backend::cuda::CudaBackend::new(0).expect("CUDA backend");
+        card.prepare_bc3hash(START_WINDOW).expect("window 16 passes the self-test");
+        let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let shared = Arc::new(Shared::new(tx, MiningPlan { gpus: 1, ..Default::default() }));
+        let jobs: Vec<MinerJob> = (0..=CHANGES)
+            .map(|k| MinerJob { job_id: format!("{k}"), ntime: 1_700_000_000 + k as u32, ..job([0; 32]) })
+            .collect();
+        shared.publish_job(jobs[0].clone());
+        let notifier = {
+            let (shared, jobs) = (shared.clone(), jobs.clone());
+            std::thread::spawn(move || {
+                // Long enough for the launch size to settle.
+                std::thread::sleep(Duration::from_secs(8));
+                let mut seed = 0x2545_f491_4f6c_dd1du64;
+                let mut at = Vec::new();
+                for j in &jobs[1..] {
+                    // 1.5 to 3.5 s apart: at no particular point of a launch.
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    std::thread::sleep(Duration::from_millis(1500 + seed % 2000));
+                    at.push(Instant::now());
+                    shared.publish_job(j.clone());
+                }
+                at
+            })
+        };
+        let verify = PowAlgo::Bc3Hash.hash_fn().expect("BC3Hash");
+        let mut w = Worker::new(&shared, 0, 0, 1);
+        let mut on_card = OnCard::new(&mut card, &shared, 0);
+        // Per run: when it returned, and the gap before its first launch.
+        let mut returned = Vec::new();
+        let mut gaps = Vec::new();
+        for _ in 0..CHANGES {
+            let (generation, j) = shared.wait_for_job();
+            let (last_back, first) = (on_card.collected.last().map(|c| c.0), on_card.enqueued.len());
+            w.mine_job(&mut on_card, &j, generation, PowAlgo::Bc3Hash, verify);
+            returned.push(Instant::now());
+            if let Some(back) = last_back {
+                gaps.push(on_card.enqueued[first].duration_since(back));
+            }
+        }
+        let notified = notifier.join().unwrap();
+        // The launch length the autotune settled at: the median of the
+        // launches since the first change.
+        let mut busy: Vec<Duration> =
+            on_card.collected.iter().filter(|c| c.0 > notified[0]).map(|c| c.1).collect();
+        busy.sort_unstable();
+        let launch = busy[busy.len() / 2];
+        let stale: Vec<Duration> = returned.iter().zip(&notified).map(|(r, n)| r.duration_since(*n)).collect();
+        let ms = |d: &Duration| d.as_secs_f64() * 1e3;
+        println!("{}: launches of {:.0} ms (median)", on_card.name(), ms(&launch));
+        for (k, s) in stale.iter().enumerate() {
+            println!("  change {k:>2}: the old job hashed {:>4.0} ms on ({:.2} launches)", ms(s), ms(s) / ms(&launch));
+        }
+        let mean = |v: &[Duration]| v.iter().map(ms).sum::<f64>() / v.len() as f64;
+        println!(
+            "mean: {:.0} ms of the old job after the change ({:.2} launches); {:.2} ms from the last launch \
+             of a job back to the next one queued (max {:.2})",
+            mean(&stale),
+            mean(&stale) / ms(&launch),
+            mean(&gaps),
+            gaps.iter().map(ms).fold(0.0, f64::max)
+        );
+        assert!(stale.iter().all(|s| ms(s) < 2.2 * ms(&launch) + 50.0), "more than two launches after a change");
+    }
+
     /// A job whose extranonce2 space this worker has used up is not ground
     /// on through wrapped values.
     #[test]
