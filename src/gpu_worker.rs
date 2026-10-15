@@ -394,9 +394,7 @@ pub fn run_gpu_worker(
                         return;
                     }
                 }
-                // A new context means a new search space position is fine, and
-                // the job may well have moved on while we waited.
-                w.prev = None;
+                w.reopened();
             }
         }
     }
@@ -544,6 +542,20 @@ impl<'a> Worker<'a> {
             last_collect: None,
             tune: Tune::new(shared, slot),
         }
+    }
+
+    /// The device was opened again after `JobEnd::DeviceGone`. A new context
+    /// changes nothing about where this card is in the search space: the
+    /// cursor already points at the oldest launch that never came back
+    /// (`device_error`), and a job that moved on meanwhile starts the cursor
+    /// over anyway (`mine_job`). This used to forget the job, which sent a
+    /// card that came back to the same job - a pool sends one every 20 s,
+    /// and the failures and the reopen take 9 s - back to nonce 0 of its
+    /// extranonce2: everything it had hashed of the job was hashed again,
+    /// and every share found there was a duplicate.
+    fn reopened(&mut self) {
+        self.errors = 0;
+        self.last_collect = None;
     }
 
     /// Grind `job` until it changes, its extranonce2 space runs out, or the
@@ -1240,6 +1252,28 @@ mod tests {
         assert_eq!(w.cursor, Cursor { en2: 0, nonce: 0 }, "nothing was done, nothing skipped");
         // Nothing came back, so nothing may reset the reopen budget.
         assert_eq!(w.collected, 0);
+    }
+
+    /// A card that stopped answering and was opened again goes on with the
+    /// job it had - the pool's next job is often the same header space -
+    /// where its last launch failed, not from nonce 0 of its extranonce2:
+    /// that was hashed already, and every share in it would be a duplicate.
+    #[test]
+    fn a_reopened_card_picks_its_job_up_where_it_failed() {
+        let j = job([0xff; 32]);
+        let (shared, _rx, generation) = shared_with_job(&j);
+        let mut w = Worker::new(&shared, 0, 2, 5);
+        let mut backend = Scripted::new(&shared, vec![], None, 4);
+        w.mine_job(&mut backend, &j, generation, PowAlgo::Bc3Hash, check_fn());
+        let hashed_to = w.cursor;
+        assert_eq!(hashed_to, Cursor { en2: 2, nonce: backend.log.iter().map(|l| l.1).sum() });
+        // The card stops answering, and no new job comes meanwhile.
+        let generation = shared.generation.load(Ordering::Acquire);
+        assert_eq!(w.mine_job(&mut Broken, &j, generation, PowAlgo::Bc3Hash, check_fn()), JobEnd::DeviceGone);
+        w.reopened();
+        let mut backend = Scripted::new(&shared, vec![], None, 2);
+        w.mine_job(&mut backend, &j, generation, PowAlgo::Bc3Hash, check_fn());
+        assert_eq!(backend.log[0].0, hashed_to.nonce, "the reopened card started over");
     }
 
     thread_local! {
