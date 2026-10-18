@@ -47,13 +47,17 @@ impl ShareRate {
     }
 }
 
-pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64) {
+pub fn run_reporter(shared: Arc<Shared>, interval_secs: u64, nvidia: bool) {
     let mut last_hashes = 0u64;
     let mut last_gpu = 0u64;
     let mut last_cpu = 0u64;
     let mut last_t = Instant::now();
     let mut share_rate = ShareRate::new(last_t, shared.stats.accepted.load(Ordering::Relaxed));
-    let telemetry = crate::telemetry::Telemetry::open();
+    let telemetry = if nvidia {
+        crate::telemetry::Telemetry::open()
+    } else {
+        crate::telemetry::Telemetry::without_gpu()
+    };
     let mut next_gpu_report = Instant::now() + GPU_REPORT_FIRST;
     loop {
         std::thread::sleep(Duration::from_secs(interval_secs));

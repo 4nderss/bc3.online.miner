@@ -79,6 +79,18 @@ impl Telemetry {
         Self {}
     }
 
+    /// Without NVML, for a run where no NVIDIA card mines: there is no GPU
+    /// reading to show, and loading nvml.dll anyway ran the driver's code on
+    /// the stats thread of every CPU-only run - code a crash in cannot be
+    /// caught (catch_unwind stops panics, not access violations). The CPU
+    /// temperature is read as before.
+    pub fn without_gpu() -> Self {
+        #[cfg(feature = "cuda")]
+        return Self { nvml: None };
+        #[cfg(not(feature = "cuda"))]
+        Self {}
+    }
+
     /// The NVIDIA driver's version, where NVML is there to tell: for the
     /// benchmark's report, and what a tuned window is remembered by.
     pub fn driver_version(&self) -> Option<String> {
@@ -316,6 +328,18 @@ mod tests {
         let _ = (r.gpu_temp_c, r.cpu_temp_c, r.gpu_power_w, r.gpu_fan_pct);
         // Nor the report, which is simply empty there.
         let _ = t.gpu_reports();
+    }
+
+    /// A run without an NVIDIA card never loads NVML, even on a machine that
+    /// has the driver: no GPU readings, no card reports.
+    #[test]
+    fn telemetry_without_a_gpu_reads_no_gpu() {
+        let t = Telemetry::without_gpu();
+        let r = t.read(0);
+        assert_eq!((r.gpu_temp_c, r.gpu_fan_pct, r.gpu_power_w), (None, None, None));
+        assert!(t.gpu_reports().is_empty());
+        #[cfg(feature = "cuda")]
+        assert!(t.nvml.is_none());
     }
 
     /// What the log says about each card, from the real driver.
