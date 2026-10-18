@@ -10,6 +10,7 @@ mod backend;
 #[cfg(feature = "internal-tools")]
 mod bench;
 mod consensus;
+mod crash;
 mod gpu_worker;
 #[cfg(feature = "internal-tools")]
 mod internal;
@@ -186,6 +187,9 @@ fn harden_dll_search_path() {
 fn harden_dll_search_path() {}
 
 fn main() {
+    // First: a crash anywhere after this - our code, the node's C++, a
+    // driver library - says where on stderr (see crash.rs).
+    crash::install();
     harden_dll_search_path();
     normalise_env();
     let args = Args::parse();
@@ -386,6 +390,9 @@ fn main() {
     // Taken before the workers own the devices: see stratum::suggested_difficulty.
     let suggest_difficulty =
         stratum::suggested_difficulty(gpus.iter().filter(|g| g.is_cuda()).count(), args.intensity);
+    // The stats thread loads NVML only when an NVIDIA card mines: see
+    // Telemetry::without_gpu.
+    let nvidia = gpus.iter().any(|g| g.is_cuda());
     for (g, gpu) in gpus.into_iter().enumerate() {
         let s = shared.clone();
         std::thread::Builder::new()
@@ -396,7 +403,7 @@ fn main() {
     if !offline {
         let s = shared.clone();
         let interval = args.stats_interval;
-        std::thread::spawn(move || stats::run_reporter(s, interval));
+        std::thread::spawn(move || stats::run_reporter(s, interval, nvidia));
     }
 
     // Watchdog: a run where every GPU worker has stopped and the CPU does not
