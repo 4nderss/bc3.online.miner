@@ -515,6 +515,12 @@ listen("miner-event", ({ payload: ev }) => {
       sparkAlgo = ev.algo;
       break;
     }
+    // What the miner is doing that is neither an error nor a status: a card
+    // loading its kernel, its first launch. Before these, a card that never
+    // started mining left nothing in the log at all.
+    case "log":
+      log(ev.message);
+      break;
     case "status":
       if (ev.state === "mining") setStatus("mining", "Mining");
       else if (ev.state === "connecting") setStatus("connecting", "Connecting");

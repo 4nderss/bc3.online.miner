@@ -38,6 +38,10 @@ pub enum Event {
         state: StatusState,
         message: String,
     },
+    /// A line about what the miner is doing - a GPU loading its kernel, its
+    /// first launch - that the human output prints and the GUI puts in its
+    /// Activity log. Errors go to stderr instead. See `note!`.
+    Log { message: String },
     /// Periodic statistics (same cadence as the text output).
     Stats {
         hashrate: f64,
@@ -130,6 +134,22 @@ macro_rules! human {
             println!($($arg)*);
         }
     };
+}
+
+/// Like `human!`, for what the GUI should show too: with `--json` the line
+/// goes out as a `log` event. The GPU's stages used to be `human!` only, so
+/// a GUI user whose card never started mining (issue #1) saw nothing at all
+/// between the start and 0 H/s - not the card, not its kernel loading.
+#[macro_export]
+macro_rules! note {
+    ($($arg:tt)*) => {{
+        let message = format!($($arg)*);
+        if $crate::ipc::json_mode() {
+            $crate::ipc::emit(&$crate::ipc::Event::Log { message });
+        } else {
+            println!("{message}");
+        }
+    }};
 }
 
 #[cfg(test)]
