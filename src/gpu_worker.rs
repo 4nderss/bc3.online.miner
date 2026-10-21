@@ -274,7 +274,7 @@ pub fn run_gpu_worker(
             return;
         }
     };
-    crate::human!("[gpu] started: {}", backend.name());
+    crate::note!("[gpu] started: {}", backend.name());
 
     // What this card can mine, as far as anyone can tell before trying. A
     // kernel that later fails its self-test withdraws its claim; dropping
@@ -282,7 +282,7 @@ pub fn run_gpu_worker(
     // stand-in CPU threads mining meanwhile slow the table build and the
     // self-test down more than they mine - window 16 took 11.2 s to get
     // ready instead of 4.6 with twenty of them busy beside it.
-    let mut caps = GpuCapability::new(&shared);
+    let mut caps = GpuCapability::new(&shared, slot);
     let claim = |caps: &mut GpuCapability, backend: &dyn MiningBackend| {
         for algo in PowAlgo::ALL {
             caps.set(algo, backend.has_kernel(algo) && crate::worker::cpu_may_support(algo));
@@ -474,6 +474,9 @@ struct Worker<'a> {
     last_collect: Option<Instant>,
     /// The BC3Hash window tuning of this card.
     tune: Tune,
+    /// Whether the first launch since the device was opened has been
+    /// reported - the line that says the card really hashes.
+    said_hashing: bool,
 }
 
 /// The header of one extranonce2, built once and used by all its launches.
@@ -541,6 +544,7 @@ impl<'a> Worker<'a> {
             collected: 0,
             last_collect: None,
             tune: Tune::new(shared, slot),
+            said_hashing: false,
         }
     }
 
@@ -555,6 +559,7 @@ impl<'a> Worker<'a> {
     /// and every share found there was a duplicate.
     fn reopened(&mut self) {
         self.errors = 0;
+        self.said_hashing = false;
         self.last_collect = None;
     }
 
@@ -626,7 +631,16 @@ impl<'a> Worker<'a> {
                     return gone;
                 }
             }
+            let count = done.count;
             let elapsed = self.finish(run, done, scan);
+            if !self.said_hashing {
+                self.said_hashing = true;
+                crate::note!(
+                    "[gpu] {}: hashing - its first launch, {count} nonces, took {:.0} ms",
+                    backend.name(),
+                    elapsed.as_secs_f64() * 1e3
+                );
+            }
             // Intensity < 100 % -> idle proportionally (keeps heat down and
             // the machine usable while mining).
             self.shared.throttle(elapsed);
@@ -889,13 +903,22 @@ fn prepare_bc3(
     let result = if let Some(why) = crate::worker::cpu_unavailable(PowAlgo::Bc3Hash, true) {
         Err(format!("no CPU reference to check it against: {why}"))
     } else {
+        crate::note!(
+            "[gpu] {}: loading the BC3Hash kernel, window {want}{}",
+            backend.name(),
+            if backend.compiles_kernel_at_load() {
+                " - the driver compiles it now, which can take a minute or more"
+            } else {
+                ""
+            }
+        );
         backend.prepare_bc3hash(want)
     };
     match result {
         Ok(took) => {
             *failed = None;
             shared.gpu_slot_bc3[slot].store(want, Ordering::Relaxed);
-            crate::human!(
+            crate::note!(
                 "[gpu] {}: BC3Hash kernel ready - window {want}, self-test passed ({:.1} s)",
                 backend.name(),
                 took.as_secs_f64()
@@ -928,7 +951,7 @@ fn prepare_bc3(
 mod tests {
     use super::*;
     use crate::backend::QUEUE_DEPTH;
-    use crate::shared::{MiningPlan, SUBMIT_QUEUE};
+    use crate::shared::{GpuStall, MiningPlan, SUBMIT_QUEUE};
     use std::collections::HashSet;
 
     /// Launches taken from a cursor tile this worker's space exactly: no
@@ -1742,7 +1765,7 @@ mod tests {
         };
         let shared = Arc::new(Shared::new(tx, plan));
         // What run_gpu_worker claims when the card opens.
-        let mut caps = GpuCapability::new(&shared);
+        let mut caps = GpuCapability::new(&shared, 0);
         caps.set(PowAlgo::Bc3Hash, true);
         shared.gpu_opened();
         let s = shared.clone();
@@ -1770,6 +1793,55 @@ mod tests {
         // The next job looks again and finds the same failure: no claim.
         prepare_bc3(&shared, &mut NoBc3, 0, &mut caps, &mut failed, shared.bc3_window());
         assert!(!shared.gpus_mine(PowAlgo::Bc3Hash));
+        shared.clear_job();
+    }
+
+    /// A card that holds BC3Hash and never finishes a launch - its worker
+    /// stuck in a driver call, alive, keeping its claim - is what the
+    /// self-test cannot catch: issue #1, 0 H/s for good. The stall check
+    /// sets its claim aside, the stand-in CPU mines, and the card gets the
+    /// job back as soon as a launch of its comes back.
+    #[cfg(feature = "bc3hash")]
+    #[test]
+    fn a_card_that_stops_answering_hands_the_pow_to_the_cpu_until_it_hashes() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let plan = MiningPlan {
+            gpus: 1,
+            cpu_threads: 0,
+            cpu_fallback_threads: 1,
+            gpu_kernel: [false, false, true],
+        };
+        let shared = Arc::new(Shared::new(tx, plan));
+        let mut caps = GpuCapability::new(&shared, 0);
+        caps.set(PowAlgo::Bc3Hash, true);
+        shared.gpu_opened();
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            crate::worker::run_worker(s, 1, 2, crate::worker::CpuRole::GpuFallback)
+        });
+        let mut fork = job([0xff; 32]);
+        fork.version = 0x2000_0800;
+        shared.publish_job(fork);
+        std::thread::sleep(Duration::from_millis(300));
+        // Not yet: 300 ms is no stall at a limit of a minute.
+        assert!(shared.check_gpu_stalls(shared.now_us(), 60_000_000).is_empty());
+        assert!(rx.try_recv().is_err(), "the stand-in mined what the card holds");
+
+        // At a limit of 100 ms the card, silent for 300, has stalled.
+        let changes = shared.check_gpu_stalls(shared.now_us(), 100_000);
+        assert!(matches!(changes[..], [GpuStall::Stalled { slot: 0, .. }]), "{changes:?}");
+        assert!(!shared.gpus_mine(PowAlgo::Bc3Hash));
+        let share = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the stand-in did not take over from the stalled card");
+        assert_eq!(share.job_id, "j");
+        // Said once, not every check.
+        assert!(shared.check_gpu_stalls(shared.now_us(), 100_000).is_empty());
+
+        // A launch comes back: the card holds BC3Hash again.
+        shared.gpu_slot_stamp[0].store(shared.now_us(), Ordering::Relaxed);
+        assert_eq!(shared.check_gpu_stalls(shared.now_us(), 100_000), vec![GpuStall::Resumed { slot: 0 }]);
+        assert!(shared.gpus_mine(PowAlgo::Bc3Hash));
         shared.clear_job();
     }
 }

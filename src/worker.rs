@@ -444,7 +444,7 @@ mod tests {
         };
         let shared = Arc::new(Shared::new(tx, plan));
         // The card claims BC3Hash when it opens: the stand-in leaves it alone...
-        let mut gpu = crate::shared::GpuCapability::new(&shared);
+        let mut gpu = crate::shared::GpuCapability::new(&shared, 0);
         gpu.set(PowAlgo::Bc3Hash, true);
         shared.publish_job(easy_job("gpu", PowAlgo::Bc3Hash));
         let s = shared.clone();

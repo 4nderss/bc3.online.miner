@@ -536,6 +536,10 @@ impl MiningBackend for OpenClBackend {
         self.bc3.as_ref().map(|k| k.window)
     }
 
+    fn compiles_kernel_at_load(&self) -> bool {
+        true
+    }
+
     fn enqueue(&mut self, l: &Launch) -> Result<(), String> {
         if l.count == 0 {
             return Err("a launch of 0 nonces".into());

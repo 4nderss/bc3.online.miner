@@ -393,6 +393,8 @@ fn main() {
     // The stats thread loads NVML only when an NVIDIA card mines: see
     // Telemetry::without_gpu.
     let nvidia = gpus.iter().any(|g| g.is_cuda());
+    // For the stall guard's messages, by slot: the workers own the devices.
+    let gpu_names: Vec<String> = gpus.iter().map(|g| g.describe()).collect();
     for (g, gpu) in gpus.into_iter().enumerate() {
         let s = shared.clone();
         std::thread::Builder::new()
@@ -440,12 +442,51 @@ fn main() {
         });
     }
 
+    // Stall guard: a GPU that holds the PoW and finishes nothing gives it to
+    // the stand-in CPU threads until it hashes again (see
+    // Shared::check_gpu_stalls) - and says so on stderr, which the GUI shows
+    // in its Activity log.
+    if plan.gpus > 0 {
+        let s = shared.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            for change in s.check_gpu_stalls(s.now_us(), shared::GPU_STALL_SECS * 1_000_000) {
+                let algo = s.current_algo();
+                let cpu = algo.is_some_and(|a| s.devices_for(a).cpu);
+                let name = algo.map(|a| a.name()).unwrap_or("the job");
+                eprintln!("{}", stall_message(change, &gpu_names, name, cpu));
+            }
+        });
+    }
+
     #[cfg(feature = "internal-tools")]
     if offline {
         std::process::exit(args.internal.run(shared, submit_rx, devices));
     }
 
     stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user, suggest_difficulty });
+}
+
+/// What the user reads when the stall guard sets a GPU aside or takes it back.
+/// `cpu`: whether CPU threads mine `algo` while the card does not.
+fn stall_message(change: shared::GpuStall, names: &[String], algo: &str, cpu: bool) -> String {
+    let card = |slot: usize| names.get(slot).cloned().unwrap_or_else(|| format!("GPU {slot}"));
+    match change {
+        shared::GpuStall::Stalled { slot, idle_secs } => format!(
+            "[gpu] {}: no launch finished in {idle_secs} s - its kernel is still loading, or the card \
+             or its driver stopped answering. {} It takes {algo} back as soon as a launch finishes. \
+             If this keeps happening, report it with this log.",
+            card(slot),
+            if cpu {
+                format!("The CPU mines {algo} meanwhile.")
+            } else {
+                "No CPU threads stand in for it (they do in --backend auto).".to_string()
+            }
+        ),
+        shared::GpuStall::Resumed { slot } => {
+            format!("[gpu] {}: a launch finished again - it mines {algo} again.", card(slot))
+        }
+    }
 }
 
 /// How many CPU threads to start, and what they mine.

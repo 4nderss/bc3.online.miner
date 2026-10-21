@@ -186,6 +186,21 @@ pub struct Shared {
     /// worker's backend has a kernel for it, lowered when that kernel fails
     /// its self-test or the worker stops. The stand-in CPU threads go by it.
     gpu_capable: [AtomicU32; 3],
+    /// Per GPU slot: the PoWs its worker claims, a bit per `PowAlgo::index` -
+    /// `gpu_capable` card by card, so the stall check knows whose claim to
+    /// set aside.
+    gpu_slot_claims: Vec<AtomicU32>,
+    /// Per GPU slot: when it last raised a claim, in microseconds since
+    /// `started`. A card that has only just claimed has not stalled.
+    gpu_slot_claimed_at: Vec<AtomicU64>,
+    /// Per GPU slot: when the stall check set its claims aside, in
+    /// microseconds since `started`; 0 while it hashes. See
+    /// `check_gpu_stalls`.
+    gpu_slot_stalled: Vec<AtomicU64>,
+    /// When the current run of jobs began, in microseconds since `started`:
+    /// the first job after none. Time without a job - the pool away - is no
+    /// card's fault.
+    job_since: AtomicU64,
     /// GPU workers past opening their backend, whether that worked or not.
     /// Until all are, a PoW the GPUs have a kernel for but do not take yet
     /// is still starting up - not failed.
@@ -225,12 +240,14 @@ pub const BC3_SLOT_FAILED: u32 = 1;
 /// every exit path, like `GpuWorkerAlive`.
 pub struct GpuCapability {
     shared: std::sync::Arc<Shared>,
+    /// The GPU's slot in the detected list.
+    slot: usize,
     held: [bool; 3],
 }
 
 impl GpuCapability {
-    pub fn new(shared: &std::sync::Arc<Shared>) -> Self {
-        Self { shared: shared.clone(), held: [false; 3] }
+    pub fn new(shared: &std::sync::Arc<Shared>, slot: usize) -> Self {
+        Self { shared: shared.clone(), slot, held: [false; 3] }
     }
 
     /// Claim or release `algo`; tells the user where the current PoW is
@@ -241,13 +258,41 @@ impl GpuCapability {
             return;
         }
         self.held[i] = capable;
-        if capable {
-            self.shared.gpu_capable[i].fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.shared.gpu_capable[i].fetch_sub(1, Ordering::Relaxed);
+        let s = &self.shared;
+        if let Some(claims) = s.gpu_slot_claims.get(self.slot) {
+            if capable {
+                s.gpu_slot_claimed_at[self.slot].store(s.now_us(), Ordering::Relaxed);
+                claims.fetch_or(1 << i, Ordering::Relaxed);
+            } else {
+                claims.fetch_and(!(1 << i), Ordering::Relaxed);
+            }
         }
-        self.shared.capability_changed(algo);
+        if capable {
+            s.gpu_capable[i].fetch_add(1, Ordering::Relaxed);
+        } else {
+            s.gpu_capable[i].fetch_sub(1, Ordering::Relaxed);
+        }
+        s.capability_changed(algo);
     }
+}
+
+/// How long a GPU that holds the current PoW may go without finishing a
+/// launch before the stand-in CPU threads mine it in its place. Launches take
+/// 400 ms and a driver reset (TDR) clears in seconds; the slowest thing a
+/// healthy card does without hashing is load its kernel, where the driver
+/// JITs the PTX for a card this build has no machine code for: 20-60 s.
+/// Reported on a Radeon RX 6700 XT and 6800 under Windows (OpenCL, issue
+/// #1): the miner sat at 0 H/s for good, the card holding the job, the CPU
+/// idle, and nothing said.
+pub const GPU_STALL_SECS: u64 = 90;
+
+/// What `Shared::check_gpu_stalls` found for one GPU slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuStall {
+    /// Nothing finished for `idle_secs`: its claims are set aside.
+    Stalled { slot: usize, idle_secs: u64 },
+    /// It finished a launch again and holds its claims as before.
+    Resumed { slot: usize },
 }
 
 impl Drop for GpuCapability {
@@ -384,6 +429,10 @@ impl Shared {
             plan,
             pow: Mutex::new(PowState::default()),
             gpu_capable: Default::default(),
+            gpu_slot_claims: (0..plan.gpus).map(|_| AtomicU32::new(0)).collect(),
+            gpu_slot_claimed_at: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
+            gpu_slot_stalled: (0..plan.gpus).map(|_| AtomicU64::new(0)).collect(),
+            job_since: AtomicU64::new(0),
             gpus_opened: AtomicU32::new(0),
             bc3_window: AtomicU32::new(DEFAULT_BC3_WINDOW),
             bc3_window_set: AtomicBool::new(false),
@@ -400,7 +449,76 @@ impl Shared {
     /// or the worker stops; a GPU that dies outright is the watchdog's
     /// business in main, not a reason to move its work to the CPU.
     pub fn gpus_mine(&self, algo: PowAlgo) -> bool {
-        self.gpu_capable[algo.index()].load(Ordering::Relaxed) > 0
+        let i = algo.index();
+        self.gpu_capable[i].load(Ordering::Relaxed) > self.stalled_claims(i)
+    }
+
+    /// Claims on the PoW with index `i` held by GPUs the stall check has set
+    /// aside: they count for nothing until the card hashes again.
+    fn stalled_claims(&self, i: usize) -> u32 {
+        self.gpu_slot_stalled
+            .iter()
+            .zip(&self.gpu_slot_claims)
+            .filter(|(stalled, claims)| {
+                stalled.load(Ordering::Relaxed) != 0 && claims.load(Ordering::Relaxed) & (1 << i) != 0
+            })
+            .count() as u32
+    }
+
+    /// Microseconds since `started`, the clock of the per-slot stamps.
+    pub fn now_us(&self) -> u64 {
+        self.started.elapsed().as_micros() as u64
+    }
+
+    /// Set aside the claims of every GPU that holds the current PoW and has
+    /// finished no launch for `limit_us`, so the stand-in CPU threads mine it
+    /// instead - and restore them for a card that has finished one since.
+    /// Called every few seconds (main); `now_us` on the clock of `now_us()`.
+    ///
+    /// The watchdog in main only sees a GPU worker that has stopped. A worker
+    /// waiting on a driver that never answers - a kernel compile that does
+    /// not end, a launch that never comes back - is alive, keeps its claim,
+    /// and keeps the CPU from mining: 0 H/s, and nothing said. Measured from
+    /// the latest of the card's last launch, its claim and the start of the
+    /// current run of jobs, so neither a card loading its kernel nor a pool
+    /// that was away counts against it.
+    pub fn check_gpu_stalls(&self, now_us: u64, limit_us: u64) -> Vec<GpuStall> {
+        let mut changes = Vec::new();
+        let algo = self.current_algo();
+        let has_job = self.job.lock().unwrap().is_some();
+        let job_since = self.job_since.load(Ordering::Relaxed);
+        for slot in 0..self.gpu_slot_stalled.len() {
+            let claims = self.gpu_slot_claims[slot].load(Ordering::Relaxed);
+            let stamp = self.gpu_slot_stamp[slot].load(Ordering::Relaxed);
+            let stalled = &self.gpu_slot_stalled[slot];
+            let since = stalled.load(Ordering::Relaxed);
+            if since != 0 {
+                // A launch finished after it was set aside, or it holds
+                // nothing to set aside any more.
+                if stamp > since || claims == 0 {
+                    stalled.store(0, Ordering::Relaxed);
+                    if claims != 0 {
+                        changes.push(GpuStall::Resumed { slot });
+                    }
+                }
+                continue;
+            }
+            let Some(algo) = algo else { continue };
+            if !has_job || claims & (1 << algo.index()) == 0 {
+                continue;
+            }
+            let last = stamp.max(self.gpu_slot_claimed_at[slot].load(Ordering::Relaxed)).max(job_since);
+            if now_us.saturating_sub(last) > limit_us {
+                stalled.store(now_us.max(1), Ordering::Relaxed);
+                changes.push(GpuStall::Stalled { slot, idle_secs: (now_us - last) / 1_000_000 });
+            }
+        }
+        if !changes.is_empty() {
+            if let Some(algo) = algo {
+                self.capability_changed(algo);
+            }
+        }
+        changes
     }
 
     pub fn devices_for(&self, algo: PowAlgo) -> PowDevices {
@@ -602,6 +720,9 @@ impl Shared {
             // which checks the generation under the same lock, cannot see the
             // old generation and then sleep through this notify.
             let mut slot = self.job.lock().unwrap();
+            if slot.is_none() {
+                self.job_since.store(self.now_us(), Ordering::Relaxed);
+            }
             *slot = Some(job);
             self.generation.fetch_add(1, Ordering::Release);
         }
@@ -867,8 +988,8 @@ mod tests {
     fn gpu_capability_comes_and_goes() {
         let s = Arc::new(shared());
         assert!(!s.gpus_mine(PowAlgo::Bc3Hash));
-        let mut a = GpuCapability::new(&s);
-        let mut b = GpuCapability::new(&s);
+        let mut a = GpuCapability::new(&s, 0);
+        let mut b = GpuCapability::new(&s, 1);
         a.set(PowAlgo::Bc3Hash, true);
         a.set(PowAlgo::Bc3Hash, true); // idempotent
         b.set(PowAlgo::Bc3Hash, true);
@@ -884,6 +1005,63 @@ mod tests {
             s.set_bc3_window(12);
             assert_eq!(s.bc3_window(), 12);
         }
+    }
+
+    /// The stall check, card by card, on its own clock: a card is set aside
+    /// only while it holds the current PoW, a job exists, and nothing of it -
+    /// a launch, its claim, the start of the jobs - is newer than the limit.
+    #[test]
+    fn a_silent_card_is_set_aside_and_taken_back_card_by_card() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
+        let plan = MiningPlan { gpus: 2, cpu_threads: 0, cpu_fallback_threads: 1, gpu_kernel: [false, false, true] };
+        let s = Arc::new(Shared::new(tx, plan));
+        let sec = 1_000_000u64;
+        let limit = 90 * sec;
+        let mut a = GpuCapability::new(&s, 0);
+        let mut b = GpuCapability::new(&s, 1);
+        a.set(PowAlgo::Bc3Hash, true);
+        b.set(PowAlgo::Bc3Hash, true);
+        // No job yet: nobody can be blamed for hashing nothing.
+        assert!(s.check_gpu_stalls(1000 * sec, limit).is_empty());
+        let mut j = a_job();
+        j.algo = PowAlgo::Bc3Hash;
+        s.publish_job(j);
+        // The claims and the run of jobs date from 0 s on this test's clock
+        // (a few real milliseconds, pinned), so 60 s in nothing has stalled;
+        // b has finished a launch at 50 s.
+        s.job_since.store(0, Ordering::Relaxed);
+        for at in &s.gpu_slot_claimed_at {
+            at.store(0, Ordering::Relaxed);
+        }
+        s.gpu_slot_stamp[1].store(50 * sec, Ordering::Relaxed);
+        assert!(s.check_gpu_stalls(60 * sec, limit).is_empty());
+        // At 100 s card a has been silent for 100 s, b for 50.
+        assert_eq!(s.check_gpu_stalls(100 * sec, limit), vec![GpuStall::Stalled { slot: 0, idle_secs: 100 }]);
+        assert!(s.gpus_mine(PowAlgo::Bc3Hash), "b still mines it");
+        // b too, at 145 s - now nothing does, and the CPU stands in.
+        assert_eq!(s.check_gpu_stalls(145 * sec, limit), vec![GpuStall::Stalled { slot: 1, idle_secs: 95 }]);
+        assert!(!s.gpus_mine(PowAlgo::Bc3Hash));
+        assert!(s.devices_for(PowAlgo::Bc3Hash).cpu);
+        // a's launch comes back: it holds BC3Hash again, b does not yet.
+        s.gpu_slot_stamp[0].store(150 * sec, Ordering::Relaxed);
+        assert_eq!(s.check_gpu_stalls(151 * sec, limit), vec![GpuStall::Resumed { slot: 0 }]);
+        assert!(s.gpus_mine(PowAlgo::Bc3Hash));
+        // b's worker stops: its claim goes, and with it the stall - silently.
+        drop(b);
+        assert!(s.check_gpu_stalls(152 * sec, limit).is_empty());
+        assert_eq!(s.gpu_slot_stalled[1].load(Ordering::Relaxed), 0);
+        // The pool goes away and comes back at 400 s: the time without a job
+        // is not a's silence.
+        s.clear_job();
+        assert!(s.check_gpu_stalls(400 * sec, limit).is_empty());
+        let mut j = a_job();
+        j.algo = PowAlgo::Bc3Hash;
+        s.publish_job(j);
+        s.job_since.store(400 * sec, Ordering::Relaxed);
+        assert!(s.check_gpu_stalls(450 * sec, limit).is_empty());
+        // A PoW the card does not hold is not its to stall on.
+        a.set(PowAlgo::Bc3Hash, false);
+        assert!(s.check_gpu_stalls(600 * sec, limit).is_empty());
     }
 
     /// A change of PoW is announced once, not once per job.

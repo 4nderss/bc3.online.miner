@@ -416,6 +416,13 @@ pub trait MiningBackend {
         None
     }
 
+    /// Does loading the BC3Hash kernel mean the driver compiles it from
+    /// source, as an OpenCL driver does - a minute or more, where a CUDA card
+    /// loads machine code in a second? Only for what the user is told.
+    fn compiles_kernel_at_load(&self) -> bool {
+        false
+    }
+
     /// Launches of `algo` should be a whole number of this many nonces - the
     /// card's wave - so that the last wave does not run on a mostly idle card.
     fn launch_granule(&self, _algo: PowAlgo) -> u32 {
