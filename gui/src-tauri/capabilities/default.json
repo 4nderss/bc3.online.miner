@@ -9,7 +9,7 @@
     "which is a direct API call and not ACL-checked, so shell:allow-execute",
     "and shell:allow-spawn were granting the frontend a power it never used:",
     "the ability to run programs with arguments of its choosing. The frontend",
-    "calls invoke() on our own four commands and shell.open on one constant",
+    "calls invoke() on our own commands and shell.open on one constant",
     "URL, and builds every DOM node with textContent, so there is no known way",
     "to reach them today - which is the point. A permission that is not needed",
     "is one that cannot be misused later.",

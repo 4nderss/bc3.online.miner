@@ -75,7 +75,8 @@ Solo, press *Start mining*. The window shows live hashrate with a sparkline,
 accepted shares a minute (with stale and rejected ones counted beside them),
 estimated time to block, which backend is running,
 and a full-screen celebration when you find a block. Settings are remembered
-between runs.
+between runs, saved as you type them, in `settings.json` in the app's folder
+(`%LOCALAPPDATA%\online.bc3.miner` on Windows).
 
 If a newer release exists on GitHub, a banner says so and links to it. The
 miner never updates itself: it holds your payout address, and a binary that

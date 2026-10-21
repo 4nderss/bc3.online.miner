@@ -8,6 +8,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -202,6 +204,72 @@ fn is_mining(state: State<'_, MinerState>) -> bool {
     state.0.lock().map(|g| g.is_some()).unwrap_or(false)
 }
 
+/// The GUI's settings - address, rig name, mode, hardware, intensity - as a
+/// JSON file in the app's local data folder (`%LOCALAPPDATA%\online.bc3.miner`
+/// on Windows), next to the WebView's own data.
+///
+/// They used to live in the WebView's localStorage. Chromium writes that to
+/// disk a few seconds after a change, so a kill or a crash in between lost
+/// the change, and a failed write was never reported. On one machine a new
+/// address reverted to the old one on every start until the whole folder was
+/// deleted. This file is written at once, and a failure reaches the log.
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| format!("no app data folder: {e}"))?;
+    Ok(dir.join("settings.json"))
+}
+
+/// The saved settings, or `None` before anything has been saved.
+#[tauri::command]
+fn load_settings(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    read_settings(&settings_path(&app)?)
+}
+
+/// A plain (not async) command: Tauri runs those on the main thread, one at
+/// a time, so two saves never write the temporary file at once. The window
+/// sends one save at a time and the newest last (saveSettings in main.js).
+#[tauri::command]
+fn save_settings(app: AppHandle, settings: serde_json::Value) -> Result<(), String> {
+    write_settings(&settings_path(&app)?, &settings)
+}
+
+fn read_settings(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.is_object() => Ok(Some(v)),
+        Ok(_) => Err(format!("{} does not hold settings", path.display())),
+        Err(e) => Err(format!("{} is damaged: {e}", path.display())),
+    }
+}
+
+/// Written to a temporary file, flushed, and renamed over the old one: a
+/// crash or power loss mid-write leaves the previous settings, never half a
+/// file.
+fn write_settings(path: &Path, settings: &serde_json::Value) -> Result<(), String> {
+    if !settings.is_object() {
+        return Err("settings must be a JSON object".into());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
+    let body = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&body)?;
+        f.sync_all()
+    };
+    write().map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("could not save {}: {e}", path.display()))
+}
+
 /// Ask the CLI which GPUs exist (a short run with `--probe`), so that the
 /// hardware buttons can show the card's name before you start.
 #[tauri::command]
@@ -234,7 +302,9 @@ fn main() {
             start_mining,
             stop_mining,
             is_mining,
-            probe_hardware
+            probe_hardware,
+            load_settings,
+            save_settings
         ])
         .run(tauri::generate_context!())
         .expect("kunde inte starta bc3.online miner");
@@ -290,5 +360,42 @@ mod tests {
         assert!(validate_address("bc1short").is_err());
         assert!(validate_address("1short").is_err());
         assert!(validate_address("xyz1qerclmenj87gc2r3hfeyd0v0rxze32pnxygnt6p").is_err());
+    }
+
+    /// A folder of its own under the system temp dir, removed again.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bc3-gui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let dir = scratch("settings");
+        // The folder does not exist yet: nothing saved, and a save creates it.
+        let path = dir.join("settings.json");
+        assert_eq!(read_settings(&path), Ok(None));
+        let first = serde_json::json!({ "address": "bc1qold", "rig": "a", "mode": "pplns" });
+        write_settings(&path, &first).unwrap();
+        assert_eq!(read_settings(&path), Ok(Some(first)));
+        // A second save replaces the first, and leaves no temporary file.
+        let second = serde_json::json!({ "address": "bc1qnew", "rig": "b", "mode": "solo" });
+        write_settings(&path, &second).unwrap();
+        assert_eq!(read_settings(&path), Ok(Some(second)));
+        assert!(!path.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn damaged_settings_are_an_error_not_defaults() {
+        let dir = scratch("damaged");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{\"address\": \"bc1q").unwrap();
+        assert!(read_settings(&path).unwrap_err().contains("damaged"));
+        std::fs::write(&path, "[1, 2]").unwrap();
+        assert!(read_settings(&path).is_err());
+        assert!(write_settings(&path, &serde_json::json!("text")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

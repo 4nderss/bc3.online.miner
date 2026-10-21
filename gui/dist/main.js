@@ -315,28 +315,86 @@ function setStatus(state, text) {
 }
 
 // ---------- Settings (persisted between runs) ----------
-const SETTINGS_KEY = "bc3-miner-settings";
-function loadSettings() {
-  try {
-    const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-    if (s.address) el("address").value = s.address;
-    if (s.rig) el("rig").value = s.rig;
-    if (s.mode) selectMode(s.mode);
-    if (s.hw) selectHw(s.hw);
-    if (s.intensity) el("intensity").value = s.intensity;
-    updateIntensityLabel();
-  } catch (_) {}
+// In settings.json, which the Rust side writes at once (load_settings and
+// save_settings in main.rs). They used to be in the WebView's localStorage:
+// saved only when a field lost focus or Start succeeded, written to disk by
+// the WebView seconds later, and a failure never reported - a new address
+// typed in and the window closed was gone, and on one machine the old one
+// came back on every start. Now every change is saved as it is made.
+// localStorage is still read once, so the first start after an update keeps
+// what the old version saved.
+const LEGACY_SETTINGS_KEY = "bc3-miner-settings";
+// Nothing is written until the saved settings have been read: a save before
+// that (a click while loading) would replace them with the defaults.
+let settingsLoaded = false;
+
+function applySettings(s) {
+  if (s.address) el("address").value = s.address;
+  if (s.rig) el("rig").value = s.rig;
+  if (s.mode) selectMode(s.mode);
+  if (s.hw) selectHw(s.hw);
+  if (s.intensity) el("intensity").value = s.intensity;
+  updateIntensityLabel();
 }
-function saveSettings() {
+function legacySettings() {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+    const s = JSON.parse(localStorage.getItem(LEGACY_SETTINGS_KEY) || "null");
+    return s && typeof s === "object" ? s : null;
+  } catch (_) {
+    return null;
+  }
+}
+async function loadSettings() {
+  let s = null;
+  try {
+    s = await invoke("load_settings");
+  } catch (e) {
+    log("could not read the saved settings: " + e, "l-bad");
+  }
+  const fromFile = s != null;
+  if (!fromFile) s = legacySettings();
+  if (s) applySettings(s);
+  settingsLoaded = true;
+  // Moved over from localStorage, or the file was damaged: write it anew.
+  if (s && !fromFile) saveSettings();
+}
+
+// One save in flight at a time, and the newest settings last: a save per
+// keystroke must not let an older one land after a newer.
+let saveInFlight = false;
+let savePending = false;
+let saveFailed = false;
+function saveSettings() {
+  if (!settingsLoaded) return;
+  if (saveInFlight) {
+    savePending = true;
+    return;
+  }
+  saveInFlight = true;
+  invoke("save_settings", {
+    settings: {
       address: el("address").value.trim(),
       rig: el("rig").value.trim(),
       mode,
       hw,
       intensity: el("intensity").value,
-    }));
-  } catch (_) {}
+    },
+  })
+    .then(() => {
+      saveFailed = false;
+    })
+    .catch((e) => {
+      // Once, not once a keystroke, until a save succeeds again.
+      if (!saveFailed) log("could not save the settings: " + e, "l-bad");
+      saveFailed = true;
+    })
+    .finally(() => {
+      saveInFlight = false;
+      if (savePending) {
+        savePending = false;
+        saveSettings();
+      }
+    });
 }
 
 function updateIntensityLabel() {
@@ -379,7 +437,10 @@ function updateStartEnabled() {
   }
 }
 el("address").addEventListener("input", updateStartEnabled);
-el("address").addEventListener("change", saveSettings);
+// On every edit, not on "change": that fires only when the field loses focus,
+// and closing the window does not count.
+el("address").addEventListener("input", saveSettings);
+el("rig").addEventListener("input", saveSettings);
 
 /// Mark a button in a radio group as selected (attribute `key` = "mode" or "hw").
 function selectIn(key, value) {
@@ -732,7 +793,8 @@ function initUpdateCheck() {
 }
 
 // ---------- Init ----------
-loadSettings();
+// Start stays disabled until the saved address is in the field.
+loadSettings().finally(updateStartEnabled);
 setStatus(null, "Idle");
 updateStartEnabled();
 probeHardware();
