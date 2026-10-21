@@ -86,9 +86,14 @@ kernel's code only while the PTX it embeds is that one. Both workflows build
 the cubins in a `sass` job and set `BC3_REQUIRE_SASS=1`, which makes a build
 without them fail. CUDA 12.9 because its machine code loads on every CUDA 12
 driver (R525 and up, as the PTX needs) and it knows Blackwell; a CUDA 13
-toolkit's would need R580. On sm_86 its ptxas makes what the driver's JIT
-makes - 119,232 instructions both, 168 registers and 3360 bytes of stack,
-568 lines in another order - and hashes as fast. The link API
+toolkit's would need R580, and cannot make sm_61 at all. Nor is CUDA 13's
+compiler faster here: driver 621.01 (CUDA 13.5) JITs the same PTX into code
+that hashed 220.8 kH/s against the 12.9 cubins' 221.5 on an RTX 3050 Ti
+(window 16, 60 s runs alternated A-B-A-B), within the runs' drift. Untried
+on sm_120, where a newer compiler has the most to gain. On sm_86 12.9's
+ptxas made what the driver's JIT made at the time - 119,232 instructions
+both, 168 registers and 3360 bytes of stack, 568 lines in another order -
+and hashes as fast. The link API
 (`cuLinkAddData` + `cuLinkComplete`) was tried for machine code made at run
 time and dropped: it compiles relocatable code, 4056 bytes of stack and
 1.4 % slower.
