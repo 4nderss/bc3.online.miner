@@ -55,6 +55,12 @@ struct Args {
     #[arg(long, env = "BC3_WORKER")]
     rig: Option<String>,
 
+    /// Password sent with the address when logging in to the pool.
+    /// bc3.online ignores it; other pools and proxies may want one.
+    #[arg(short = 'p', long, visible_alias = "pass", default_value = "x",
+          env = "BC3_PASSWORD", hide_env_values = true)]
+    password: String,
+
     /// Backend: auto = CUDA if possible, else OpenCL, else CPU. In auto the
     /// CPU also mines whatever the GPU cannot (BC3Hash on a card whose
     /// BC3Hash kernel failed its self-test); with cuda or opencl it mines
@@ -141,7 +147,7 @@ impl Mode {
 fn normalise_env() {
     const VARS: &[&str] = &[
         "BC3_WALLET", "BC3_WORKER", "BC3_USER", "BC3_MODE", "BC3_POOL",
-        "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID",
+        "BC3_PASSWORD", "BC3_BACKEND", "BC3_THREADS", "BC3_INTENSITY", "BC3_GPU_ID",
         #[cfg(feature = "internal-tools")]
         "BC3_BC3HASH_MODE",
         #[cfg(feature = "internal-tools")]
@@ -464,7 +470,8 @@ fn main() {
         std::process::exit(args.internal.run(shared, submit_rx, devices));
     }
 
-    stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user, suggest_difficulty });
+    let password = args.password.clone();
+    stratum::run_client(shared, submit_rx, stratum::StratumConfig { pool, user, password, suggest_difficulty });
 }
 
 /// What the user reads when the stall guard sets a GPU aside or takes it back.
@@ -543,5 +550,20 @@ mod tests {
         assert_eq!(plan_cpu(Auto, 0, None, 20), (20, CpuRole::All));
         assert_eq!(plan_cpu(Cpu, 0, None, 20), (20, CpuRole::All));
         assert_eq!(plan_cpu(Cpu, 0, Some(0), 20), (20, CpuRole::All));
+    }
+
+    /// Mining-OS templates and other miners' command lines pass `-p` (issue
+    /// #2), and clap refuses an option it does not know - so all three
+    /// spellings must parse, and none given is the "x" every pool accepts.
+    #[test]
+    fn the_pool_password_takes_the_usual_spellings() {
+        let password = |argv: &[&str]| {
+            let argv = [&["bc3-miner", "--user", "bc1qtest"], argv].concat();
+            Args::try_parse_from(argv).unwrap().password
+        };
+        assert_eq!(password(&[]), "x");
+        assert_eq!(password(&["-p", "d=0.5"]), "d=0.5");
+        assert_eq!(password(&["--password", "secret"]), "secret");
+        assert_eq!(password(&["--pass", "secret"]), "secret");
     }
 }

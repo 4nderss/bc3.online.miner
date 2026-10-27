@@ -104,6 +104,7 @@ Backend selection is automatic: CUDA if an NVIDIA GPU is present, otherwise Open
 |------|-------------|
 | `--mode pplns\|solo` | Payout mode. Picks the pool port: 3111 for `pplns` (default), 3112 for `solo` |
 | `--pool host:port` | Pool address (default `bc3.online:3111`, solo `bc3.online:3112`). Overrides `--mode` |
+| `-p`, `--password` | Password sent to the pool with your address (default `x`). bc3.online ignores it; set it for a pool or proxy that wants one. `--pass` works too |
 | `--backend auto\|cuda\|opencl\|cpu` | Force a backend (default `auto`) |
 | `--gpu-id N` | Use only the N:th detected GPU |
 | `--threads N` | CPU threads, mining every job. Default: all cores in CPU mode. Next to a GPU the CPU does not mine unless you pass the flag: under `--backend auto` every core stands by and mines only what no GPU can (BC3Hash on a card whose kernel failed its self-test, for one), and with `--backend cuda` or `opencl` it stays out. `--threads 0` means "all cores", minus the GPU feeder threads when a GPU is running |
@@ -154,6 +155,7 @@ upgrade, say - measures again.
 | `BC3_WORKER` | — | Rig name, appended to the address. |
 | `BC3_MODE` | `pplns` | `pplns` or `solo`. Picks the pool port. |
 | `BC3_POOL` | from mode | `host:port`, overrides `BC3_MODE`. |
+| `BC3_PASSWORD` | `x` | Pool password, as `--password`. |
 | `BC3_BACKEND` | `auto` | `auto`, `cuda`, `opencl` or `cpu`. |
 | `BC3_THREADS` | none in GPU mode | CPU threads. |
 | `BC3_INTENSITY` | `100` | 1–100. Below 100 the machine stays usable. |
