@@ -224,9 +224,13 @@ impl RejectLog {
 const HASHRATE_REPORT_EVERY: Duration = Duration::from_secs(60);
 
 /// The id of every `mining.hashrate` request: below the submits (100 and
-/// up), so its answer is never counted as an accepted or rejected share.
-const HASHRATE_ID: u64 = 3;
-const _: () = assert!(HASHRATE_ID > 2 && HASHRATE_ID < 100);
+/// up), so its answer is never counted as an accepted or rejected share, and
+/// above subscribe, authorize and `mining.suggest_difficulty` (1-3). It was
+/// 3 on a branch cut before the suggestion existed: a pool's "unknown
+/// method" to the suggestion would then have read as a refusal of the
+/// reports, and stopped them for the connection.
+const HASHRATE_ID: u64 = 4;
+const _: () = assert!(HASHRATE_ID > 3 && HASHRATE_ID < 100);
 
 /// The miner's own hashrate, sent to the pool once a minute so the pool can
 /// show it next to the hashrate it derives from accepted shares.
@@ -867,10 +871,10 @@ mod tests {
         let t0 = Instant::now();
         let mut r = HashrateReport::new();
         r.start(t0, 0);
-        assert!(!r.answer(&json!({"id": 3, "error": null, "result": true})));
+        assert!(!r.answer(&json!({"id": HASHRATE_ID, "error": null, "result": true})));
         assert!(r.due(t0 + HASHRATE_REPORT_EVERY, 60).is_some());
 
-        let unknown = json!({"id": 3, "result": null, "error": [20, "unknown method", null]});
+        let unknown = json!({"id": HASHRATE_ID, "result": null, "error": [20, "unknown method", null]});
         assert!(r.answer(&unknown), "the first refusal is said");
         assert!(!r.answer(&unknown), "and only once");
         assert_eq!(r.due(t0 + 10 * HASHRATE_REPORT_EVERY, 600), None);
@@ -880,7 +884,7 @@ mod tests {
 
         let mut r = HashrateReport::new();
         r.start(t0, 0);
-        assert!(r.answer(&json!({"id": 3, "error": null, "result": false})));
+        assert!(r.answer(&json!({"id": HASHRATE_ID, "error": null, "result": false})));
         assert_eq!(r.due(t0 + HASHRATE_REPORT_EVERY, 60), None);
     }
 
