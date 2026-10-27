@@ -86,6 +86,8 @@ fn next_line<R: Read>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<Opti
 pub struct StratumConfig {
     pub pool: String,
     pub user: String,
+    /// The second parameter of `mining.authorize`. Never logged.
+    pub password: String,
     /// The share difficulty to ask the pool to start at, if any - see
     /// `suggested_difficulty`.
     pub suggest_difficulty: Option<f64>,
@@ -324,7 +326,7 @@ fn session(
         outstanding.sent(3, Instant::now());
     }
     send(&mut writer, json!({"id": 2, "method": "mining.authorize",
-        "params": [cfg.user, "x"]}))?;
+        "params": [cfg.user, cfg.password]}))?;
     outstanding.sent(2, Instant::now());
 
     let mut extranonce1: Vec<u8> = vec![];
@@ -899,6 +901,7 @@ mod tests {
         let cfg = StratumConfig {
             pool: listener.local_addr().unwrap().to_string(),
             user: "bc1qtest.rig".into(),
+            password: "d=0.5".into(),
             suggest_difficulty: Some(2e-4),
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(crate::shared::SUBMIT_QUEUE);
@@ -919,6 +922,8 @@ mod tests {
         let methods: Vec<&str> = asked.iter().map(|m| m["method"].as_str().unwrap_or("")).collect();
         assert_eq!(methods, ["mining.subscribe", "mining.suggest_difficulty", "mining.authorize"]);
         assert_eq!(asked[1]["params"][0].as_f64(), Some(2e-4));
+        // --password as given: other pools read options such as d= from it.
+        assert_eq!(asked[2]["params"], json!(["bc1qtest.rig", "d=0.5"]));
         pool.send(json!({"id": 1, "error": null, "result": [
             [["mining.set_difficulty", "0a0b0c0d"], ["mining.notify", "0a0b0c0d"]], "0a0b0c0d", 4]}));
         pool.send(json!({"id": 3, "result": null, "error": [20, "unknown method", null]}));
@@ -945,6 +950,7 @@ mod tests {
         let cfg = StratumConfig {
             pool: listener.local_addr().unwrap().to_string(),
             user: "bc1qtest.rig".into(),
+            password: "x".into(),
             suggest_difficulty: None,
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(crate::shared::SUBMIT_QUEUE);
@@ -1009,6 +1015,7 @@ mod tests {
         let cfg = StratumConfig {
             pool: listener.local_addr().unwrap().to_string(),
             user: "bc1qtest.rig".into(),
+            password: "x".into(),
             suggest_difficulty: None,
         };
         let (tx, rx) = std::sync::mpsc::sync_channel(SUBMIT_QUEUE);
